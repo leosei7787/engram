@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "engram"
+version = "0.1.0"
+description = "Compiled knowledge with continuous reconsolidation and active context assembly"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Full feature set
+full = [
+    "pyyaml>=6.0",
+    "anthropic>=0.40.0",   # for memory modules and deep-work team
+    "networkx>=3.0",       # for community detection (engram.memory.communities)
+    "python-louvain>=0.16",
+]
+
+# Development
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio",
+    "black",
+    "ruff",
+    "mypy",
+]
+
+[project.urls]
+Homepage   = "https://github.com/leosei7787/engram"
+Repository = "https://github.com/leosei7787/engram"
+Issues     = "https://github.com/leosei7787/engram/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["engram*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
