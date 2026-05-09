@@ -40,6 +40,7 @@ from engram.retrieval.pipeline import memory_scan
 from engram.retrieval.curator import build_candidates, curate_context, monitor_context, detect_drift
 from engram.ingest.watcher import InboxWatcher
 from engram.ingest.cleaner import EmailCleaner
+from engram.ingest.ics import parse_ics, format_agenda
 
 app = Flask(__name__)
 _cfg: EngramConfig | None = None
@@ -372,20 +373,78 @@ def chat():
                 pass
 
         # ── Calendar auto-load ────────────────────────────────────────────────
-        # Finds the most-recently modified file matching calendar* in memory tree.
-        # Keeps everyone oriented to upcoming commitments every turn.
+        # Two-phase calendar loading:
+        #   1. ICS file (authoritative — actual event source from Outlook/Google).
+        #      Searched first; in inbox_src or memory_path. Parsed into a clean
+        #      agenda so the model sees structured events, not raw ICS noise.
+        #   2. Markdown calendar fallback (legacy hand-curated calendar*.md files).
+        #      Only loaded if no ICS was found.
         cal_patterns = list(getattr(cfg.system_prompt, "calendar_globs", None) or ["calendar*.md"])
-        cal_hits: list[Path] = []
-        for pat in cal_patterns:
-            cal_hits.extend(base.rglob(pat))
-        if cal_hits and used < budget:
-            cal_file = max(cal_hits, key=lambda f: f.stat().st_mtime)
+
+        # Phase 1: ICS — search inbox + memory for the most-recent .ics
+        ics_search_dirs: list[Path] = []
+        try:
+            inbox = getattr(cfg.paths, "inbox_src", None) if hasattr(cfg, "paths") else None
+            if inbox and Path(inbox).exists():
+                ics_search_dirs.append(Path(inbox))
+        except Exception:
+            pass
+        ics_search_dirs.append(base)
+
+        ics_hits: list[Path] = []
+        for d in ics_search_dirs:
             try:
-                cal_content = cal_file.read_text(errors="ignore")[:8000]
-                system_parts.append(f"\n\n---\n# Upcoming calendar ({cal_file.name})\n\n{cal_content}")
-                used += len(cal_content)
+                ics_hits.extend(d.rglob("*.ics"))
             except Exception:
-                pass
+                continue
+
+        ics_loaded = False
+        if ics_hits and used < budget:
+            ics_file = max(ics_hits, key=lambda f: f.stat().st_mtime)
+            try:
+                events = parse_ics(ics_file)
+                if events:
+                    # Adaptive window: longer agenda when query is calendar-related,
+                    # short focused window otherwise (keeps prompt small for general queries).
+                    qlow = query.lower()
+                    is_cal_query = any(kw in qlow for kw in (
+                        "week", "tomorrow", "today", "agenda", "calendar", "schedule",
+                        "meeting", "next month", "upcoming", "1:1", "1on1", "free time",
+                        "available", "busy", "block",
+                    ))
+                    days_ahead = 14 if is_cal_query else 7
+                    max_events = 60 if is_cal_query else 25
+                    agenda = format_agenda(events, days_ahead=days_ahead, max_events=max_events)
+                    # Hard cap to keep TTFT reasonable — bigger prompt = slower first token
+                    agenda_cap = 8000 if is_cal_query else 3500
+                    agenda = agenda[:agenda_cap]
+                    today = datetime.now().strftime("%A %d %b %Y")
+                    system_parts.append(
+                        f"\n\n---\n# Upcoming calendar — {ics_file.name} (parsed ICS, next {days_ahead}d)\n"
+                        f"Today is {today}. This agenda is the **authoritative** event source "
+                        f"(parsed directly from your Outlook/Google ICS). "
+                        f"Use it for any time, scheduling, or 'what's coming' question — "
+                        f"do NOT request additional calendar context.\n\n"
+                        f"{agenda}"
+                    )
+                    used += len(agenda)
+                    ics_loaded = True
+            except Exception as e:
+                print(f"[chat] ICS parse error: {e}", flush=True)
+
+        # Phase 2: Markdown calendar fallback (only if no ICS was loaded)
+        if not ics_loaded:
+            cal_hits: list[Path] = []
+            for pat in cal_patterns:
+                cal_hits.extend(base.rglob(pat))
+            if cal_hits and used < budget:
+                cal_file = max(cal_hits, key=lambda f: f.stat().st_mtime)
+                try:
+                    cal_content = cal_file.read_text(errors="ignore")[:8000]
+                    system_parts.append(f"\n\n---\n# Upcoming calendar ({cal_file.name})\n\n{cal_content}")
+                    used += len(cal_content)
+                except Exception:
+                    pass
 
         for c in selected:
             if used >= budget:
