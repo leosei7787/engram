@@ -369,7 +369,7 @@ _TURN_HEADER_RX = re.compile(r"^##\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*$
 
 
 def _parse_session_turns(content: str) -> list[dict]:
-    """Return list of {ts, user, assistant} for each turn in the file."""
+    """Return list of {ts, user, assistant, active_context, attached} for each turn."""
     if not content:
         return []
     headers = list(_TURN_HEADER_RX.finditer(content))
@@ -378,17 +378,49 @@ def _parse_session_turns(content: str) -> list[dict]:
         body_start = h.end()
         body_end = headers[i + 1].start() if i + 1 < len(headers) else len(content)
         block = content[body_start:body_end]
-        # Pull **User:** … and **Assistant:** … sections
-        u_m = re.search(r"\*\*User:\*\*\s*(.*?)(?=\n\*\*Assistant:\*\*|\Z)", block, re.DOTALL)
+        # Pull **User:** … and **Assistant:** … sections.
+        # User section ends at the first metadata marker (_Active context: …,
+        # _Attached: …, _(Previous response …)) or the **Assistant:** header.
+        u_m = re.search(
+            r"\*\*User:\*\*\s*(.*?)(?=\n_(?:Active context|Attached|\(Previous response)|\n\*\*Assistant:\*\*|\Z)",
+            block, re.DOTALL,
+        )
         a_m = re.search(r"\*\*Assistant:\*\*\s*(.*?)(?=\n---|\Z)", block, re.DOTALL)
         if not u_m or not a_m:
             continue
+        # Pull metadata lines written by log_turn()
+        ctx_m = re.search(r"_Active context:\s*(.+?)_$", block, re.MULTILINE)
+        att_m = re.search(r"_Attached:\s*(.+?)_$",       block, re.MULTILINE)
+        active_context = []
+        if ctx_m:
+            active_context = [p.strip() for p in ctx_m.group(1).split(",") if p.strip()]
+        attached = []
+        if att_m:
+            attached = [p.strip() for p in att_m.group(1).split(",") if p.strip()]
         out.append({
-            "ts":        h.group(1),
-            "user":      u_m.group(1).strip(),
-            "assistant": a_m.group(1).strip(),
+            "ts":             h.group(1),
+            "user":           u_m.group(1).strip(),
+            "assistant":      a_m.group(1).strip(),
+            "active_context": active_context,
+            "attached":       attached,
         })
     return out
+
+
+def session_file_for(memory_path: Path, session_id: str) -> Path:
+    """Public path resolver — needed by the dashboard's pin endpoints."""
+    return _session_file(memory_path, session_id)
+
+
+def parse_session_file(memory_path: Path, session_id: str) -> list[dict]:
+    """Read + parse a session file. Returns turns or [] if missing."""
+    fp = _session_file(memory_path, session_id)
+    if not fp.exists():
+        return []
+    try:
+        return _parse_session_turns(fp.read_text(errors="ignore"))
+    except Exception:
+        return []
 
 
 # ─── Session-level harvest ────────────────────────────────────────────────────
