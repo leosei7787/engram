@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from flask import Flask, jsonify, request, Response, stream_with_context
 from engram.retrieval.config import load_config, EngramConfig
 from engram.retrieval.pipeline import memory_scan
-from engram.retrieval.curator import build_candidates, curate_context, monitor_context
+from engram.retrieval.curator import build_candidates, curate_context, monitor_context, detect_drift
 
 app = Flask(__name__)
 _cfg: EngramConfig | None = None
@@ -193,16 +194,24 @@ def chat():
 
         n_candidates = len(all_candidates)
 
-        # Announce curating (sidebar shows candidate count immediately)
-        yield f"data: {json.dumps({'context': {'phase': 'curating', 'candidates_total': n_candidates, 'selected': [], 'reasoning': ''}})}\n\n"
+        # ── Phase 3: Drift detection — skip Haiku if topic hasn't changed ──────
+        has_drift = detect_drift(query, messages)
 
-        # ── Phase 3: Haiku curator selects which files enter context ──────────
-        try:
-            selected, reasoning = curate_context(query, all_candidates, cfg, max_files=10)
-        except Exception as e:
+        if has_drift:
+            # Announce curating (sidebar shows candidate count immediately)
+            yield f"data: {json.dumps({'context': {'phase': 'curating', 'candidates_total': n_candidates, 'selected': [], 'reasoning': ''}})}\n\n"
+
+            # Haiku curator selects which files enter context
+            try:
+                selected, reasoning = curate_context(query, all_candidates, cfg, max_files=10)
+            except Exception as e:
+                selected  = all_candidates[:10]
+                reasoning = "Top-N by scan score (fallback)"
+                print(f"[chat] curator error: {e}", flush=True)
+        else:
+            # No drift — skip Haiku, use top-N by scan order (fast path)
             selected  = all_candidates[:10]
-            reasoning = "Top-N by scan score (fallback)"
-            print(f"[chat] curator error: {e}", flush=True)
+            reasoning = "Same topic — context reused"
 
         sel_payload = [{"path": c["path"], "type": c["type"]} for c in selected]
         yield f"data: {json.dumps({'context': {'phase': 'ready', 'candidates_total': n_candidates, 'selected': sel_payload, 'reasoning': reasoning}})}\n\n"
@@ -251,7 +260,27 @@ def chat():
         if scan.get("graph_context"):
             system_parts.append("\n\n" + scan["graph_context"])
 
+        # ── request_more_context tool instruction ─────────────────────────────
+        system_parts.append(
+            "\n\n---\n"
+            "# Context management\n"
+            "If you cannot answer because you need more specific context not in the files above, "
+            "output exactly this on its own line (nothing else on that line):\n"
+            "REQUEST_CONTEXT: <focused one-sentence query describing what you need>\n"
+            "The system will automatically fetch and inject the missing context and re-run your response."
+        )
+
         system_prompt = "\n".join(system_parts)
+
+        # Inject raw documents added by user (sent in request body)
+        raw_docs = data.get("raw_docs", [])   # [{"name": str, "content": str}]
+        if raw_docs:
+            raw_parts = []
+            for rd in raw_docs[:5]:   # cap at 5 raw docs
+                name    = rd.get("name", "raw_document")
+                content = rd.get("content", "")[:6000]
+                raw_parts.append(f"\n\n---\n# Raw document: {name}\n\n{content}")
+            system_prompt += "\n".join(raw_parts)
 
         # ── Phase 5: Stream response via configured backend ───────────────────
         chat_cfg      = getattr(cfg, "chat", None)
@@ -296,6 +325,55 @@ def chat():
                         yield f"data: {json.dumps({'token': text})}\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+        # ── Phase 5b: Handle REQUEST_CONTEXT sentinel ────────────────────────
+        # If model said REQUEST_CONTEXT: <query>, re-run retrieval on that
+        # focused query and inject the new files, then stream a fresh response.
+        rc_match = re.search(r"REQUEST_CONTEXT:\s*(.+)", assistant_text)
+        if rc_match and not getattr(generate, "_in_context_retry", False):
+            focused_q = rc_match.group(1).strip()
+            print(f"[chat] REQUEST_CONTEXT: {focused_q!r}", flush=True)
+            try:
+                extra_scan = memory_scan(focused_q, cfg, max_files=8)
+                extra_cands = build_candidates(extra_scan, cfg, snippet_chars=200)
+                extra_sel, extra_reason = curate_context(
+                    focused_q, extra_cands, cfg, max_files=5
+                )
+                if extra_sel:
+                    # Inject new files into system prompt
+                    for c in extra_sel:
+                        p = Path(c["path"])
+                        if not p.is_absolute():
+                            p = base / c["path"]
+                        if p.exists() and used < budget:
+                            content = p.read_text(errors="ignore")[:4000]
+                            system_prompt += f"\n\n---\n# Additional context: {c['path']}\n\n{content}"
+                            used += len(content)
+
+                    add_pl = [{"path": c["path"], "type": c["type"]} for c in extra_sel]
+                    yield f"data: {json.dumps({'context_update': {'add': add_pl, 'remove': [], 'reason': f'request_more_context: {focused_q[:60]}'}})}\n\n"
+
+                    # Clear the REQUEST_CONTEXT text and stream a fresh response
+                    assistant_text = ""
+                    generate._in_context_retry = True
+
+                    if backend == "cli":
+                        for text in _stream_cli(messages, system_prompt, cli_bin, model=cli_model):
+                            assistant_text += text
+                            yield f"data: {json.dumps({'token': text})}\n\n"
+                    else:
+                        with client.messages.stream(
+                            model=cfg.models.primary, max_tokens=4096,
+                            system=system_prompt, messages=messages,
+                        ) as stream:
+                            for text in stream.text_stream:
+                                assistant_text += text
+                                yield f"data: {json.dumps({'token': text})}\n\n"
+            except Exception as e:
+                print(f"[chat] REQUEST_CONTEXT retry error: {e}", flush=True)
+            finally:
+                if hasattr(generate, "_in_context_retry"):
+                    del generate._in_context_retry
 
         # ── Phase 6: Haiku monitor — update context for next turn ─────────────
         if assistant_text and all_candidates:
@@ -575,7 +653,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .ctx-count {{ font-size: 11px; color: #bbb; margin-top: 2px; }}
 .ctx-list {{ flex: 1; overflow-y: auto; padding: 8px 0; }}
 .ctx-item {{ padding: 5px 16px; display: flex; align-items: flex-start; gap: 7px; }}
-.ctx-dot {{ width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }}
+.ctx-dot {{ width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }}
 .ctx-dot.memory {{ background: #4285F4; }}
 .ctx-dot.direct {{ background: #4285F4; }}
 .ctx-dot.graph  {{ background: #34A853; }}
@@ -584,13 +662,52 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .ctx-empty {{ padding: 12px 16px; font-size: 11px; color: #bbb; font-style: italic; }}
 .ctx-reasoning {{ padding: 0 16px 8px; font-size: 10px; color: #aaa; font-style: italic;
                   line-height: 1.5; min-height: 0; }}
-.ctx-legend {{ padding: 10px 16px; border-top: 1px solid #efefef; display: flex;
+.ctx-legend {{ padding: 8px 16px; border-top: 1px solid #efefef; display: flex;
                gap: 10px; flex-wrap: wrap; }}
 .ctx-legend-item {{ display: flex; align-items: center; gap: 4px;
                     font-size: 10px; color: #aaa; }}
 
+/* Context inspector actions */
+.ctx-item {{ display: flex; align-items: flex-start; gap: 7px; padding: 4px 8px 4px 16px;
+             position: relative; }}
+.ctx-item:hover .ctx-actions {{ opacity: 1; }}
+.ctx-actions {{ display: flex; gap: 2px; margin-left: auto; opacity: 0;
+                transition: opacity .15s; flex-shrink: 0; }}
+.ctx-btn {{ background: none; border: none; cursor: pointer; padding: 1px 3px;
+            font-size: 10px; color: #bbb; border-radius: 3px; line-height: 1; }}
+.ctx-btn:hover {{ color: #555; background: #eee; }}
+.ctx-btn.pinned {{ color: #D97757; opacity: 1 !important; }}
+.ctx-add-bar {{ padding: 8px 12px; border-top: 1px solid #efefef; }}
+.ctx-add-btn {{ width: 100%; background: #fafafa; border: 1px dashed #ddd;
+                border-radius: 6px; padding: 5px 10px; font-size: 11px; color: #aaa;
+                cursor: pointer; text-align: center; transition: all .15s; }}
+.ctx-add-btn:hover {{ background: #f0f0f0; color: #666; border-color: #ccc; }}
+
+/* Add raw doc modal */
+.ctx-modal-overlay {{ position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 100;
+                       display: flex; align-items: center; justify-content: center; }}
+.ctx-modal {{ background: #fff; border-radius: 12px; padding: 20px; width: 480px;
+              max-height: 70vh; display: flex; flex-direction: column; gap: 12px;
+              box-shadow: 0 8px 32px rgba(0,0,0,.15); }}
+.ctx-modal-title {{ font-size: 14px; font-weight: 700; color: #1a1a1a; }}
+.ctx-modal-sub   {{ font-size: 11px; color: #aaa; margin-top: -8px; }}
+.ctx-modal textarea {{ flex: 1; border: 1px solid #ddd; border-radius: 8px; padding: 10px;
+                        font-size: 12px; font-family: inherit; resize: none; outline: none;
+                        min-height: 160px; line-height: 1.5; }}
+.ctx-modal textarea:focus {{ border-color: #D97757; }}
+.ctx-modal-row {{ display: flex; gap: 8px; }}
+.ctx-modal-name {{ flex: 1; border: 1px solid #ddd; border-radius: 6px; padding: 6px 10px;
+                   font-size: 12px; font-family: inherit; outline: none; }}
+.ctx-modal-name:focus {{ border-color: #D97757; }}
+.ctx-modal-actions {{ display: flex; gap: 8px; justify-content: flex-end; }}
+.ctx-modal-cancel {{ padding: 6px 14px; border-radius: 6px; border: 1px solid #ddd;
+                      background: #fff; font-size: 12px; cursor: pointer; }}
+.ctx-modal-add {{ padding: 6px 14px; border-radius: 6px; border: none;
+                   background: #D97757; color: #fff; font-size: 12px; cursor: pointer;
+                   font-weight: 600; }}
+.ctx-modal-add:hover {{ background: #c06040; }}
+
 /* Context item animations */
-.ctx-item {{ transition: opacity .2s; }}
 .ctx-item.ctx-adding   {{ animation: ctx-add .4s ease-out; }}
 .ctx-item.ctx-removing {{ animation: ctx-remove .3s ease-in forwards; overflow: hidden; }}
 @keyframes ctx-add    {{ from {{ opacity:0; transform:translateX(-6px); }} to {{ opacity:1; transform:translateX(0); }} }}
@@ -770,10 +887,14 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
       <div class="ctx-list" id="ctx-list">
         <div class="ctx-empty">Context files will appear here after your first message.</div>
       </div>
+      <div class="ctx-add-bar">
+        <button class="ctx-add-btn" onclick="openRawDocModal()">+ Add document</button>
+      </div>
       <div class="ctx-legend">
         <div class="ctx-legend-item"><div class="ctx-dot memory"></div>memory</div>
         <div class="ctx-legend-item"><div class="ctx-dot graph"></div>graph</div>
         <div class="ctx-legend-item"><div class="ctx-dot wiki"></div>wiki</div>
+        <div class="ctx-legend-item"><div class="ctx-dot" style="background:#a855f7"></div>raw</div>
       </div>
     </div>
 
@@ -810,6 +931,22 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 
 </div><!-- .shell -->
 
+<!-- ── Raw doc modal ─────────────────────────────────────────────────────── -->
+<div class="ctx-modal-overlay" id="raw-doc-modal" style="display:none" onclick="closeRawDocModal(event)">
+  <div class="ctx-modal" onclick="event.stopPropagation()">
+    <div class="ctx-modal-title">Add document to context</div>
+    <div class="ctx-modal-sub">Paste content or a file path. Injected immediately as a raw-tier item; compiled into memory in the background.</div>
+    <div class="ctx-modal-row">
+      <input class="ctx-modal-name" id="raw-doc-name" placeholder="Document name (optional)" />
+    </div>
+    <textarea id="raw-doc-content" placeholder="Paste document content here…"></textarea>
+    <div class="ctx-modal-actions">
+      <button class="ctx-modal-cancel" onclick="closeRawDocModal()">Cancel</button>
+      <button class="ctx-modal-add" onclick="addRawDoc()">Add to context</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
 const TOPIC_COLORS = {{
@@ -819,7 +956,9 @@ const TOPIC_COLORS = {{
 
 let messages      = [];
 let streaming     = false;
-let activeContext = [];   // [{path, type}, ...]
+let activeContext = [];      // [{path, type}, ...]
+let pinnedPaths   = new Set(); // paths the user has pinned
+let rawDocs       = [];      // [{name, content}, ...] injected by user
 
 // ── Auto-resize textarea ───────────────────────────────────────────────────
 const input = document.getElementById('input');
@@ -862,7 +1001,7 @@ function sendMessage() {{
   fetch('/api/chat', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{messages}})
+    body: JSON.stringify({{messages, raw_docs: rawDocs, pinned: [...pinnedPaths]}})
   }}).then(res => {{
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -929,12 +1068,88 @@ function scrollToBottom() {{
 }}
 
 function makeCtxItem(path, type) {{
-  const name = path.split('/').pop().replace(/\\.md$/, '');
-  const el   = document.createElement('div');
+  const name    = path.split('/').pop().replace(/\\.md$/, '');
+  const isPinned = pinnedPaths.has(path);
+  const el      = document.createElement('div');
   el.className    = 'ctx-item';
   el.dataset.path = path;
-  el.innerHTML    = `<div class="ctx-dot ${{type}}"></div><div class="ctx-file">${{name}}</div>`;
+  el.innerHTML = `
+    <div class="ctx-dot ${{type}}" style="margin-top:6px"></div>
+    <div class="ctx-file" style="flex:1">${{name}}</div>
+    <div class="ctx-actions">
+      <button class="ctx-btn${{isPinned ? ' pinned' : ''}}" title="${{isPinned ? 'Unpin' : 'Pin (keep in context)'}}"
+        onclick="togglePin('${{path}}', this)">📌</button>
+      <button class="ctx-btn" title="Remove from context"
+        onclick="removeFile('${{path}}')">✕</button>
+    </div>`;
   return el;
+}}
+
+function togglePin(path, btn) {{
+  if (pinnedPaths.has(path)) {{
+    pinnedPaths.delete(path);
+    btn.classList.remove('pinned');
+    btn.title = 'Pin (keep in context)';
+  }} else {{
+    pinnedPaths.add(path);
+    btn.classList.add('pinned');
+    btn.title = 'Unpin';
+  }}
+}}
+
+function removeFile(path) {{
+  if (pinnedPaths.has(path)) return;  // can't remove pinned
+  const list = document.getElementById('ctx-list');
+  for (const el of list.querySelectorAll('.ctx-item')) {{
+    if (el.dataset.path === path) {{
+      el.classList.add('ctx-removing');
+      setTimeout(() => el.remove(), 320);
+      break;
+    }}
+  }}
+  activeContext = activeContext.filter(c => c.path !== path);
+  const countEl = document.getElementById('ctx-count');
+  const m = countEl.textContent.match(/of (\\d+)/);
+  const total = m ? m[1] : '?';
+  countEl.textContent = activeContext.length + ' of ' + total + ' candidate' + (total > 1 ? 's' : '');
+}}
+
+// ── Raw doc modal ──────────────────────────────────────────────────────────
+function openRawDocModal() {{
+  document.getElementById('raw-doc-modal').style.display = 'flex';
+  document.getElementById('raw-doc-content').focus();
+}}
+
+function closeRawDocModal(e) {{
+  if (!e || e.target === document.getElementById('raw-doc-modal')) {{
+    document.getElementById('raw-doc-modal').style.display = 'none';
+  }}
+}}
+
+function addRawDoc() {{
+  const name    = (document.getElementById('raw-doc-name').value.trim() || 'raw_doc_' + (rawDocs.length + 1));
+  const content = document.getElementById('raw-doc-content').value.trim();
+  if (!content) return;
+
+  rawDocs.push({{name, content}});
+
+  // Show in sidebar immediately
+  const list = document.getElementById('ctx-list');
+  const el   = makeCtxItem('__raw__/' + name, 'raw');
+  el.dataset.path = '__raw__/' + name;
+  el.classList.add('ctx-adding');
+  list.insertBefore(el, list.firstChild);
+  activeContext.unshift({{path: '__raw__/' + name, type: 'raw'}});
+
+  // Update count
+  const countEl = document.getElementById('ctx-count');
+  const m = countEl.textContent.match(/of (\\d+)/);
+  const total = m ? m[1] : '?';
+  countEl.textContent = activeContext.length + ' of ' + total + ' candidate' + (Number(total) !== 1 ? 's' : '');
+
+  document.getElementById('raw-doc-name').value    = '';
+  document.getElementById('raw-doc-content').value = '';
+  closeRawDocModal();
 }}
 
 function renderContext(ctx) {{
@@ -985,8 +1200,9 @@ function applyContextUpdate(upd) {{
   const reasonEl = document.getElementById('ctx-reasoning');
   reasonEl.textContent = '↻ ' + reason;
 
-  // Remove items (animate out)
+  // Remove items (animate out) — skip pinned files
   for (const f of toRemove) {{
+    if (pinnedPaths.has(f.path)) continue;   // never remove pinned
     for (const el of list.querySelectorAll('.ctx-item')) {{
       if (el.dataset.path === f.path) {{
         el.classList.add('ctx-removing');

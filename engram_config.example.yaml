@@ -190,6 +190,8 @@ retrieval:
     max_pages:          4      # max wiki pages to inject per query
     proper_noun_boost:  3.0    # proper-noun token → 3× score multiplier
     max_count_per_token: 5     # cap token occurrence count (avoids over-scoring)
+    use_qmd:            true   # try QMD BM25 backend first (requires qmd CLI)
+    qmd_collection:     wiki   # name of the QMD collection for compiled wiki pages
 
   # ── Context budget ─────────────────────────────────────────────────────────
   context_budget:
@@ -216,6 +218,29 @@ retrieval:
     # revenue: [arr, arpu, sales]
     # partnership: [deal, agreement, contract]
     # adas: [autonomy, autonomous, self-driving]
+
+
+# ── Active Context Manager (V2) ───────────────────────────────────────────────
+# Controls the Haiku-powered context curation pipeline.
+curator:
+  # Wide scan: how many keyword-matched files to fetch before curation
+  wide_scan_max_files:  30
+
+  # Max files Haiku selects for the context window
+  max_context_files:    10
+
+  # Drift detection: skip Haiku re-curation when topic overlap exceeds this
+  # fraction (Jaccard similarity). Range [0, 1]. Higher = re-curate more often.
+  drift_skip_threshold: 0.45
+
+  # Max session-priming entities to show the curator (from session_priming.json)
+  priming_top_n:        6
+
+  # Max open questions to show the curator (from open_questions.json)
+  open_questions_top_n: 4
+
+  # Monitor: whether to run a post-response context update pass
+  monitor_enabled:      true
 
 
 # ── Domain bundles ────────────────────────────────────────────────────────────
@@ -266,6 +291,41 @@ domain_bundles:
       - pipeline
     patterns:
       - accounts/
+
+
+# ── Continuous ingestion (V2) ─────────────────────────────────────────────────
+# The built-in Python watcher (engram/ingest/watcher.py) polls an inbox folder
+# and compiles new documents automatically. No launchd/cron setup needed.
+#
+# Run:  python3 -m engram.ingest.watcher --inbox /path/to/inbox --memory /path/to/memory-store
+# Or start automatically via the dashboard: dashboard.start_watcher: true (below)
+ingest:
+  enabled:          false       # set true to auto-start watcher with dashboard
+  inbox_path:       null        # defaults to paths.inbox_src if set
+  interval_seconds: 60          # poll every N seconds
+  extensions:       [.md, .txt, .eml, .vtt]
+  model:            "claude-haiku-4-5"
+
+  # ── Redaction — applied pre-compilation to protect PII / sensitive data ──
+  redaction:
+    enabled: false              # set true to activate
+    placeholder: "[REDACTED:{label}]"
+
+    # Built-in rule sets — enable/disable per type
+    builtin_rules:
+      email:        true        # jane@company.com → [REDACTED:email]
+      phone:        true        # +1 555 123-4567 → [REDACTED:phone]
+      ssn:          true        # 123-45-6789 → [REDACTED:ssn]
+      credit_card:  false
+      compensation: false       # €120k / $85,000 / etc — enable for HR data
+
+    # Custom regex rules (in addition to built-ins)
+    rules: []
+    # Example:
+    # rules:
+    #   - name: internal_code
+    #     pattern: 'PRJ-\d{4,6}'
+    #     label: internal_project_code
 
 
 # ── Wiki ingestion ────────────────────────────────────────────────────────────

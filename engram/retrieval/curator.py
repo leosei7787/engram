@@ -7,11 +7,19 @@ Two-pass Haiku-powered context management:
   Pass 1 — curate_context()
     Given ~30-50 candidate files from a wide scan, uses Haiku to select
     the most relevant files (≤ max_files) to load into the context window.
+    Loads session_priming.json and open_questions.json as priors so the
+    curator is aware of recurring topics and unresolved threads.
     Returns the selected candidates + a one-sentence reasoning string.
 
   Pass 2 — monitor_context()
     After the assistant has responded, re-evaluates the active context
     against the full exchange. Returns an add/remove/none action dict.
+
+Drift detection (detect_drift):
+    Compares the current query to the previous user turn. If entity-overlap
+    exceeds DRIFT_SKIP_THRESHOLD, the curator pass is skipped (no Haiku call)
+    and the previous context is reused. Only meaningful topic shifts trigger
+    a full re-curation.
 
 Both passes use the configured backend (CLI or API) with the haiku model.
 On failure or timeout, both fall back gracefully (top-N / no-change).
@@ -27,6 +35,176 @@ from pathlib import Path
 from typing import Optional
 
 from .config import EngramConfig
+from .tokenizer import query_tokens
+
+
+# ─── Drift detection ──────────────────────────────────────────────────────────
+
+# If token overlap between new query and previous user turn exceeds this
+# fraction, skip the Haiku curation pass (context hasn't drifted).
+DRIFT_SKIP_THRESHOLD: float = 0.20
+
+# Common English stop words excluded from drift comparison
+_STOP = frozenset({
+    "what", "who", "is", "are", "the", "a", "an", "in", "on", "at", "of",
+    "to", "for", "and", "or", "but", "from", "with", "about", "this", "that",
+    "can", "will", "how", "me", "tell", "give", "let", "know", "its", "my",
+    "your", "our", "their", "there", "here", "be", "do", "have", "has", "had",
+    "was", "were", "am", "get", "got", "any", "which", "when", "where", "why",
+    "if", "then", "so", "as", "by", "up", "out", "more", "please", "update",
+    "status", "latest", "current", "new", "old", "between", "each", "all",
+})
+
+
+def _drift_tokens(text: str) -> frozenset[str]:
+    """
+    Broad tokenizer for drift detection. Keeps 2-char tokens (e.g. 'vw', 'gm')
+    and strips only the most common stop words. More inclusive than query_tokens.
+    """
+    import re
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9']{0,}", text.lower())
+    return frozenset(w for w in words if len(w) >= 2 and w not in _STOP)
+
+
+def detect_drift(query: str, messages: list[dict]) -> bool:
+    """
+    Return True if the conversation has drifted enough to warrant re-curation.
+
+    Uses Jaccard similarity of query tokens vs the previous user turn.
+    Drift  is detected when similarity < DRIFT_SKIP_THRESHOLD, or when
+    this is the first message in the conversation.
+
+    Args:
+        query:    The current user query.
+        messages: Full message list (current query is last).
+
+    Returns:
+        True  → topic shifted, run full Haiku curation.
+        False → same topic, skip Haiku and reuse previous context.
+    """
+    # First message: always curate
+    prev_user_msgs = [
+        m["content"] for m in messages[:-1]
+        if m.get("role") == "user" and m.get("content")
+    ]
+    if not prev_user_msgs:
+        return True
+
+    prev_query = prev_user_msgs[-1]
+    curr_toks  = _drift_tokens(query)
+    prev_toks  = _drift_tokens(prev_query)
+
+    union = curr_toks | prev_toks
+    if not union:
+        return True
+
+    jaccard = len(curr_toks & prev_toks) / len(union)
+    drifted = jaccard < DRIFT_SKIP_THRESHOLD
+
+    if not drifted:
+        print(
+            f"[curator/drift] no drift (jaccard={jaccard:.2f}) — skipping Haiku curation",
+            flush=True,
+        )
+    else:
+        print(
+            f"[curator/drift] topic shifted (jaccard={jaccard:.2f}) — running curation",
+            flush=True,
+        )
+
+    return drifted
+
+
+# ─── Session priors ───────────────────────────────────────────────────────────
+
+def _load_session_priming(memory_path: Path, top_n: int = 6) -> str:
+    """
+    Load top-N primed entity names from session_priming.json.
+
+    Returns a short string like "Recent focus: VW, AcmeTech, Alice Chen"
+    or empty string if not available.
+    """
+    candidates = [
+        memory_path / "priming" / "session_priming.json",
+        memory_path / "session_priming.json",
+    ]
+    for p in candidates:
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text())
+            # Format: {"default": {"nodes": {"entity_id": strength, ...}}}
+            # or just {"entity_id": strength}
+            nodes: dict = {}
+            if isinstance(data, dict):
+                first = next(iter(data.values()), {})
+                if isinstance(first, dict) and "nodes" in first:
+                    nodes = first["nodes"]  # session_id → PrimingVector dict
+                elif all(isinstance(v, (int, float)) for v in data.values()):
+                    nodes = data
+                else:
+                    # Try each value as a PrimingVector dict
+                    for v in data.values():
+                        if isinstance(v, dict) and "nodes" in v:
+                            nodes.update(v["nodes"])
+
+            if not nodes:
+                return ""
+
+            # Sort by strength, take top-N
+            top = sorted(nodes.items(), key=lambda x: -float(x[1]))[:top_n]
+
+            # Resolve entity IDs to names if graph is accessible
+            graph_file = memory_path / "graph.json"
+            if graph_file.exists():
+                try:
+                    g = json.loads(graph_file.read_text(errors="ignore"))
+                    entities = g.get("entities", {})
+                    names = [
+                        entities.get(eid, {}).get("name", eid)
+                        for eid, _ in top
+                        if entities.get(eid, {}).get("name")
+                    ]
+                    if names:
+                        return "Recent session focus: " + ", ".join(names[:top_n])
+                except Exception:
+                    pass
+
+            # Fallback: just use entity IDs
+            ids = [eid for eid, _ in top]
+            return "Recent session focus: " + ", ".join(ids[:top_n])
+
+        except Exception:
+            continue
+
+    return ""
+
+
+def _load_open_questions(memory_path: Path, top_n: int = 4) -> str:
+    """
+    Load top-N unresolved open questions from open_questions.json.
+
+    Returns a bulleted string or empty string if none.
+    """
+    p = memory_path / "open_questions.json"
+    if not p.exists():
+        return ""
+    try:
+        data = json.loads(p.read_text())
+        qs = data if isinstance(data, list) else data.get("questions", [])
+        open_qs = [
+            q for q in qs
+            if q.get("status") not in ("resolved", "dismissed", "closed")
+            and q.get("text")
+        ]
+        if not open_qs:
+            return ""
+        # Sort by salience if available
+        open_qs.sort(key=lambda q: -float(q.get("salience", 0.5)))
+        texts = [q["text"][:120] for q in open_qs[:top_n]]
+        return "Unresolved open questions:\n" + "\n".join(f"  • {t}" for t in texts)
+    except Exception:
+        return ""
 
 
 # ─── Snippet helpers ──────────────────────────────────────────────────────────
@@ -72,14 +250,15 @@ def build_candidates(
     seen: set[str] = set()
     candidates: list[dict] = []
 
-    def _add(paths: list[str], kind: str) -> None:
+    def _add(paths: list[str], kind: str, source_tier: str = "") -> None:
         for p in paths:
             if p not in seen:
                 seen.add(p)
                 candidates.append({
-                    "path":    p,
-                    "type":    kind,
-                    "snippet": _snippet(p, base, snippet_chars),
+                    "path":        p,
+                    "type":        kind,
+                    "source_tier": source_tier,
+                    "snippet":     _snippet(p, base, snippet_chars),
                 })
 
     _add(scan.get("direct", []), "memory")
@@ -186,19 +365,34 @@ def curate_context(
     HAIKU_CAP = 25
     haiku_cands = candidates[:HAIKU_CAP]
 
+    # Load session priors (priming + open questions)
+    memory_path = getattr(cfg, "memory_path", None)
+    priming_ctx = _load_session_priming(memory_path) if memory_path else ""
+    oq_ctx      = _load_open_questions(memory_path)  if memory_path else ""
+
     # Build concise candidate list for the prompt
     lines: list[str] = []
     for i, c in enumerate(haiku_cands):
         name    = Path(c["path"]).stem.replace("_", " ")
         snippet = c["snippet"][:100].replace("\n", " ")
-        lines.append(f"[{i}] {name}: {snippet}")
+        tier    = c.get("source_tier", "")
+        tier_tag = f" [{tier}]" if tier else ""
+        lines.append(f"[{i}]{tier_tag} {name}: {snippet}")
+
+    prior_block = ""
+    if priming_ctx:
+        prior_block += priming_ctx + "\n"
+    if oq_ctx:
+        prior_block += oq_ctx + "\n"
 
     prompt = (
-        f'Context curator for AcmeCorp CPO assistant.\n'
-        f'Query: "{query}"\n\n'
+        f'Context curator for a CPO knowledge assistant.\n'
+        + (f'{prior_block}\n' if prior_block else "")
+        + f'Query: "{query}"\n\n'
         f'Candidates (select ≤{max_files}):\n'
         + "\n".join(lines) +
-        f'\n\nPick the MOST relevant. Prefer: named entities in query, active deals, recent decisions.\n'
+        f'\n\nPick the MOST relevant. Prefer: named entities in query, active deals, '
+        f'recent decisions, files matching open questions.\n'
         f'JSON only: {{"selected": [0,2,5], "reasoning": "one sentence"}}'
     )
 
