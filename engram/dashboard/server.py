@@ -225,6 +225,36 @@ def chat():
         trunc  = cfg.retrieval.context_budget.wiki_page_truncate_chars
         used   = 0
 
+        # ── Always-load files (CLAUDE.md, preferences…) ──────────────────────
+        # Prepended before dynamic context — always in window regardless of query.
+        always_paths = list(getattr(cfg.system_prompt, "always_load", None) or [])
+        for rel in always_paths:
+            p = Path(rel) if Path(rel).is_absolute() else base / rel
+            if not p.exists():
+                continue
+            try:
+                content = p.read_text(errors="ignore")[:20000]
+                system_parts.append(f"\n\n---\n# {p.name} (always loaded)\n\n{content}")
+                used += len(content)
+            except Exception:
+                pass
+
+        # ── Calendar auto-load ────────────────────────────────────────────────
+        # Finds the most-recently modified file matching calendar* in memory tree.
+        # Keeps everyone oriented to upcoming commitments every turn.
+        cal_patterns = list(getattr(cfg.system_prompt, "calendar_globs", None) or ["calendar*.md"])
+        cal_hits: list[Path] = []
+        for pat in cal_patterns:
+            cal_hits.extend(base.rglob(pat))
+        if cal_hits and used < budget:
+            cal_file = max(cal_hits, key=lambda f: f.stat().st_mtime)
+            try:
+                cal_content = cal_file.read_text(errors="ignore")[:8000]
+                system_parts.append(f"\n\n---\n# Upcoming calendar ({cal_file.name})\n\n{cal_content}")
+                used += len(cal_content)
+            except Exception:
+                pass
+
         for c in selected:
             if used >= budget:
                 break
