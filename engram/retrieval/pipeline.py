@@ -39,6 +39,7 @@ Usage:
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -48,6 +49,27 @@ from .keyword import fast_file_score
 from .graph import load_graph, spreading_activation, entity_seed_ids, graph_context_block, activated_to_files
 from .wiki import wiki_scan
 from .domain_bundles import match_domain_bundles, bundles_from_config
+
+
+# ─── Graph cache ──────────────────────────────────────────────────────────────
+# graph.json is read on every scan. For Leo's 224-contradiction store this
+# costs 100-300ms per call. Cache by mtime so multi-turn chats reuse it.
+_GRAPH_CACHE: dict = {"path": None, "mtime": 0.0, "graph": None}
+
+
+def _cached_graph(graph_file: Path):
+    if not graph_file.exists():
+        return None
+    m = graph_file.stat().st_mtime
+    if (
+        _GRAPH_CACHE["path"] == str(graph_file)
+        and _GRAPH_CACHE["mtime"] == m
+        and _GRAPH_CACHE["graph"] is not None
+    ):
+        return _GRAPH_CACHE["graph"]
+    g = load_graph(graph_file)
+    _GRAPH_CACHE.update({"path": str(graph_file), "mtime": m, "graph": g})
+    return g
 
 
 # ─── Main pipeline ────────────────────────────────────────────────────────────
@@ -85,29 +107,55 @@ def memory_scan(
     t0 = time.time()
     synonyms = getattr(ret_cfg, "synonyms", {}) or {}
 
-    # ── Stage 1: keyword scan ─────────────────────────────────────────────────
-    FETCH_CAP = max(max_files * 2, 16)
+    # ── Parallel kick-off: keyword scan + wiki scan ──────────────────────────
+    # The wiki QMD subprocess (~400-600ms) and keyword scan (~300-500ms) are
+    # independent — run them concurrently to halve wall-clock time.
+    FETCH_CAP   = max(max_files * 2, 16)
     people_file = memory_path / "context" / "people.md"
 
-    ranked = fast_file_score(
-        query, memory_path, base_path,
-        max_files        = FETCH_CAP,
-        body_read_chars  = kw_cfg.body_read_chars,
-        path_boosts      = kw_cfg.path_boosts,
-        filename_match   = kw_cfg.filename_match,
-        score_components = kw_cfg.score_components,
-        dynamic_caps     = kw_cfg.dynamic_caps,
-        meeting_from_person = kw_cfg.meeting_from_person,
-        scan_exclude     = kw_cfg.scan_exclude,
-        people_file      = people_file if people_file.exists() else None,
-        synonyms         = synonyms,
-    )
+    def _stage1_keyword():
+        return fast_file_score(
+            query, memory_path, base_path,
+            max_files        = FETCH_CAP,
+            body_read_chars  = kw_cfg.body_read_chars,
+            path_boosts      = kw_cfg.path_boosts,
+            filename_match   = kw_cfg.filename_match,
+            score_components = kw_cfg.score_components,
+            dynamic_caps     = kw_cfg.dynamic_caps,
+            meeting_from_person = kw_cfg.meeting_from_person,
+            scan_exclude     = kw_cfg.scan_exclude,
+            people_file      = people_file if people_file.exists() else None,
+            synonyms         = synonyms,
+        )
+
+    def _stage4_wiki():
+        try:
+            return wiki_scan(
+                query, wiki_path,
+                max_pages           = wi_cfg.max_pages,
+                proper_noun_boost   = wi_cfg.proper_noun_boost,
+                max_count_per_token = wi_cfg.max_count_per_token,
+                topics              = cfg.wiki.topics,
+                synonyms            = synonyms,
+                use_qmd             = getattr(wi_cfg, "use_qmd", True),
+                qmd_collection      = getattr(wi_cfg, "qmd_collection", "wiki"),
+            )
+        except Exception as e:
+            print(f"[memory_scan] stage4 wiki error: {e}", flush=True)
+            return []
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        kw_future   = ex.submit(_stage1_keyword)
+        wiki_future = ex.submit(_stage4_wiki)
+        ranked      = kw_future.result()
+        wiki_files  = wiki_future.result()
+
     all_scored  = [rel for rel, _score in ranked]
     direct      = all_scored[:max_files]
     suggestions = all_scored[max_files:]
 
-    ms1 = (time.time() - t0) * 1000
-    print(f"[memory_scan] stage1 keyword: {len(direct)} files in {ms1:.0f}ms", flush=True)
+    ms_par = (time.time() - t0) * 1000
+    print(f"[memory_scan] stages 1+4 parallel: {len(direct)} kw + {len(wiki_files)} wiki in {ms_par:.0f}ms", flush=True)
 
     # ── Stage 2: domain bundles ────────────────────────────────────────────────
     if bundles:
@@ -120,13 +168,13 @@ def memory_scan(
         if added:
             print(f"[memory_scan] stage2 bundles: +{added} files", flush=True)
 
-    # ── Stage 3: graph spreading activation ───────────────────────────────────
-    graph_extra   = []
+    # ── Stage 3: graph spreading activation (uses cached graph) ──────────────
+    graph_extra    = []
     _graph_context = ""
-    graph_file    = memory_path / "graph.json"
+    graph_file     = memory_path / "graph.json"
 
     try:
-        g        = load_graph(graph_file)
+        g = _cached_graph(graph_file) or {}
         entities = g.get("entities", {})
 
         if entities:
@@ -177,24 +225,9 @@ def memory_scan(
     except Exception as e:
         print(f"[memory_scan] stage3 graph error: {e}", flush=True)
 
-    # ── Stage 4: wiki scan ────────────────────────────────────────────────────
-    wiki_files: list[str] = []
-    try:
-        wiki_files = wiki_scan(
-            query, wiki_path,
-            max_pages           = wi_cfg.max_pages,
-            proper_noun_boost   = wi_cfg.proper_noun_boost,
-            max_count_per_token = wi_cfg.max_count_per_token,
-            topics              = cfg.wiki.topics,
-            synonyms            = synonyms,
-            use_qmd             = getattr(wi_cfg, "use_qmd", True),
-            qmd_collection      = getattr(wi_cfg, "qmd_collection", "wiki"),
-        )
-        if wiki_files:
-            print(f"[memory_scan] stage4 wiki: {len(wiki_files)} pages — "
-                  f"{', '.join(Path(p).stem[:30] for p in wiki_files)}", flush=True)
-    except Exception as e:
-        print(f"[memory_scan] stage4 wiki error: {e}", flush=True)
+    if wiki_files:
+        print(f"[memory_scan] wiki: {len(wiki_files)} pages — "
+              f"{', '.join(Path(p).stem[:30] for p in wiki_files)}", flush=True)
 
     # ── Finalise ──────────────────────────────────────────────────────────────
     loaded_set  = set(direct) | set(graph_extra)
