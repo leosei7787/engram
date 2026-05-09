@@ -198,6 +198,25 @@ retrieval:
     graph_block_max_high:     6     # max "High relevance" entities in graph block
     graph_block_max_related:  4     # max "Also related" entities in graph block
 
+  # ── Synonym groups ──────────────────────────────────────────────────────────
+  # Bidirectional: any member of a group in the query pulls in all other members.
+  # Use this to bridge: abbreviations, domain jargon, spelling variants, acronyms.
+  # Example queries that benefit:
+  #   "car company deal"    → also matches files with "automotive", "vehicle"
+  #   "vw counter-offer"    → also matches files with "acmemotors", "acmetech"
+  #   "hiring status"       → also matches files with "recruit", "recruitment"
+  synonyms:
+    # Abbreviations / aliases
+    # vw: [acmemotors, acmetech]
+    # msft: [microsoft]
+    # gm: [general motors]
+    # Jargon / domain equivalents
+    # automotive: [car, vehicle, vehicles]
+    # hire: [recruit, recruitment, recruiting, headcount]
+    # revenue: [arr, arpu, sales]
+    # partnership: [deal, agreement, contract]
+    # adas: [autonomy, autonomous, self-driving]
+
 
 # ── Domain bundles ────────────────────────────────────────────────────────────
 # Force-load specific file path patterns when query matches trigger words.

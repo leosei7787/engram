@@ -5,6 +5,11 @@ engram.retrieval.tokenizer — Query tokenization
 Converts a natural-language query into a set of signal tokens for keyword
 matching. Also extracts proper-noun candidates and person-name hints for
 meeting/email queries.
+
+New in v0.2: stem_token(), stemmed_tokens(), expand_with_synonyms()
+  - stem_token()          lightweight suffix stemmer (no deps)
+  - stemmed_tokens()      set of stems for a token set
+  - expand_with_synonyms() bidirectional synonym expansion from config
 """
 
 from __future__ import annotations
@@ -118,3 +123,117 @@ def query_person_names(query: str, people_file: Optional[Path] = None) -> set:
         known_first.add(m.group(1))
 
     return candidates & known_first
+
+
+# ─── Stemmer ─────────────────────────────────────────────────────────────────
+#
+# A lightweight suffix stemmer — no external deps. Not Porter-complete, but
+# handles the most common English morphological variants well enough for BM25-
+# style retrieval. Suffixes are tried longest-first so we don't double-strip.
+#
+# Examples:
+#   meetings  → meet    hiring  → hir    decided  → decid
+#   decisions → decis   hired   → hir    recruiter → recruit
+#   accounts  → account companies → compan  strategic → strateg
+
+_STEM_SUFFIXES: tuple = (
+    # 6-char
+    "ations",                       # examinations → examin
+    "nesses",                       # businesses → busin
+    # 5-char
+    "ments",                        # agreements → agreem
+    "tions",                        # organisations → organis
+    "ings",                         # meetings → meet
+    # 4-char
+    "ions",                         # decisions → decis, opinions → opin
+    "ness",                         # business → busin
+    "ment",                         # agreement → agreem
+    "tion",                         # station → stat
+    "ers",                          # recruiters → recruit
+    "ies",                          # companies → compan
+    "ied",                          # occupied → occupi
+    # 3-char
+    "ics",                          # logistics → logist, analytics → analyt
+    "ing",                          # deciding → decid, hiring → hir
+    "ion",                          # decision → decis, option → opt
+    # 2-char
+    "ic",                           # strategic → strateg, logistic → logist
+    "ed",                           # decided → decid, hired → hir
+    "er",                           # recruiter → recruit
+    "es",                           # decides → decid
+    "ly",                           # quickly → quick
+    "al",                           # seasonal → season
+    # 1-char (last resort — plurals)
+    "s",                            # accounts → account
+)
+
+_STEM_MIN_ROOT: int = 3  # shortest root we'll keep after stripping
+
+
+def stem(word: str) -> str:
+    """
+    Strip the longest matching English suffix, keeping a minimum root length.
+
+    This is the base stem — use stem_token() for retrieval (adds 'e' normalisation).
+    """
+    for sfx in _STEM_SUFFIXES:
+        if word.endswith(sfx) and len(word) - len(sfx) >= _STEM_MIN_ROOT:
+            return word[: -len(sfx)]
+    return word
+
+
+def stem_token(word: str) -> str:
+    """
+    Stem + strip trailing 'e' so hire/hiring/hired all normalise to 'hir'.
+
+    This is the canonical form used for cross-token matching during retrieval.
+    Both query tokens and document tokens should be normalised with this function
+    before comparing stems.
+    """
+    s = stem(word)
+    # Strip trailing 'e' only when root stays >= _STEM_MIN_ROOT chars.
+    # This collapses pairs like decide/deciding → decid, hire/hiring → hir.
+    return s.rstrip("e") if len(s) > _STEM_MIN_ROOT else s
+
+
+def stemmed_tokens(tokens: set) -> set:
+    """Return the set of normalised stems for a token set."""
+    return {stem_token(t) for t in tokens if len(t) >= _STEM_MIN_ROOT}
+
+
+# ─── Synonym expansion ────────────────────────────────────────────────────────
+
+def expand_with_synonyms(tokens: set, synonyms: dict) -> set:
+    """
+    Expand a token set with configured synonyms (bidirectional).
+
+    synonyms format (from config YAML):
+
+        retrieval:
+          synonyms:
+            automotive: [car, vehicle, vehicles]
+            vw: [acmemotors, acmetech]
+            hire: [recruit, recruitment, recruiting]
+
+    Logic:
+      - If ANY member of a synonym group appears in tokens, ALL members are added.
+      - This means "vw" in query → adds "acmemotors"; "acmemotors" in query → adds "vw".
+
+    Args:
+        tokens:   Set of query tokens (from query_tokens()).
+        synonyms: Dict from config (key → list of equivalents).
+
+    Returns:
+        Expanded token set (always a superset of the input).
+    """
+    if not synonyms:
+        return tokens
+
+    expanded = set(tokens)
+    for key, vals in synonyms.items():
+        key_l   = key.lower()
+        vals_l  = {v.lower() for v in vals}
+        group   = {key_l} | vals_l
+        if tokens & group:        # any member of the group found in query?
+            expanded |= group     # pull in all equivalents
+    return expanded

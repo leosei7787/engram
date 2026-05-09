@@ -83,6 +83,7 @@ def memory_scan(
     bundles      = bundles_from_config(cfg.domain_bundles)
 
     t0 = time.time()
+    synonyms = getattr(ret_cfg, "synonyms", {}) or {}
 
     # ── Stage 1: keyword scan ─────────────────────────────────────────────────
     FETCH_CAP = max(max_files * 2, 16)
@@ -99,6 +100,7 @@ def memory_scan(
         meeting_from_person = kw_cfg.meeting_from_person,
         scan_exclude     = kw_cfg.scan_exclude,
         people_file      = people_file if people_file.exists() else None,
+        synonyms         = synonyms,
     )
     all_scored  = [rel for rel, _score in ranked]
     direct      = all_scored[:max_files]
@@ -184,6 +186,7 @@ def memory_scan(
             proper_noun_boost   = wi_cfg.proper_noun_boost,
             max_count_per_token = wi_cfg.max_count_per_token,
             topics              = cfg.wiki.topics,
+            synonyms            = synonyms,
         )
         if wiki_files:
             print(f"[memory_scan] stage4 wiki: {len(wiki_files)} pages — "
