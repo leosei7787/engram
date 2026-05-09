@@ -90,6 +90,10 @@ That's it. Drop `.md`, `.txt`, `.eml`, or `.vtt` files into your inbox folder an
 
 It creates the full folder skeleton and writes `~/.engram/config.yaml` from the example template. Run with `--non-interactive` for CI / headless environments.
 
+### Maintenance scripts
+
+- `scripts/prune-stale-graph.py` — sweeps `MEMORY/graph.json` of source pointers to files that no longer exist on disk (typical after email-cleanup runs that delete dropped marketing). Dry-run by default; pass `--apply` to write, with a timestamped backup.
+
 ---
 
 ## Configuration
@@ -232,12 +236,14 @@ The wiki format uses **Obsidian-compatible `[[wikilinks]]`** for cross-referenci
 
 `python3 engram/dashboard/server.py` starts a local web UI at `http://localhost:7090`.
 
-Features:
-- **Chat** — streamed responses via Claude CLI or Anthropic API
-- **Active context sidebar** — live view of files in context; pin, remove, or add raw documents
-- **Context reasoning** — Haiku's curation rationale shown per query
-- **Stats panel** — memory-store health, graph entity counts, wiki page counts, sleep cycle status
-- **Deep Work mode** — multi-specialist advisory panel for complex strategic questions
+Three tabs:
+
+- **Chat** (`/`) — streamed responses via Claude CLI or Anthropic API. Includes a live active-context sidebar (pin / remove / inject raw docs), per-query Haiku curation rationale, and Deep Work mode for multi-specialist advisory output.
+- **Top of Mind** (`/top-of-mind`) — focused executive view that surfaces:
+  - **High-stakes events** — keyword-scored upcoming meetings (board, steering, QBR, exec, decisions, kickoffs, …) from the ICS feed, with structural boosts for long/in-person and demotion of personal items
+  - **Pending proposals** — memory writes awaiting save / skip from `MEMORY/proposals/index.json`, ranked by salience
+  - **Deadlines from emails** — phrases like "due by", "deadline", "submit by" extracted from recent emails in `MEMORY/daily/emails/`, with click-through to the source
+- **Engram Health** (`/health`) — three-pillar dashboard for memory-store health, graph entity counts, wiki page counts, sleep cycle status, recent activity, and contradictions / open-questions queues.
 
 ---
 
