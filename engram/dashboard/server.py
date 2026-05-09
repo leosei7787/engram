@@ -262,6 +262,41 @@ def _start_watcher(cfg: EngramConfig):
     print(f"[watcher] started — watching {inbox_path}", flush=True)
 
 
+# ─── Inbox save (chat uploads also enter the long-term pipeline) ──────────────
+# Files / pasted text submitted via the chat sidebar modal are normally
+# ephemeral (live only in the browser's rawDocs array, gone on tab close).
+# To make them part of long-term knowledge, we drop a copy into the watcher's
+# inbox folder — the next watcher cycle (≤60s) ingests it through the full
+# pipeline (cleaner, redactor, future dream-cycle extraction).
+
+def _save_to_inbox(filename: str, data: bytes) -> Path | None:
+    """Save bytes to the inbox folder for watcher pickup.
+
+    Returns the path written, or None if no inbox is configured / save failed.
+    Filename is sanitised and timestamped to avoid collisions; the watcher
+    de-dupes by content hash anyway.
+    """
+    cfg = get_cfg()
+    inbox = getattr(getattr(cfg, "paths", None), "inbox_src", None)
+    if not inbox:
+        return None
+    inbox_path = Path(inbox).expanduser()
+    if not inbox_path.exists():
+        return None
+    stem = Path(filename).stem
+    ext  = Path(filename).suffix or ".md"
+    safe_stem = re.sub(r"[^\w\-]", "_", stem)[:80] or "chat_upload"
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out = inbox_path / f"chat_upload_{ts}_{safe_stem}{ext}"
+    try:
+        out.write_bytes(data)
+        print(f"[chat/upload] saved to inbox for pipeline ingest: {out.name}", flush=True)
+        return out
+    except Exception as e:
+        print(f"[chat/upload] inbox save failed: {e}", flush=True)
+        return None
+
+
 # ─── Claude backend helpers ───────────────────────────────────────────────────
 
 def _format_messages_for_cli(messages: list) -> str:
@@ -1126,7 +1161,15 @@ def config_info():
 
 @app.route("/api/upload", methods=["POST"])
 def upload_doc():
-    """Accept file upload and return extracted text for context injection."""
+    """Accept file upload and return extracted text for context injection.
+
+    Also saves the original bytes to the watcher's inbox folder so the file
+    enters the long-term knowledge pipeline (cleaner → memory → graph) for
+    future chat sessions. The current chat keeps its in-memory raw_docs copy
+    for immediate use.
+    """
+    from io import BytesIO
+
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "no file"}), 400
@@ -1134,14 +1177,22 @@ def upload_doc():
     name = f.filename or "document"
     ext  = Path(name).suffix.lower()
 
+    # Read bytes once — the parsers below all accept BytesIO, and we need
+    # the bytes for the inbox copy too.
+    try:
+        raw_bytes = f.read()
+    except Exception as e:
+        print(f"[upload] read failed: {e}", flush=True)
+        return jsonify({"error": "could not read uploaded file"}), 500
+
     try:
         if ext in (".txt", ".md", ".eml", ".vtt", ".csv"):
-            content = f.read().decode("utf-8", errors="ignore")
+            content = raw_bytes.decode("utf-8", errors="ignore")
 
         elif ext == ".pdf":
             try:
                 import pypdf
-                reader  = pypdf.PdfReader(f)
+                reader  = pypdf.PdfReader(BytesIO(raw_bytes))
                 content = "\n\n".join(
                     page.extract_text() or "" for page in reader.pages
                 )
@@ -1150,12 +1201,12 @@ def upload_doc():
 
         elif ext == ".docx":
             from docx import Document as DocxDoc
-            doc     = DocxDoc(f)
+            doc     = DocxDoc(BytesIO(raw_bytes))
             content = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
 
         elif ext == ".pptx":
             from pptx import Presentation as PptxPrs
-            prs     = PptxPrs(f)
+            prs     = PptxPrs(BytesIO(raw_bytes))
             content = "\n".join(
                 shape.text for slide in prs.slides
                 for shape in slide.shapes if hasattr(shape, "text") and shape.text.strip()
@@ -1168,11 +1219,39 @@ def upload_doc():
         if not content:
             return jsonify({"error": "File appears to be empty or could not be parsed"}), 400
 
-        stem = Path(name).stem
-        return jsonify({"name": stem, "content": content, "chars": len(content)})
+        # Drop the original bytes into the inbox so the watcher picks it up
+        # for long-term ingestion. Failures are non-fatal: the immediate
+        # chat still works without long-term persistence.
+        saved_path = _save_to_inbox(name, raw_bytes)
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        stem = Path(name).stem
+        return jsonify({
+            "name":           stem,
+            "content":        content,
+            "chars":          len(content),
+            "saved_to_inbox": str(saved_path) if saved_path else None,
+        })
+
+    except Exception:
+        import traceback as _tb
+        print("[upload] extraction error:\n" + _tb.format_exc(), flush=True)
+        return jsonify({"error": "Failed to parse file — check server log."}), 500
+
+
+@app.route("/api/inbox-save", methods=["POST"])
+def inbox_save_paste():
+    """Save pasted-text content to the watcher's inbox as a markdown file.
+
+    Used by the chat sidebar's raw-doc modal when the user enters content via
+    the textarea (rather than file upload). Body: {"name": str, "content": str}.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    name    = (body.get("name", "")    or "raw_paste").strip()
+    content = (body.get("content", "") or "")
+    if not content.strip():
+        return jsonify({"error": "no content"}), 400
+    saved = _save_to_inbox(f"{name}.md", content.encode("utf-8"))
+    return jsonify({"saved_to_inbox": str(saved) if saved else None})
 
 
 @app.route("/api/export", methods=["POST"])
@@ -3091,9 +3170,16 @@ function openOutputsFolder() {{
 refreshOutputs();
 
 // ── Raw doc modal ──────────────────────────────────────────────────────────
+// Uploads do double duty: the extracted text is added to rawDocs for the
+// current session, AND the original bytes go to the watcher's inbox so the
+// file enters the long-term pipeline (cleaner → memory → graph) for future
+// chats. For paste-only content we POST /api/inbox-save in parallel.
+let _lastUploadInboxPath = null;   // set by /api/upload, consumed by addRawDoc
+
 function openRawDocModal() {{
   document.getElementById('raw-doc-modal').style.display = 'flex';
   document.getElementById('raw-doc-content').focus();
+  _lastUploadInboxPath = null;
 }}
 
 function closeRawDocModal(e) {{
@@ -3122,7 +3208,10 @@ async function handleFileUpload(input) {{
     }} else {{
       document.getElementById('raw-doc-name').value    = data.name;
       document.getElementById('raw-doc-content').value = data.content;
-      zone.querySelector('.ctx-modal-upload-label').textContent = '✓ ' + file.name + ' (' + data.chars.toLocaleString() + ' chars)';
+      _lastUploadInboxPath = data.saved_to_inbox || null;
+      const inboxNote = _lastUploadInboxPath ? '  ·  saved for future sessions' : '';
+      zone.querySelector('.ctx-modal-upload-label').textContent =
+        '✓ ' + file.name + ' (' + data.chars.toLocaleString() + ' chars)' + inboxNote;
     }}
   }} catch (err) {{
     alert('Upload failed: ' + err.message);
@@ -3152,6 +3241,19 @@ function addRawDoc() {{
   const m = countEl.textContent.match(/of (\\d+)/);
   const total = m ? m[1] : '?';
   countEl.textContent = activeContext.length + ' of ' + total + ' candidate' + (Number(total) !== 1 ? 's' : '');
+
+  // If the content didn't come from a file upload (i.e. user pasted directly),
+  // ship a markdown copy to the inbox so it enters long-term pipeline. Fire
+  // and forget — failure here just means no long-term persistence; the
+  // current chat still has the rawDoc in context.
+  if (!_lastUploadInboxPath) {{
+    fetch('/api/inbox-save', {{
+      method:  'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body:    JSON.stringify({{name, content}}),
+    }}).catch(() => {{}});
+  }}
+  _lastUploadInboxPath = null;
 
   document.getElementById('raw-doc-name').value    = '';
   document.getElementById('raw-doc-content').value = '';
