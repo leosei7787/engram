@@ -6,6 +6,13 @@
       "runtimeExecutable": "python3",
       "runtimeArgs": ["engram/dashboard/server.py"],
       "port": 7090
+    },
+    {
+      "name": "engram dashboard (worktree)",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["engram/dashboard/server.py"],
+      "port": 7091,
+      "env": { "ENGRAM_PORT": "7091" }
     }
   ]
 }
