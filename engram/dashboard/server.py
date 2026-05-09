@@ -847,10 +847,14 @@ def _classify_interjection(in_flight: str, partial: str, new_msg: str, cfg) -> d
                 capture_output=True, text=True, timeout=10,
             )
             text = (proc.stdout or "").strip()
-    except Exception as e:
+    except Exception:
+        # Log the full traceback server-side; return a generic reason to the
+        # client so we don't leak stack details (CodeQL py/stack-trace-exposure).
+        import traceback as _tb
+        print("[chat/interject] classifier error:\n" + _tb.format_exc(), flush=True)
         return {
             "action":     "continue",
-            "reason":     f"classifier error — defaulting to continue ({e})",
+            "reason":     "classifier unavailable — defaulting to continue",
             "latency_ms": int((_t.time() - t0) * 1000),
             "source":     "fallback",
         }
@@ -2476,9 +2480,9 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
     <span class="logo-name">engram<span class="logo-org">{org}</span></span>
   </a>
   <nav class="tabs">
-    <a class="tab {'active' if active_tab == 'chat' else ''}" href="/" id="tab-chat">Chat</a>
-    <a class="tab {'active' if active_tab == 'top-of-mind' else ''}" href="/top-of-mind" id="tab-top-of-mind">Top of Mind</a>
-    <a class="tab {'active' if active_tab == 'health' else ''}" href="/health" id="tab-health">Engram Health</a>
+    <a class="tab {'active' if active_tab == 'chat' else ''}" href="/" data-tab="chat" id="tab-chat" onclick="return switchTab(event, 'chat')">Chat</a>
+    <a class="tab {'active' if active_tab == 'top-of-mind' else ''}" href="/top-of-mind" data-tab="top-of-mind" id="tab-top-of-mind" onclick="return switchTab(event, 'top-of-mind')">Top of Mind</a>
+    <a class="tab {'active' if active_tab == 'health' else ''}" href="/health" data-tab="health" id="tab-health" onclick="return switchTab(event, 'health')">Engram Health</a>
   </nav>
   <div class="topbar-right">
     <div class="badge-live"><div class="badge-live-dot"></div>Live</div>
@@ -3734,17 +3738,52 @@ function closeHealthDetail(e) {{
   }}
 }}
 
-// Load health on page if on /health
-if (document.getElementById('panel-health').classList.contains('active')) {{
-  loadHealth();
-  setInterval(loadHealth, 30000);
+// ── SPA tab switching ─────────────────────────────────────────────────────
+// Anchors keep their hrefs (so right-click → open in new tab still works)
+// but normal clicks toggle panels in place — chat state, in-flight stream,
+// rawDocs, pinned context all survive navigation between tabs.
+const TAB_PATHS = {{ chat: '/', 'top-of-mind': '/top-of-mind', health: '/health' }};
+
+function switchTab(ev, name) {{
+  if (ev) {{
+    if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.button === 1) return true;
+    ev.preventDefault();
+  }}
+  _applyTab(name);
+  const path = TAB_PATHS[name] || '/';
+  if (location.pathname !== path) history.pushState({{tab: name}}, '', path);
+  return false;
 }}
 
-// Load top-of-mind if on /top-of-mind
-if (document.getElementById('panel-top-of-mind').classList.contains('active')) {{
-  loadTopOfMind();
-  setInterval(loadTopOfMind, 60000);
+function _applyTab(name) {{
+  document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === name));
+  document.querySelectorAll('.tab-panel').forEach(el => {{
+    el.classList.toggle('active', el.id === 'panel-' + name);
+  }});
+  // Trigger per-tab data load (each handler self-skips when not active).
+  if (name === 'health')      loadHealth();
+  if (name === 'top-of-mind') loadTopOfMind();
 }}
+
+window.addEventListener('popstate', (e) => {{
+  const name = (e.state && e.state.tab) || _tabFromPath(location.pathname);
+  _applyTab(name);
+}});
+
+function _tabFromPath(p) {{
+  if (p === '/health')       return 'health';
+  if (p === '/top-of-mind')  return 'top-of-mind';
+  return 'chat';
+}}
+
+// Always-on refresh intervals — the load functions self-skip when their
+// panel isn't active, so this is cheap and means newly-switched-to tabs
+// stay fresh without any extra wiring.
+setInterval(loadHealth,     30000);
+setInterval(loadTopOfMind,  60000);
+// Initial load for whichever tab is active at page-load time.
+loadHealth();
+loadTopOfMind();
 
 // Drag-and-drop on the upload zone
 document.addEventListener('DOMContentLoaded', () => {{
