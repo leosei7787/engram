@@ -2139,7 +2139,7 @@ function loadHealth() {{
   }}).catch(() => {{}});
 }}
 
-function renderHealth(data) {{
+async function renderHealth(data) {{
   const c = data.compile || {{}}, d = data.dream || {{}}, r = data.retrieve || {{}};
 
   // Compile pillar
