@@ -144,6 +144,8 @@ The dashboard sidebar shows the current context set in real time with controls t
 - **Retrieval-Induced Strengthening (RIS)**: retrieval itself strengthens memory
 - **Forgetting curve**: exponential decay, slower for high-salience facts
 - **Contradiction engine**: detects and tracks conflicting claims
+- **Rejected-claims registry** (`MEMORY/.rejected_claims.json`): user resolutions persist as ground truths. Cascades across related contradictions (e.g. "Leo reports_to Mike" auto-dismisses every other "Leo reports_to *" claim). Future extractions check this registry before generating new contradictions.
+- **Source-quality filter**: org-structure relations (`reports_to`, `manages`, `ceo_of`...) are only trusted from authoritative sources (`CLAUDE.md`, `context/people.md`, `decisions/*`). Random emails and transcripts can't fabricate reporting lines anymore.
 - **Open questions**: surfaces gaps; fed to the curator as priors
 - **Session priming**: `session_priming.json` hot-starts activation for recurring entities
 - **Reconstructive synthesis**: generates coherent briefings, not concatenated chunks
@@ -155,7 +157,7 @@ The dashboard sidebar shows the current context set in real time with controls t
 
 ## Continuous ingestion
 
-The Python watcher (`engram/ingest/watcher.py`) polls an inbox folder and compiles new documents automatically — no launchd, cron, or systemd setup needed.
+The Python watcher (`engram/ingest/watcher.py`) polls an inbox folder and compiles new documents automatically — no launchd, cron, or systemd setup needed. **It auto-starts with the dashboard** when `paths.inbox_src` is set in config.yaml.
 
 ```bash
 # Start manually
@@ -163,13 +165,31 @@ python3 -m engram.ingest.watcher \
   --inbox ~/engram/inbox \
   --memory ~/engram/memory-store \
   --interval 60
-
-# Or enable auto-start with the dashboard in config.yaml:
-# ingest:
-#   enabled: true
 ```
 
-The watcher tracks already-processed files by content hash (`.watcher_seen.json`) so re-runs are safe.
+The watcher tracks already-processed files by content hash (`.watcher_seen.json`) so re-runs are safe. The dashboard exposes a "Watcher" chip showing live ingest counts and a `/api/watcher-rescan` endpoint to wipe the registry and re-process everything.
+
+### Email noise stripping (`engram/ingest/cleaner.py`)
+
+Raw HTML email is 90%+ CSS, tracking pixels, and marketing junk. The cleaner runs on every file the watcher picks up:
+
+1. **Marketing classifier** — sender-domain + subject-pattern + body-heuristic. Marketing emails (Uber Eats, airline upsells, newsletters) are *silently dropped* with a reason logged in `watcher_status.skipped_recent`.
+2. **HTML/CSS stripper** — removes `<style>`/`<script>`/`<svg>` blocks, decodes entities, collapses whitespace.
+3. **Reply-chain truncation** — cuts everything below the first `On <date> wrote:` boundary so threads don't compound.
+4. **Header extraction** — pulls From/Subject/Date into clean markdown frontmatter.
+
+Typical reduction: 40 KB raw HTML email → 2 KB signal. Real measurement on 1,263-file inbox: **88 % size reduction, 37 marketing emails dropped automatically**.
+
+POST `/api/clean-emails` runs the cleaner over the entire `daily/emails/` folder retroactively. A backup folder is created before any destructive change.
+
+Optional local-LLM summarization (off by default):
+
+```bash
+export ENGRAM_LOCAL_LLM=ollama
+export ENGRAM_LOCAL_LLM_MODEL=llama3.2:3b
+```
+
+The cleaner will then pipe each cleaned email through Ollama for a 3-5 bullet summary. Falls back silently if Ollama isn't installed.
 
 ### PII Redaction
 

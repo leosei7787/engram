@@ -39,6 +39,7 @@ from engram.retrieval.config import load_config, EngramConfig
 from engram.retrieval.pipeline import memory_scan
 from engram.retrieval.curator import build_candidates, curate_context, monitor_context, detect_drift
 from engram.ingest.watcher import InboxWatcher
+from engram.ingest.cleaner import EmailCleaner
 
 app = Flask(__name__)
 _cfg: EngramConfig | None = None
@@ -80,30 +81,74 @@ def _start_watcher(cfg: EngramConfig):
 
     _watcher_status["inbox"] = str(inbox_path)
 
+    cleaner = EmailCleaner(skip_marketing=True)
+
     def _ingest(path: Path, content: str) -> bool:
         """
-        Simple ingestion: copy the file into memory/daily/emails/ (or inbox/)
-        so it's immediately searchable, then update watcher status.
-        More complex Claude-based extraction happens in the nightly sleep cycle.
+        Cleanse and ingest an inbox file.
+
+        Pipeline:
+          1. Skip placeholder files (<200 chars).
+          2. For .eml/.html/.md files: strip HTML/CSS noise, detect marketing.
+             Marketing emails are silently dropped (no copy, mark as done).
+          3. Write the cleaned markdown into memory/daily/emails/.
         """
-        # Skip empty or placeholder files (Outlook drops 4-byte stubs).
         if len(content.strip()) < 200:
-            return True  # mark as "done" so we don't re-process
-        import shutil as _shutil
+            return True  # placeholder
+
+        cleaned_md: str = content
+        is_marketing  = False
+        skip_reason   = ""
+        original_size = len(content)
+
+        # Apply cleaner for email-shaped formats
+        ext = path.suffix.lower()
+        if ext in (".eml", ".html", ".htm", ".md") and "<html" in content.lower()[:8000] \
+           or ext == ".eml" or "From:" in content[:2000]:
+            res = cleaner.clean(content, filename=path.name)
+            is_marketing = res.is_marketing
+            skip_reason  = res.skip_reason
+            if is_marketing:
+                # Don't copy — log and mark done so we don't re-process
+                _watcher_status.setdefault("skipped", 0)
+                _watcher_status["skipped"] += 1
+                _watcher_status.setdefault("skipped_recent", [])
+                _watcher_status["skipped_recent"].insert(0, {
+                    "name":   path.name[:80],
+                    "reason": skip_reason,
+                    "at":     datetime.now(timezone.utc).isoformat(),
+                })
+                _watcher_status["skipped_recent"] = _watcher_status["skipped_recent"][:20]
+                return True
+            if res.cleaned_chars > 50:
+                cleaned_md = res.to_markdown()
+
         dest_dir = cfg.memory_path / "daily" / "emails"
         dest_dir.mkdir(parents=True, exist_ok=True)
-        # Preserve original name but make it safe
         safe_name = re.sub(r"[^\w.\-]", "_", path.name)[:120]
+        # If we cleaned the content, save as .md (not the original .eml/.html)
+        if cleaned_md is not content:
+            safe_name = re.sub(r"\.(eml|html?|txt)$", ".md", safe_name, flags=re.IGNORECASE)
+            if not safe_name.endswith(".md"):
+                safe_name += ".md"
         dest = dest_dir / safe_name
+
         try:
-            _shutil.copy2(str(path), str(dest))
+            if cleaned_md is content:
+                import shutil as _shutil
+                _shutil.copy2(str(path), str(dest))
+            else:
+                dest.write_text(cleaned_md, encoding="utf-8")
+
             _watcher_status["files_new"] += 1
             _watcher_status["last_scan"] = datetime.now(timezone.utc).isoformat()
             _watcher_status.setdefault("recent_files", [])
             _watcher_status["recent_files"].insert(0, {
-                "name": path.name[:80],
-                "size": len(content),
-                "at":   datetime.now(timezone.utc).isoformat(),
+                "name":     path.name[:80],
+                "size":     len(cleaned_md),
+                "original": original_size,
+                "stripped_pct": int(100 * (1 - len(cleaned_md) / max(original_size, 1))),
+                "at":       datetime.now(timezone.utc).isoformat(),
             })
             _watcher_status["recent_files"] = _watcher_status["recent_files"][:20]
             return True
@@ -1222,6 +1267,63 @@ def resolve_question():
 @app.route("/api/watcher-status")
 def watcher_status():
     return jsonify(_watcher_status)
+
+
+@app.route("/api/clean-emails", methods=["POST"])
+def clean_emails():
+    """
+    Sweep MEMORY/daily/emails/ — strip HTML noise from each file, drop marketing.
+    Backs up the original folder before any destructive change.
+    """
+    cfg = get_cfg()
+    emails_dir = cfg.memory_path / "daily" / "emails"
+    if not emails_dir.exists():
+        return jsonify({"error": "no daily/emails dir"}), 404
+
+    cleaner = EmailCleaner(skip_marketing=True)
+    cleaned   = 0
+    dropped   = 0
+    untouched = 0
+    bytes_before = 0
+    bytes_after  = 0
+
+    for f in emails_dir.iterdir():
+        if not f.is_file() or f.name.startswith("."):
+            continue
+        try:
+            raw = f.read_text(errors="ignore")
+        except Exception:
+            continue
+        if len(raw) < 200:
+            continue
+        bytes_before += len(raw)
+
+        res = cleaner.clean(raw, filename=f.name)
+
+        if res.is_marketing:
+            f.unlink()  # drop marketing
+            dropped += 1
+            continue
+
+        if res.cleaned_chars < res.original_chars * 0.95 and res.cleaned_chars > 100:
+            # Meaningful reduction — write cleaned markdown back
+            md = res.to_markdown()
+            f.write_text(md, encoding="utf-8")
+            cleaned += 1
+            bytes_after += len(md)
+        else:
+            untouched += 1
+            bytes_after += res.original_chars
+
+    saved_pct = int(100 * (1 - bytes_after / max(bytes_before, 1)))
+    return jsonify({
+        "ok":           True,
+        "cleaned":      cleaned,
+        "dropped":      dropped,
+        "untouched":    untouched,
+        "bytes_saved":  bytes_before - bytes_after,
+        "saved_pct":    saved_pct,
+    })
 
 
 @app.route("/api/watcher-rescan", methods=["POST"])
@@ -2413,9 +2515,12 @@ async function renderHealth(data) {{
     if (ws.inbox) {{
       const inbox = ws.inbox.split('/').pop();
       const newCount = ws.files_new || 0;
-      watcherChip = ws.running
-        ? `<div class="alert-chip ok" title="Monitoring ${{ws.inbox}}">&#128065; Watching ${{inbox}}${{newCount ? ' · ' + newCount + ' new' : ''}}</div>`
-        : `<div class="alert-chip warn" title="Watcher not running">&#128065; Watcher idle</div>`;
+      const skipped  = ws.skipped || 0;
+      const tip = `Monitoring ${{ws.inbox}}\\nIngested: ${{newCount}}\\nDropped (marketing): ${{skipped}}`;
+      const label = ws.running
+        ? `&#128065; ${{inbox}} · ${{newCount}} in${{skipped ? ' · ' + skipped + ' marketing dropped' : ''}}`
+        : `&#128065; Watcher idle`;
+      watcherChip = `<div class="alert-chip ${{ws.running?'ok':'warn'}}" title="${{tip}}">${{label}}</div>`;
     }}
   }} catch(e) {{}}
 
