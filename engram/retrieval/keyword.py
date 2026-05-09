@@ -11,17 +11,26 @@ Key design choices:
 - Dynamic max_files: proper-noun or meeting queries return more files
 - Meeting-from-person boost: surfaces emails FROM a named person for 1:1 prep
 - All tuning values come from EngramConfig (or a passed config dict)
+
+Resilience features (v0.2):
+- Stemming:          morphological variants match (meetings/meeting, hired/hiring)
+- Synonym expansion: config-driven equivalent terms (vw/volkswagen, car/automotive)
+- Fuzzy PN match:    difflib catches typos in proper nouns (Stellantiss->Stellantis)
 """
 
 from __future__ import annotations
 
+import difflib
 import math
 import re
 import time
 from pathlib import Path
 from typing import Optional
 
-from .tokenizer import query_tokens, proper_nouns, is_meeting_query, query_person_names
+from .tokenizer import (
+    query_tokens, proper_nouns, is_meeting_query, query_person_names,
+    stem_token, stemmed_tokens, expand_with_synonyms,
+)
 
 
 # ─── Tunable config cache ─────────────────────────────────────────────────────
@@ -78,6 +87,7 @@ def fast_file_score(
     scan_exclude: Optional[list] = None,
     people_file: Optional[Path] = None,
     claim_boosts: Optional[dict] = None,
+    synonyms: Optional[dict] = None,
 ) -> list[tuple[str, float]]:
     """
     Score all .md files under memory_path for relevance to query.
@@ -93,7 +103,7 @@ def fast_file_score(
                       memory_path.parent.
         max_files:    Base maximum results (may be raised for proper-noun queries).
         body_read_chars: Characters of file body to read per file.
-        path_boosts:  Dict of path fragment → score multiplier.
+        path_boosts:  Dict of path fragment to score multiplier.
         filename_match: Dict with 'stem_hit_multiplier' and 'path_hit_multiplier'.
         score_components: Dict with 'overlap_log_factor', 'proper_noun_factor',
                           'tf_log_factor'.
@@ -101,7 +111,9 @@ def fast_file_score(
         meeting_from_person: Dict with thresholds for the from-person boost.
         scan_exclude: List of path fragments to skip.
         people_file:  Optional path to people.md for person-name extraction.
-        claim_boosts: Pre-computed {rel_path → multiplicative_boost} dict.
+        claim_boosts: Pre-computed {rel_path: multiplicative_boost} dict.
+        synonyms:     Dict of {term: [equivalent, ...]} for query expansion.
+                      Bidirectional -- matched on any group member.
     """
     if not memory_path.exists():
         return []
@@ -125,16 +137,23 @@ def fast_file_score(
     }
     _claim_boosts = claim_boosts or {}
 
-    # Tokenize
+    # ── Tokenize + expand ─────────────────────────────────────────────────────
     q_lower  = query.lower()
     recency  = any(w in q_lower for w in ("latest", "recent", "update", "current", "now", "today"))
     q_toks   = query_tokens(query)
+
+    # Synonym expansion: bidirectional -- "vw" pulls in "volkswagen" and vice-versa
+    if synonyms:
+        q_toks = expand_with_synonyms(q_toks, synonyms)
+
     if not q_toks:
         return []
 
-    pn       = proper_nouns(query, q_toks)
-    has_pn   = len(pn) > 0
-    is_mtg   = is_meeting_query(q_toks)
+    pn          = proper_nouns(query, q_toks)
+    pn_long     = {p for p in pn if len(p) >= 5}   # long proper nouns for fuzzy match
+    q_stems     = stemmed_tokens(q_toks)             # pre-compute stems once
+    has_pn      = len(pn) > 0
+    is_mtg      = is_meeting_query(q_toks)
     mtg_persons = (query_person_names(query, people_file) if is_mtg else set())
     mtg_patterns = {p.lower() for p in mtg_persons}
 
@@ -169,11 +188,37 @@ def fast_file_score(
         haystack = haystack_path + " " + body
         hay_toks  = set(re.split(r"\W+", haystack))
 
+        # ── Exact token overlap ───────────────────────────────────────────────
         overlap = len(q_toks & hay_toks)
-        if overlap == 0:
+
+        # ── Stem overlap (morphological variants) ─────────────────────────────
+        # Catches: meetings/meeting, decided/deciding/decide, hired/hiring/hire.
+        # Only stem tokens of reasonable length; short tokens are too ambiguous.
+        hay_stems = stemmed_tokens({t for t in hay_toks if len(t) >= 3})
+        # Subtract overlap to avoid double-counting already-exact-matched tokens.
+        stem_hits = max(0, len(q_stems & hay_stems) - overlap)
+
+        # ── Fuzzy proper-noun matching (typo resilience) ──────────────────────
+        # Only on long proper nouns (>=5 chars) to keep false-positive rate low.
+        # difflib cutoff=0.85 is strict: "Stellantiss" matches "Stellantis",
+        # but "cat" does not match "car".
+        fuzzy_pn_hits = 0
+        if pn_long:
+            for pn_tok in pn_long:
+                if pn_tok not in hay_toks:      # skip already-exact-matched
+                    if difflib.get_close_matches(pn_tok, hay_toks, n=1, cutoff=0.85):
+                        fuzzy_pn_hits += 1
+
+        # ── Combined signal ───────────────────────────────────────────────────
+        # Stem hits: 0.6x (less certain than exact match).
+        # Fuzzy PN hits: 1.5x (strong signal -- a fuzzy match on a proper noun
+        # in a domain-specific corpus almost always means an intentional typo).
+        effective_overlap = overlap + stem_hits * 0.6 + fuzzy_pn_hits * 1.5
+        if effective_overlap == 0:
             continue
 
-        proper_hits = sum(1 for p in pn if p in haystack)
+        # Proper noun hits: exact occurrences + confirmed fuzzy hits
+        proper_hits = sum(1 for p in pn if p in haystack) + fuzzy_pn_hits
         tf = sum(min(haystack.count(t), 12) for t in q_toks)
 
         # Path boost
@@ -216,7 +261,7 @@ def fast_file_score(
             boost *= 1.5
 
         score = (
-            float(_sc.get("overlap_log_factor", 1.0)) * overlap * boost * math.log(1 + overlap)
+            float(_sc.get("overlap_log_factor", 1.0)) * effective_overlap * boost * math.log(1 + effective_overlap)
             + float(_sc.get("proper_noun_factor", 3.0)) * proper_hits * boost
             + float(_sc.get("tf_log_factor", 0.4)) * math.log(1 + tf) * boost
         )
