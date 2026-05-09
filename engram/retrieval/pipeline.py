@@ -187,6 +187,8 @@ def memory_scan(
             max_count_per_token = wi_cfg.max_count_per_token,
             topics              = cfg.wiki.topics,
             synonyms            = synonyms,
+            use_qmd             = getattr(wi_cfg, "use_qmd", True),
+            qmd_collection      = getattr(wi_cfg, "qmd_collection", "wiki"),
         )
         if wiki_files:
             print(f"[memory_scan] stage4 wiki: {len(wiki_files)} pages — "

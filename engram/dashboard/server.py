@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -41,6 +43,74 @@ def get_cfg() -> EngramConfig:
     return _cfg
 
 
+# ─── Claude backend helpers ───────────────────────────────────────────────────
+
+def _format_messages_for_cli(messages: list) -> str:
+    """
+    Flatten a multi-turn message list into a single string for the Claude CLI.
+    The CLI -p flag is single-turn; we embed history as context so the model
+    can see prior turns.
+    """
+    if len(messages) == 1:
+        return messages[0].get("content", "")
+
+    parts: list[str] = []
+    for m in messages[:-1]:
+        role = "Human" if m["role"] == "user" else "Assistant"
+        parts.append(f"{role}: {m.get('content', '')}")
+    history = "\n\n".join(parts)
+    current = messages[-1].get("content", "")
+    return f"[Conversation history]\n{history}\n\n[Current question]\n{current}"
+
+
+def _stream_cli(messages: list, system_prompt: str, cli_bin: str, model: str | None = None):
+    """
+    Stream a Claude CLI response token-by-token.
+
+    Uses `claude -p <msg> --output-format stream-json [--system ...] [--model ...]`.
+    Parses NDJSON lines for content_block_delta / text_delta events.
+
+    Yields plain text strings (no SSE framing — caller wraps in data: ... \\n\\n).
+    """
+    user_msg = _format_messages_for_cli(messages)
+
+    cmd = [cli_bin, "-p", user_msg, "--output-format", "stream-json"]
+    if system_prompt:
+        cmd += ["--system", system_prompt]
+    if model:
+        cmd += ["--model", model]
+
+    print(f"[chat/cli] {cli_bin} -p <{len(user_msg)}chars> --output-format stream-json", flush=True)
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+                if event.get("type") == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        yield delta.get("text", "")
+            except json.JSONDecodeError:
+                pass
+        proc.wait()
+        if proc.returncode not in (0, None):
+            err = proc.stderr.read() if proc.stderr else ""
+            if err:
+                print(f"[chat/cli] exit {proc.returncode}: {err[:300]}", flush=True)
+    except Exception as e:
+        yield f"\n\n⚠ CLI error: {e}"
+
+
 # ─── Chat API ─────────────────────────────────────────────────────────────────
 
 @app.route("/api/chat", methods=["POST"])
@@ -50,8 +120,6 @@ def chat():
     query    = (messages[-1].get("content", "") if messages else "").strip()
     if not query:
         return jsonify({"error": "empty query"}), 400
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
     def generate():
         cfg = get_cfg()
@@ -83,13 +151,11 @@ def chat():
             system_parts.append(f"Tone: {sp.user_tone}")
 
         # Load context files
-        base = cfg.base_path
-        loaded: list[str] = []
+        base   = cfg.base_path
         budget = cfg.retrieval.context_budget.max_total_chars
         used   = 0
 
-        all_files = direct + graph
-        for rel in all_files:
+        for rel in direct + graph:
             if used >= budget:
                 break
             p = Path(rel) if Path(rel).is_absolute() else base / rel
@@ -102,7 +168,6 @@ def chat():
                     content = content[:cap] + "\n…(truncated)"
                 system_parts.append(f"\n\n---\n# Context: {rel}\n\n{content}")
                 used += len(content)
-                loaded.append(rel)
             except Exception:
                 pass
 
@@ -127,25 +192,48 @@ def chat():
 
         system_prompt = "\n".join(system_parts)
 
-        # Stage 3 — stream Claude response
-        if not api_key:
-            yield f"data: {json.dumps({'token': '⚠ No ANTHROPIC_API_KEY set. Set it as an environment variable to enable chat.'})}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+        # Stage 3 — stream via configured backend
+        chat_cfg = getattr(cfg, "chat", None)
+        backend  = getattr(chat_cfg, "backend", "api") if chat_cfg else "api"
 
-        try:
-            import anthropic
-            client = anthropic.Anthropic(api_key=api_key)
-            with client.messages.stream(
-                model    = cfg.models.primary,
-                max_tokens = 4096,
-                system   = system_prompt,
-                messages = messages,
-            ) as stream:
-                for text in stream.text_stream:
+        if backend == "cli":
+            # ── Claude CLI backend ─────────────────────────────────────────────
+            cli_bin = (getattr(chat_cfg, "cli_bin", None) or None) or shutil.which("claude")
+            if not cli_bin:
+                yield f"data: {json.dumps({'token': '⚠ Claude CLI not found. Install claude or set chat.cli_bin in config.'})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            cli_model = getattr(chat_cfg, "cli_model", None) or None
+            try:
+                for text in _stream_cli(messages, system_prompt, cli_bin, model=cli_model):
                     yield f"data: {json.dumps({'token': text})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+        else:
+            # ── Anthropic API backend (default) ───────────────────────────────
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                yield (
+                    f"data: {json.dumps({'token': '⚠ No ANTHROPIC_API_KEY set. '
+                    'Either set the env var, or switch to the CLI backend: '
+                    'add  chat:\\n  backend: cli  to ~/.engram/config.yaml'})}\n\n"
+                )
+                yield "data: [DONE]\n\n"
+                return
+            try:
+                import anthropic
+                client = anthropic.Anthropic(api_key=api_key)
+                with client.messages.stream(
+                    model      = cfg.models.primary,
+                    max_tokens = 4096,
+                    system     = system_prompt,
+                    messages   = messages,
+                ) as stream:
+                    for text in stream.text_stream:
+                        yield f"data: {json.dumps({'token': text})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
         yield "data: [DONE]\n\n"
 
