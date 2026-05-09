@@ -86,6 +86,9 @@ def _start_watcher(cfg: EngramConfig):
         so it's immediately searchable, then update watcher status.
         More complex Claude-based extraction happens in the nightly sleep cycle.
         """
+        # Skip empty or placeholder files (Outlook drops 4-byte stubs).
+        if len(content.strip()) < 200:
+            return True  # mark as "done" so we don't re-process
         import shutil as _shutil
         dest_dir = cfg.memory_path / "daily" / "emails"
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -96,6 +99,13 @@ def _start_watcher(cfg: EngramConfig):
             _shutil.copy2(str(path), str(dest))
             _watcher_status["files_new"] += 1
             _watcher_status["last_scan"] = datetime.now(timezone.utc).isoformat()
+            _watcher_status.setdefault("recent_files", [])
+            _watcher_status["recent_files"].insert(0, {
+                "name": path.name[:80],
+                "size": len(content),
+                "at":   datetime.now(timezone.utc).isoformat(),
+            })
+            _watcher_status["recent_files"] = _watcher_status["recent_files"][:20]
             return True
         except Exception as e:
             print(f"[watcher] copy error: {e}", flush=True)
@@ -809,6 +819,7 @@ def list_outputs():
               Path(cfg.memory_path).parent / "outputs"
 
     if not out_dir.exists():
+        out_dir.mkdir(parents=True, exist_ok=True)
         return jsonify({"files": [], "dir": str(out_dir)})
 
     files = sorted(
@@ -821,10 +832,54 @@ def list_outputs():
         "files": [
             {"name": f.name, "size": f.stat().st_size,
              "modified": f.stat().st_mtime,
-             "ext": f.suffix.lstrip(".")}
+             "ext": f.suffix.lstrip(".").lower(),
+             "abspath": str(f.resolve())}
             for f in files
         ],
     })
+
+
+@app.route("/api/open-path", methods=["POST"])
+def open_path():
+    """
+    Open a file or folder in the OS default app / file manager.
+    Body: {"path": "/abs/path", "reveal": false}
+    On macOS uses `open` (with `-R` for reveal).
+    """
+    body   = request.get_json(force=True, silent=True) or {}
+    path   = body.get("path", "")
+    reveal = bool(body.get("reveal", False))
+
+    if not path:
+        return jsonify({"error": "no path"}), 400
+
+    p = Path(path)
+    if not p.exists():
+        return jsonify({"error": "not found"}), 404
+
+    cfg = get_cfg()
+    # Safety: only allow paths under memory_path, outputs_path, or wiki_path
+    allowed = [
+        cfg.memory_path,
+        Path(cfg.paths.outputs_path) if getattr(cfg.paths, "outputs_path", None) else None,
+        cfg.wiki_path,
+    ]
+    allowed = [a.resolve() for a in allowed if a]
+    abs_p = p.resolve()
+    if not any(str(abs_p).startswith(str(a)) for a in allowed):
+        return jsonify({"error": "path outside allowed roots"}), 403
+
+    try:
+        if sys.platform == "darwin":
+            cmd = ["open"] + (["-R"] if reveal else []) + [str(abs_p)]
+        elif sys.platform.startswith("linux"):
+            cmd = ["xdg-open", str(abs_p.parent if reveal else abs_p)]
+        else:  # windows
+            cmd = ["explorer", "/select," + str(abs_p)] if reveal else ["start", "", str(abs_p)]
+        subprocess.Popen(cmd)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/health-detail")
@@ -973,6 +1028,65 @@ def resolve_question():
 @app.route("/api/watcher-status")
 def watcher_status():
     return jsonify(_watcher_status)
+
+
+@app.route("/api/watcher-rescan", methods=["POST"])
+def watcher_rescan():
+    """
+    Reset the seen registry and trigger a fresh full sweep of the inbox.
+    Useful after bulk deletions/restores or to re-ingest everything.
+    """
+    cfg = get_cfg()
+    if _watcher is None:
+        return jsonify({"error": "watcher not running"}), 400
+    try:
+        # Wipe registry
+        registry_file = cfg.memory_path / ".watcher_seen.json"
+        if registry_file.exists():
+            registry_file.unlink()
+        # Reset in-memory state
+        _watcher._registry._seen = {}
+        _watcher_status["files_new"] = 0
+        _watcher_status["recent_files"] = []
+        # Trigger immediate scan in background
+        threading.Thread(target=_watcher.run_once, daemon=True).start()
+        return jsonify({"ok": True, "message": "rescan triggered"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/recent-activity")
+def recent_activity():
+    """
+    Real-time feed of recently modified memory files (last 7 days).
+    Replaces the stale wiki/log.jsonl-based 'Recent activity' panel.
+    """
+    cfg = get_cfg()
+    mem = cfg.memory_path
+    cutoff = time.time() - 14 * 86400  # 14 days
+    items: list = []
+    try:
+        for f in mem.rglob("*.md"):
+            try:
+                if "/sessions/" in str(f) or "/_pre_compression_backups/" in str(f):
+                    continue
+                m = f.stat().st_mtime
+                if m < cutoff:
+                    continue
+                items.append({
+                    "name":     f.name,
+                    "rel":      str(f.relative_to(mem)),
+                    "folder":   f.parent.relative_to(mem).as_posix() or "/",
+                    "modified": m,
+                    "size":     f.stat().st_size,
+                })
+            except Exception:
+                continue
+    except Exception as e:
+        return jsonify({"items": [], "error": str(e)})
+
+    items.sort(key=lambda x: x["modified"], reverse=True)
+    return jsonify({"items": items[:20], "total": len(items)})
 
 
 # ─── Main page ────────────────────────────────────────────────────────────────
@@ -1394,7 +1508,11 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 
       <!-- Outputs panel -->
       <div class="outputs-section" id="outputs-section" style="display:none">
-        <div class="outputs-title">Recent outputs</div>
+        <div class="outputs-title-row" style="display:flex;align-items:center;justify-content:space-between;padding:4px 16px 6px">
+          <div class="outputs-title" style="padding:0">Recent outputs</div>
+          <button id="outputs-folder-btn" onclick="openOutputsFolder()" title="Show in Finder"
+                  style="background:none;border:none;cursor:pointer;font-size:11px;color:#888;padding:2px 6px;border-radius:4px">&#128193; Folder</button>
+        </div>
         <div id="outputs-list"></div>
       </div>
     </div>
@@ -1798,12 +1916,15 @@ async function exportAs(fmt, content, filename, btn) {{
   }}
 }}
 
+let _outputsDir = null;
+
 async function refreshOutputs() {{
   try {{
     const res  = await fetch('/api/outputs');
     const data = await res.json();
     const list = document.getElementById('outputs-list');
     const sec  = document.getElementById('outputs-section');
+    _outputsDir = data.dir || null;
 
     if (!data.files || !data.files.length) {{
       sec.style.display = 'none';
@@ -1814,12 +1935,41 @@ async function refreshOutputs() {{
     data.files.slice(0, 8).forEach(f => {{
       const item = document.createElement('div');
       item.className = 'output-item';
-      item.title     = f.name;
-      item.innerHTML = `<span class="output-ext ${{f.ext}}">${{f.ext}}</span>
-                        <span class="output-name">${{f.name.replace(/_\\d{{8}}_\\d{{6}}(\\.[^.]+)$/, '$1')}}</span>`;
+      item.title     = f.name + ' — click to open';
+      item.style.cursor = 'pointer';
+      const cleanName = f.name.replace(/_\\d{{8}}_\\d{{6}}(\\.[^.]+)$/, '$1');
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'output-name';
+      nameSpan.textContent = cleanName;
+      const extSpan = document.createElement('span');
+      extSpan.className = 'output-ext ' + f.ext;
+      extSpan.textContent = f.ext;
+      item.appendChild(extSpan);
+      item.appendChild(nameSpan);
+      const revealBtn = document.createElement('button');
+      revealBtn.textContent = '⤴';
+      revealBtn.title = 'Reveal in Finder';
+      revealBtn.style.cssText = 'background:none;border:none;cursor:pointer;color:#bbb;font-size:11px;padding:0 2px';
+      revealBtn.onclick = (e) => {{ e.stopPropagation(); openPath(f.abspath, true); }};
+      item.appendChild(revealBtn);
+      item.onclick = () => openPath(f.abspath, false);
       list.appendChild(item);
     }});
   }} catch (e) {{}}
+}}
+
+async function openPath(path, reveal) {{
+  try {{
+    await fetch('/api/open-path', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ path, reveal }})
+    }});
+  }} catch (e) {{}}
+}}
+
+function openOutputsFolder() {{
+  if (_outputsDir) openPath(_outputsDir, false);
 }}
 
 // Load outputs on page start
@@ -2005,15 +2155,25 @@ function renderHealth(data) {{
   const memRows = Object.entries(c.mem_folders||{{}}).slice(0,6).map(([k,v]) =>
     `<tr><td>${{k}}</td><td>${{v}}</td></tr>`).join('');
 
-  const recent = (c.wiki_recent||[]).slice(0,5).map(r => {{
-    const b = [r.pages_created?`<span class="act-badge new">+${{r.pages_created}}</span>`:'',
-               r.pages_updated?`<span class="act-badge upd">~${{r.pages_updated}}</span>`:''].filter(Boolean).join(' ');
-    return `<div style="padding:5px 0;border-bottom:1px solid #f5f5f5;font-size:11px">
-      <div style="display:flex;gap:6px;align-items:center">
-        <span style="color:#444;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${{r.file}} ${{b}}</span>
-        <span style="color:#bbb;flex-shrink:0">${{r.date}}</span></div>
-      <div style="color:#aaa;font-size:10px">${{r.summary||''}}</div></div>`;
-  }}).join('');
+  // Recent activity — pulled live from /api/recent-activity (mtime-based)
+  let recent = '';
+  try {{
+    const ra = await fetch('/api/recent-activity').then(r=>r.json());
+    const fmtAgo = (ts) => {{
+      const ago = (Date.now()/1000) - ts;
+      if (ago < 60)    return 'just now';
+      if (ago < 3600)  return Math.round(ago/60) + 'm ago';
+      if (ago < 86400) return Math.round(ago/3600) + 'h ago';
+      return Math.round(ago/86400) + 'd ago';
+    }};
+    recent = (ra.items||[]).slice(0,8).map(it => `
+      <div style="padding:5px 0;border-bottom:1px solid #f5f5f5;font-size:11px;cursor:pointer"
+           onclick="openFilePreview('${{it.rel.replace(/'/g, "\\\\'")}}')">
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="color:#444;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${{it.name}}</span>
+          <span style="color:#bbb;flex-shrink:0;font-size:10px">${{fmtAgo(it.modified)}}</span></div>
+        <div style="color:#aaa;font-size:10px">${{it.folder}}</div></div>`).join('');
+  }} catch(e) {{}}
 
   // Dream pillar
   const lr = d.last_run || {{}};
@@ -2113,6 +2273,19 @@ function renderHealth(data) {{
     <div class="section"><div class="section-label">Memory tiers</div>
       <div class="tier-bars">${{tierBars}}</div>
       <div class="tier-legend">${{tierLegend}}</div></div>
+    <div class="section"><div class="section-label">Resolve</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <button onclick="openHealthDetail('contradictions')"
+                style="display:flex;align-items:center;justify-content:space-between;background:${{d.contradictions_pending>0?'#fff3e0':'#f5f5f5'}};border:1px solid ${{d.contradictions_pending>0?'#fbbc04':'#e8e8e8'}};border-radius:8px;padding:9px 12px;cursor:pointer;font-size:12px;color:#1a1a1a;text-align:left;width:100%">
+          <span>&#9888; Contradictions</span>
+          <span style="font-weight:700;color:${{d.contradictions_pending>0?'#a07800':'#aaa'}}">${{d.contradictions_pending||0}} pending →</span>
+        </button>
+        <button onclick="openHealthDetail('open_questions')"
+                style="display:flex;align-items:center;justify-content:space-between;background:${{d.open_questions>0?'#ebf5ff':'#f5f5f5'}};border:1px solid ${{d.open_questions>0?'#4285F4':'#e8e8e8'}};border-radius:8px;padding:9px 12px;cursor:pointer;font-size:12px;color:#1a1a1a;text-align:left;width:100%">
+          <span>&#10067; Open questions</span>
+          <span style="font-weight:700;color:${{d.open_questions>0?'#4285F4':'#aaa'}}">${{d.open_questions||0}} pending →</span>
+        </button>
+      </div></div>
     <div class="section"><div class="section-label">Health</div>
       <div class="meter"><div class="meter-label">Coverage</div>
         <div class="meter-track"><div class="meter-fill" style="width:${{covPct}}%"></div></div>
