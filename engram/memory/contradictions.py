@@ -7,8 +7,16 @@ severity, creates Contradiction nodes, and surfaces them in an inbox.
 Detection rule:
   - Same (subject, relation) but different object → factual_conflict
   - Same (subject, object) but incompatible relation → role_conflict
+
+Rejected-claims registry:
+  Once a user marks a contradiction (or its claims) as wrong, the
+  (subject, relation, object) tuple is stored in MEMORY/.rejected_claims.json
+  so future extractions don't re-create it. Ground truths recorded here also
+  let the system reject any future triple that contradicts an established fact
+  for a single-valued relation.
 """
 import json
+import re
 import uuid
 from pathlib import Path
 from .schemas import Contradiction, _now, TIER_CRYSTALLISED, TIME_BOUND_RELATIONS
@@ -44,13 +52,52 @@ INCOMPATIBLE_PAIRS = [
 ]
 
 
+# ─── Source-quality filter ────────────────────────────────────────────────────
+# Org-structure relations should only be trusted from these source patterns.
+# Triples extracted from email signatures, airline notifications, marketing
+# copy, etc. were generating "Leo Sei reports_to LOT Upgrade" garbage.
+AUTHORITATIVE_ORG_SOURCES = (
+    "/CLAUDE.md",
+    "/context/people",
+    "/context/org_",
+    "/context/responsibility_",
+    "/context/leo_sei",
+    "/context/tomtom_product_org",
+    "/decisions/",
+)
+
+ORG_RELATIONS = {
+    "reports_to", "current_manager", "current_role", "current_title",
+    "current_employer", "currently_works_at", "employed_by",
+    "manages", "leads", "owns",
+    "ceo_of", "cto_of", "cfo_of", "cpo_of", "coo_of",
+}
+
+
+def _is_authoritative_source(source: str) -> bool:
+    if not source:
+        return False
+    return any(pat in source for pat in AUTHORITATIVE_ORG_SOURCES)
+
+
+def _norm_obj(s: str) -> str:
+    """Normalize a name/identifier for fuzzy matching against the rejection registry."""
+    if not s:
+        return ""
+    return re.sub(r"[\s\-_.,:]+", " ", s.lower()).strip()
+
+
 def find_contradictions(
     new_triples: list,
     graph: dict,
     confidence_threshold: float = 0.7,
+    rejected_registry: dict | None = None,
 ) -> list:
     """
     new_triples: list of dicts {from, to, type, confidence, source, props?}
+    rejected_registry: optional dict from .rejected_claims.json — used to skip
+        already-rejected (subject, relation, object) tuples and to enforce
+        ground truths (any new triple contradicting a ground truth is dropped).
     Returns list of Contradiction dicts.
     """
     out = []
@@ -65,6 +112,8 @@ def find_contradictions(
         by_from_rel.setdefault((f, et), []).append(ed)
         by_pair.setdefault((f, t), []).append(ed)
 
+    rejected = _index_rejections(rejected_registry) if rejected_registry else None
+
     for tr in new_triples:
         if tr.get("confidence", 1.0) < confidence_threshold:
             continue
@@ -72,12 +121,26 @@ def find_contradictions(
         if not (f and t and et):
             continue
 
+        # ── Filter: untrusted sources for org relations ──────────────────────
+        # Don't extract reports_to/manages/etc. from random emails or transcripts.
+        if et in ORG_RELATIONS and not _is_authoritative_source(tr.get("source", "")):
+            continue
+
+        # ── Filter: registry rejection ───────────────────────────────────────
+        if rejected is not None:
+            f_name = entities.get(f, {}).get("name", f)
+            t_name = entities.get(t, {}).get("name", t)
+            if _is_rejected(rejected, f_name, et, t_name):
+                continue
+            # Ground-truth violation for single-valued relations: silently drop.
+            gt_obj = _ground_truth_object(rejected, f_name, et)
+            if gt_obj and _norm_obj(gt_obj) != _norm_obj(t_name):
+                continue
+
         # Same (from, relation) different to → factual conflict
         if et in SINGLE_VALUED_RELATIONS:
             for ed in by_from_rel.get((f, et), []):
                 if ed.get("to") != t:
-                    # Skip if this triple is a duplicate of the existing edge
-                    # (some pipelines re-emit the same triple)
                     out.append(_build_contradiction(
                         type="factual_conflict",
                         existing_edge=ed,
@@ -247,3 +310,198 @@ def _dedup_sig(c: dict) -> str:
 def list_pending_contradictions(path: Path) -> list:
     items = load_contradictions(path)
     return [c for c in items if c.get("status") == "unresolved"]
+
+
+# ─── Rejected-claims registry ────────────────────────────────────────────────
+# File: {memory_path}/.rejected_claims.json
+# Schema:
+#   {
+#     "rejected": [
+#       {"subject": str, "relation": str, "object": str,
+#        "rejected_at": iso, "source_contradiction": id}
+#     ],
+#     "ground_truths": [
+#       {"subject": str, "relation": str, "object": str,
+#        "established_at": iso, "source_contradiction": id}
+#     ]
+#   }
+# Ground truths are only stored for SINGLE_VALUED_RELATIONS — for those,
+# any future triple with same (subject, relation) but different object is
+# automatically rejected.
+
+def load_rejected_registry(path: Path) -> dict:
+    if not path.exists():
+        return {"rejected": [], "ground_truths": []}
+    try:
+        data = json.loads(path.read_text())
+        data.setdefault("rejected", [])
+        data.setdefault("ground_truths", [])
+        return data
+    except Exception:
+        return {"rejected": [], "ground_truths": []}
+
+
+def save_rejected_registry(path: Path, registry: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(registry, indent=2, ensure_ascii=False))
+
+
+def _index_rejections(registry: dict) -> dict:
+    """Build a fast-lookup index from a registry dict."""
+    rejected_set: set = set()
+    truths: dict = {}  # (norm_subject, relation) -> norm_object
+    for r in registry.get("rejected", []):
+        key = (_norm_obj(r.get("subject","")), r.get("relation",""), _norm_obj(r.get("object","")))
+        rejected_set.add(key)
+    for g in registry.get("ground_truths", []):
+        if g.get("relation") in SINGLE_VALUED_RELATIONS:
+            truths[(_norm_obj(g.get("subject","")), g.get("relation",""))] = g.get("object","")
+    return {"rejected": rejected_set, "truths": truths}
+
+
+def _is_rejected(idx: dict, subject: str, relation: str, obj: str) -> bool:
+    return (_norm_obj(subject), relation, _norm_obj(obj)) in idx.get("rejected", set())
+
+
+def _ground_truth_object(idx: dict, subject: str, relation: str) -> str | None:
+    return idx.get("truths", {}).get((_norm_obj(subject), relation))
+
+
+def _parse_statement(stmt: str) -> tuple[str, str, str] | None:
+    """Mirror of dashboard parser — splits 'X relation Y' on known relation tokens."""
+    if not stmt:
+        return None
+    s = stmt.strip()
+    # Try longest relations first
+    all_rels = SINGLE_VALUED_RELATIONS | ORG_RELATIONS | {"manages", "leads", "owns", "knows", "advises", "is_a", "part_of"}
+    for rel in sorted(all_rels, key=len, reverse=True):
+        for token in (f" {rel} ", f" {rel.replace('_', ' ')} "):
+            idx = s.lower().find(token.lower())
+            if idx > 0:
+                subject = s[:idx].strip()
+                obj     = s[idx + len(token):].strip()
+                return (subject, rel.replace(" ", "_"), obj)
+    return None
+
+
+def record_resolution(
+    registry_path: Path,
+    contradiction: dict,
+    resolution: str,
+) -> int:
+    """
+    Update the rejected-claims registry based on a user resolution.
+
+    Returns count of new entries added.
+
+    resolution:
+      resolved_A   — claim A correct → reject claim B; claim A is ground truth
+      resolved_B   — claim B correct → reject claim A; claim B is ground truth
+      both_true    — no rejection, no truth (ambiguous, both valid)
+      both_false   — reject both A and B; no truth
+      dismissed    — no registry change (user just doesn't want to see it)
+    """
+    if resolution == "dismissed" or resolution == "both_true":
+        return 0
+
+    registry = load_rejected_registry(registry_path)
+    rejected_keys = {
+        (_norm_obj(r.get("subject","")), r.get("relation",""), _norm_obj(r.get("object","")))
+        for r in registry["rejected"]
+    }
+    truth_keys = {
+        (_norm_obj(g.get("subject","")), g.get("relation",""))
+        for g in registry["ground_truths"]
+    }
+
+    now = _now()
+    cid = contradiction.get("id", "")
+    added = 0
+
+    def _add_rejection(stmt: str):
+        nonlocal added
+        parsed = _parse_statement(stmt)
+        if not parsed:
+            return
+        subj, rel, obj = parsed
+        key = (_norm_obj(subj), rel, _norm_obj(obj))
+        if key in rejected_keys:
+            return
+        registry["rejected"].append({
+            "subject": subj, "relation": rel, "object": obj,
+            "rejected_at": now,
+            "source_contradiction": cid,
+        })
+        rejected_keys.add(key)
+        added += 1
+
+    def _add_truth(stmt: str):
+        nonlocal added
+        parsed = _parse_statement(stmt)
+        if not parsed:
+            return
+        subj, rel, obj = parsed
+        if rel not in SINGLE_VALUED_RELATIONS:
+            return
+        key = (_norm_obj(subj), rel)
+        if key in truth_keys:
+            return
+        registry["ground_truths"].append({
+            "subject": subj, "relation": rel, "object": obj,
+            "established_at": now,
+            "source_contradiction": cid,
+        })
+        truth_keys.add(key)
+        added += 1
+
+    A_stmt = (contradiction.get("claim_A") or {}).get("statement", "")
+    B_stmt = (contradiction.get("claim_B") or {}).get("statement", "")
+
+    if resolution == "resolved_A":
+        _add_truth(A_stmt)
+        _add_rejection(B_stmt)
+    elif resolution == "resolved_B":
+        _add_truth(B_stmt)
+        _add_rejection(A_stmt)
+    elif resolution == "both_false":
+        _add_rejection(A_stmt)
+        _add_rejection(B_stmt)
+
+    if added:
+        save_rejected_registry(registry_path, registry)
+    return added
+
+
+def purge_rejected_edges_from_graph(graph: dict, registry: dict) -> int:
+    """
+    Remove edges from the graph that match rejected claims. Returns count removed.
+    Mutates `graph` in place.
+    """
+    idx = _index_rejections(registry)
+    if not idx["rejected"] and not idx["truths"]:
+        return 0
+
+    entities = graph.get("entities", {})
+    edges    = graph.get("edges", [])
+    keep: list = []
+    removed = 0
+
+    for ed in edges:
+        f_name = entities.get(ed.get("from"), {}).get("name", ed.get("from", ""))
+        t_name = entities.get(ed.get("to"),   {}).get("name", ed.get("to",   ""))
+        rel    = ed.get("type", "")
+
+        if _is_rejected(idx, f_name, rel, t_name):
+            removed += 1
+            continue
+
+        # Ground truth violation: drop edges that contradict an established truth
+        gt_obj = _ground_truth_object(idx, f_name, rel)
+        if gt_obj and _norm_obj(gt_obj) != _norm_obj(t_name):
+            removed += 1
+            continue
+
+        keep.append(ed)
+
+    graph["edges"] = keep
+    return removed

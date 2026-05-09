@@ -1085,6 +1085,9 @@ def resolve_contradiction():
     if not p.exists():
         return jsonify({"error": "file not found"}), 404
     try:
+        from engram.memory.contradictions import record_resolution
+        registry_path = cfg.memory_path / ".rejected_claims.json"
+
         data  = json.loads(p.read_text(errors="ignore"))
         items = data if isinstance(data, list) else data.get("contradictions", [])
         target = next((it for it in items if it.get("id") == item_id), None)
@@ -1095,8 +1098,19 @@ def resolve_contradiction():
         target["resolved_by"] = "user"
         target["resolved_at"] = datetime.now(timezone.utc).isoformat()
 
+        # Persist the user's decision into the rejection registry so future
+        # sleep cycles don't re-extract these triples.
+        registry_added = record_resolution(registry_path, target, resolution)
+
         # Cascade resolution to related contradictions (only for resolved_A/B)
         cascaded = _cascade_resolve(items, target, resolution)
+
+        # Each cascaded resolution also gets recorded into the registry
+        if cascaded > 0:
+            for it in items:
+                rb = str(it.get("resolved_by", ""))
+                if rb.startswith(f"cascade_from_{item_id}"):
+                    registry_added += record_resolution(registry_path, it, it.get("status",""))
 
         if isinstance(data, list):
             p.write_text(json.dumps(data, indent=2, ensure_ascii=False))
@@ -1105,13 +1119,68 @@ def resolve_contradiction():
             p.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
         return jsonify({
-            "ok":         True,
-            "id":         item_id,
-            "resolution": resolution,
-            "cascaded":   cascaded,
+            "ok":              True,
+            "id":              item_id,
+            "resolution":      resolution,
+            "cascaded":        cascaded,
+            "registry_added":  registry_added,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cleanup-resolved", methods=["POST"])
+def cleanup_resolved():
+    """
+    Retroactively backfill the rejected-claims registry from all already-resolved
+    contradictions, then purge matching edges from graph.json.
+
+    Useful after the user has resolved many contradictions but the system was
+    not yet recording them as ground truths. Idempotent.
+    """
+    cfg = get_cfg()
+    from engram.memory.contradictions import (
+        record_resolution, load_rejected_registry, save_rejected_registry,
+        purge_rejected_edges_from_graph,
+    )
+
+    p = cfg.memory_path / "contradictions.json"
+    g = cfg.memory_path / "graph.json"
+    registry_path = cfg.memory_path / ".rejected_claims.json"
+
+    if not p.exists():
+        return jsonify({"error": "no contradictions"}), 404
+
+    data  = json.loads(p.read_text(errors="ignore"))
+    items = data if isinstance(data, list) else data.get("contradictions", [])
+
+    # Backfill registry from already-resolved items
+    backfilled = 0
+    for it in items:
+        status = it.get("status", "")
+        if status in ("resolved_A", "resolved_B", "both_false"):
+            backfilled += record_resolution(registry_path, it, status)
+
+    # Purge bad edges from the graph
+    purged = 0
+    if g.exists():
+        graph = json.loads(g.read_text(errors="ignore"))
+        registry = load_rejected_registry(registry_path)
+        purged = purge_rejected_edges_from_graph(graph, registry)
+        if purged:
+            # Backup before write
+            backup = g.with_suffix(f".pre_cleanup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.bak")
+            backup.write_text(g.read_text())
+            g.write_text(json.dumps(graph, indent=2, ensure_ascii=False))
+
+    registry = load_rejected_registry(registry_path)
+    return jsonify({
+        "ok":                True,
+        "backfilled_registry": backfilled,
+        "graph_edges_purged":  purged,
+        "registry_total_rejected":  len(registry.get("rejected", [])),
+        "registry_total_truths":    len(registry.get("ground_truths", [])),
+    })
 
 
 @app.route("/api/resolve-question", methods=["POST"])
@@ -2419,6 +2488,12 @@ async function renderHealth(data) {{
           <span>&#10067; Open questions</span>
           <span style="font-weight:700;color:${{d.open_questions>0?'#4285F4':'#aaa'}}">${{d.open_questions||0}} pending →</span>
         </button>
+        <button onclick="cleanupResolved(this)" id="cleanup-btn"
+                style="display:flex;align-items:center;justify-content:space-between;background:#f5f5f5;border:1px solid #e8e8e8;border-radius:8px;padding:9px 12px;cursor:pointer;font-size:12px;color:#1a1a1a;text-align:left;width:100%"
+                title="Persist all resolved contradictions to the rejection registry and purge bad edges from the graph">
+          <span>&#129529; Apply resolutions to graph</span>
+          <span style="font-weight:600;color:#888;font-size:11px">Run cleanup</span>
+        </button>
       </div></div>
     <div class="section"><div class="section-label">Health</div>
       <div class="meter"><div class="meter-label">Coverage</div>
@@ -2538,6 +2613,27 @@ async function _renderHealthDetail(what, bodyEl) {{
     bodyEl.innerHTML = html;
   }} catch (err) {{
     bodyEl.innerHTML = '<p style="color:#e00">&#9888; ' + err.message + '</p>';
+  }}
+}}
+
+async function cleanupResolved(btn) {{
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span>&#129529; Cleaning up…</span>';
+  try {{
+    const res  = await fetch('/api/cleanup-resolved', {{ method: 'POST' }});
+    const data = await res.json();
+    if (data.ok) {{
+      _showToast(`✓ Registered ${{data.backfilled_registry}} resolutions · purged ${{data.graph_edges_purged}} edges · ${{data.registry_total_truths}} ground truths active`);
+      btn.innerHTML = `<span>&#10003; Cleaned up</span><span style="font-weight:600;color:#15803d;font-size:11px">${{data.graph_edges_purged}} edges purged</span>`;
+      setTimeout(() => {{ btn.innerHTML = original; btn.disabled = false; }}, 3500);
+    }} else {{
+      btn.innerHTML = '<span>&#9888; Error</span>';
+      btn.disabled = false;
+    }}
+  }} catch(e) {{
+    btn.innerHTML = '<span>&#9888; Error</span>';
+    btn.disabled = false;
   }}
 }}
 
