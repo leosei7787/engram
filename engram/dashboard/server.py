@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import traceback
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1919,84 +1920,10 @@ def _classify_event(e) -> tuple[float, list[str]]:
     return (round(score, 2), tags[:5])
 
 
-# Deadline extraction from recent emails.
-# A "date-like tail" — what we want as the actual deadline value.
-_DATE_TAIL = (
-    r"(?:EOD|EOW|"
-    r"end\s+of\s+(?:day|week|month|next\s+week|the\s+\w+|\w+day)|"
-    r"tomorrow|today|tonight|"
-    r"next\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|week|month)\w*|"
-    r"this\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*|"
-    r"(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day(?:\s+\d{1,2}(?:st|nd|rd|th)?)?|"
-    r"\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*|"
-    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2}(?:st|nd|rd|th)?|"
-    r"\d{4}-\d{2}-\d{2}|"
-    r"\d{1,2}/\d{1,2}(?:/\d{2,4})?"
-    r")"
-)
-_DEADLINE_RX = re.compile(
-    r"(?:"
-    # "deadline:" / "deadline is" — keyword strong enough to take any short tail
-    r"deadline(?:\s+is)?\s*[:\-]\s*(?P<d1>[^\.\n;<]{2,80})"
-    # "due by/on/before <date>"
-    r"|\bdue\s+(?:by|on|before)\s+(?P<d2>" + _DATE_TAIL + r"[^\.\n;<]{0,40})"
-    # "due date: ..." / "target date: ..."
-    r"|(?:due|target)\s+date\s*[:\-]\s*(?P<d3>[^\.\n;<]{2,60})"
-    # "submit by/before <date>"
-    r"|submit(?:\w+)?\s+(?:by|before)\s+(?P<d4>" + _DATE_TAIL + r"[^\.\n;<]{0,40})"
-    # "needs to be done|completed|sent|delivered|finalized|reviewed by <date>"
-    r"|need(?:s|ed)?\s+(?:to\s+be\s+)?(?:done|completed|sent|delivered|finalized|reviewed|signed[- ]?off)\s+by\s+(?P<d5>" + _DATE_TAIL + r"[^\.\n;<]{0,40})"
-    # Generic "by <date>" only when followed by a date-like token (avoids "by then" / "by us")
-    r"|\bby\s+(?P<d6>" + _DATE_TAIL + r")"
-    r")",
-    re.IGNORECASE,
-)
-
-
-def _extract_deadlines_from_emails(mem: Path, days_back: int = 14, limit: int = 20) -> list[dict]:
-    """Scan recent email files for deadline mentions. Returns list of hits."""
-    emails_dir = mem / "daily" / "emails"
-    if not emails_dir.exists():
-        return []
-    cutoff = time.time() - days_back * 86400
-    hits: list[dict] = []
-    for f in emails_dir.glob("*.md"):
-        try:
-            if f.stat().st_mtime < cutoff:
-                continue
-            text = f.read_text(errors="ignore")[:6000]
-        except Exception:
-            continue
-
-        # Pull subject line (frontmatter or first H1) for display
-        subject = f.stem.replace("email_", "").replace("_", " ")
-        # Drop trailing ".digest" suffix that some processed emails carry
-        if subject.endswith(".digest"):
-            subject = subject[:-len(".digest")]
-        m = re.search(r"^(?:subject|Subject)\s*[:=]\s*(.+)$", text, re.MULTILINE)
-        if m:
-            subject = m.group(1).strip().strip('"').strip("'")
-
-        for match in _DEADLINE_RX.finditer(text):
-            phrase = next((g for g in match.groupdict().values() if g), "").strip(" :-,")
-            if not phrase or len(phrase) < 2:
-                continue
-            # Pull a short context window around the match
-            start = max(0, match.start() - 40)
-            end = min(len(text), match.end() + 40)
-            ctx = re.sub(r"\s+", " ", text[start:end]).strip()
-
-            hits.append({
-                "subject": subject[:120],
-                "phrase":  phrase[:80],
-                "context": ctx[:180],
-                "rel":     str(f.relative_to(mem)),
-                "mtime":   f.stat().st_mtime,
-            })
-            break  # one deadline per email, keep it tidy
-
-    hits.sort(key=lambda h: h["mtime"], reverse=True)
-    return hits[:limit]
+# Deadline extraction now lives in engram/memory/signal_extractor.py — an
+# AI-driven pass that resolves relative dates, filters past + already-replied
+# threads, and persists to MEMORY/signals/deadlines.json. The dashboard reads
+# the JSON; trigger refresh via /api/signals/refresh or scripts/extract-deadlines.py.
 
 
 @app.route("/api/top-of-mind")
@@ -2081,17 +2008,34 @@ def top_of_mind():
     except Exception:
         pass
 
-    # 3) Deadlines harvested from recent emails
+    # 3) Deadlines from AI-extracted signals (MEMORY/signals/deadlines.json).
+    # The extractor resolves relative dates against each email's send date,
+    # filters past deadlines and already-replied threads, and persists. The
+    # endpoint just reads JSON — no regex, no on-the-fly LLM calls.
     deadlines_out: list = []
+    extracted_at = None
+    extracted_age_s = None
     try:
-        deadlines_out = _extract_deadlines_from_emails(mem, days_back=14, limit=15)
-    except Exception:
-        pass
+        from engram.memory.signal_extractor import (
+            load_signals as _load_signals,
+            signals_age_seconds as _signals_age,
+        )
+        sigs = _load_signals(mem)
+        if sigs:
+            deadlines_out = sigs.get("deadlines", []) or []
+            extracted_at  = sigs.get("extracted_at")
+            extracted_age_s = _signals_age(mem)
+    except Exception as e:
+        print(f"[top-of-mind] signals load error: {e}", flush=True)
 
     return jsonify({
         "events":    events_out,
         "proposals": proposals_out,
         "deadlines": deadlines_out,
+        "deadlines_meta": {
+            "extracted_at": extracted_at,
+            "age_seconds":  extracted_age_s,
+        },
         "counts": {
             "events":    len(events_out),
             "proposals": len(proposals_out),
@@ -2099,6 +2043,61 @@ def top_of_mind():
         },
         "days_ahead": days_ahead,
     })
+
+
+# ─── Signal refresh endpoint (manual or button-triggered) ─────────────────────
+_signals_refresh_lock = threading.Lock()
+_signals_refreshing = False
+
+
+@app.route("/api/signals/refresh", methods=["POST"])
+def signals_refresh():
+    """Kick off a background extraction pass over recent emails.
+
+    Returns immediately with status. The Top of Mind tab can poll
+    /api/top-of-mind to see updated deadlines once the pass completes.
+    Locks so concurrent presses don't pile up parallel extractions.
+    """
+    global _signals_refreshing
+    cfg = get_cfg()
+    body = request.get_json(force=True, silent=True) or {}
+    days_back = int(body.get("days_back", 14))
+    limit     = int(body.get("limit", 80))
+
+    with _signals_refresh_lock:
+        if _signals_refreshing:
+            return jsonify({"status": "already_running"})
+        _signals_refreshing = True
+
+    def _run():
+        global _signals_refreshing
+        try:
+            from engram.memory.signal_extractor import (
+                extract_recent_email_signals,
+                save_signals,
+            )
+            user = cfg.identity.user_name or ""
+            sigs = extract_recent_email_signals(
+                memory_path = cfg.memory_path,
+                user_name   = user,
+                cfg         = cfg,
+                days_back   = days_back,
+                limit       = limit,
+            )
+            save_signals(sigs, cfg.memory_path)
+            print(f"[signals] refresh done: {sigs['scanned']} scanned, "
+                  f"{len(sigs['deadlines'])} surfaced, "
+                  f"{sigs['filtered_out']['past']} past + "
+                  f"{sigs['filtered_out']['already_responded']} responded filtered out",
+                  flush=True)
+        except Exception:
+            print("[signals] refresh error:\n" + traceback.format_exc(), flush=True)
+        finally:
+            with _signals_refresh_lock:
+                _signals_refreshing = False
+
+    threading.Thread(target=_run, daemon=True, name="engram-signals").start()
+    return jsonify({"status": "started", "days_back": days_back, "limit": limit})
 
 
 # ─── Main page ────────────────────────────────────────────────────────────────
@@ -3431,18 +3430,35 @@ function renderTopOfMind(data) {{
     }}).join('') + '</div>';
   }}
 
-  // Deadlines from recent emails
+  // Deadlines from recent emails — AI-extracted, persisted to signals/deadlines.json
+  const dlMeta = data.deadlines_meta || {{}};
+  const ageMin = dlMeta.age_seconds != null ? Math.round(dlMeta.age_seconds / 60) : null;
+  let metaLine = '';
+  if (!dlMeta.extracted_at) {{
+    metaLine = `<span style="color:#aaa">never extracted — <a href="#" onclick="refreshSignals(event)" style="color:#34A853;text-decoration:underline">run now →</a></span>`;
+  }} else {{
+    const ageStr = ageMin == null ? '?' : (ageMin < 60 ? `${{ageMin}}m ago` : `${{Math.round(ageMin/60)}}h ago`);
+    metaLine = `<span style="color:#aaa">extracted ${{ageStr}}</span> · <a href="#" onclick="refreshSignals(event)" style="color:#34A853;text-decoration:underline">refresh →</a>`;
+  }}
+
   let dHtml = '';
   if (deadlines.length === 0) {{
-    dHtml = '<div class="tom-empty">No deadlines mentioned in recent emails.</div>';
+    dHtml = '<div class="tom-empty">No outstanding deadlines.</div>';
   }} else {{
     dHtml = '<div class="tom-list">' + deadlines.map(d => {{
+      const urg = d.urgency || 'medium';
+      const urgColor = urg === 'high' ? '#c06040' : urg === 'low' ? '#888' : '#4285F4';
+      const dateStr = d.deadline || '—';
+      const conf = d.confidence ? ` · ${{Math.round(d.confidence*100)}}%` : '';
       return `
-        <div class="tom-item" onclick="openFilePreview('${{escHtml(d.rel).replace(/'/g, "\\\\'")}}')" style="cursor:pointer">
+        <div class="tom-item" onclick="openFilePreview('${{escHtml(d.source_rel).replace(/'/g, "\\\\'")}}')" style="cursor:pointer">
           <div class="tom-item-main">
-            <div style="font-weight:600;color:#34A853;font-size:11.5px">${{escHtml(d.phrase)}}</div>
-            <div style="margin-top:3px">${{escHtml(d.subject)}}</div>
-            ${{d.context ? `<div class="tom-item-aux" style="font-style:italic;margin-top:3px">"${{escHtml(d.context)}}"</div>` : ''}}
+            <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:3px">
+              <span style="font-weight:700;font-size:12px;color:${{urgColor}}">${{escHtml(dateStr)}}</span>
+              <span style="font-size:9.5px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;padding:1px 6px;border-radius:8px;background:rgba(0,0,0,.05);color:${{urgColor}}">${{escHtml(urg)}}</span>
+            </div>
+            <div style="font-weight:600;font-size:12px">${{escHtml(d.action)}}</div>
+            <div class="tom-item-aux" style="margin-top:3px">${{escHtml(d.subject)}}${{conf}}</div>
           </div>
         </div>`;
     }}).join('') + '</div>';
@@ -3469,10 +3485,33 @@ function renderTopOfMind(data) {{
       <div class="tom-col-stripe"></div>
       <div class="tom-col-num">Inbox signals</div>
       <div class="tom-col-title">Deadlines from emails</div>
-      <div class="tom-col-sub">Phrases like "due by", "deadline", "submit by" in last 14 days</div>
-      <div class="tom-col-count">${{deadlines.length}} found</div>
+      <div class="tom-col-sub">AI-extracted: relative dates resolved · already-replied + past filtered out</div>
+      <div class="tom-col-count">${{deadlines.length}} active · <span style="font-weight:400">${{metaLine}}</span></div>
       <div style="margin-top:14px">${{dHtml}}</div>
     </div>`;
+}}
+
+function refreshSignals(ev) {{
+  if (ev) ev.preventDefault();
+  const tile = document.querySelector('.tom-col.questions .tom-col-count');
+  if (tile) tile.innerHTML = tile.innerHTML.split(' · ')[0] + ' · <span style="color:#888">refreshing…</span>';
+  fetch('/api/signals/refresh', {{
+    method:  'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body:    JSON.stringify({{days_back: 14}}),
+  }}).then(r => r.json()).then(j => {{
+    if (j.status === 'started') {{
+      // Poll Top of Mind a few times until the signals file's mtime updates.
+      let tries = 0;
+      const poll = () => {{
+        if (++tries > 40) return;       // 40 × 3s = 2 min cap
+        loadTopOfMind();
+        const t = document.querySelector('.tom-col.questions .tom-col-count');
+        if (t && t.innerHTML.includes('refreshing')) setTimeout(poll, 3000);
+      }};
+      setTimeout(poll, 4000);
+    }}
+  }}).catch(() => {{}});
 }}
 
 // ── Health tab ─────────────────────────────────────────────────────────────
