@@ -27,7 +27,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -36,9 +38,21 @@ from flask import Flask, jsonify, request, Response, stream_with_context
 from engram.retrieval.config import load_config, EngramConfig
 from engram.retrieval.pipeline import memory_scan
 from engram.retrieval.curator import build_candidates, curate_context, monitor_context, detect_drift
+from engram.ingest.watcher import InboxWatcher
 
 app = Flask(__name__)
 _cfg: EngramConfig | None = None
+
+# ─── Watcher state ────────────────────────────────────────────────────────────
+_watcher: InboxWatcher | None = None
+_watcher_thread: threading.Thread | None = None
+_watcher_status: dict = {
+    "running": False,
+    "inbox":   None,
+    "last_scan": None,
+    "files_seen": 0,
+    "files_new":  0,
+}
 
 
 def get_cfg() -> EngramConfig:
@@ -46,6 +60,68 @@ def get_cfg() -> EngramConfig:
     if _cfg is None:
         _cfg = load_config()
     return _cfg
+
+
+def _start_watcher(cfg: EngramConfig):
+    """Start inbox watcher as a background daemon thread."""
+    global _watcher, _watcher_thread, _watcher_status
+
+    inbox = (
+        getattr(cfg, "inbox_src", None)
+        or (cfg.paths.inbox_src if hasattr(cfg, "paths") else None)
+    )
+    if not inbox:
+        return
+
+    inbox_path = Path(inbox)
+    if not inbox_path.exists():
+        print(f"[watcher] inbox does not exist yet: {inbox_path}", flush=True)
+        return
+
+    _watcher_status["inbox"] = str(inbox_path)
+
+    def _ingest(path: Path, content: str) -> bool:
+        """
+        Simple ingestion: copy the file into memory/daily/emails/ (or inbox/)
+        so it's immediately searchable, then update watcher status.
+        More complex Claude-based extraction happens in the nightly sleep cycle.
+        """
+        import shutil as _shutil
+        dest_dir = cfg.memory_path / "daily" / "emails"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        # Preserve original name but make it safe
+        safe_name = re.sub(r"[^\w.\-]", "_", path.name)[:120]
+        dest = dest_dir / safe_name
+        try:
+            _shutil.copy2(str(path), str(dest))
+            _watcher_status["files_new"] += 1
+            _watcher_status["last_scan"] = datetime.now(timezone.utc).isoformat()
+            return True
+        except Exception as e:
+            print(f"[watcher] copy error: {e}", flush=True)
+            return False
+
+    _watcher = InboxWatcher(
+        inbox_path       = inbox_path,
+        memory_path      = cfg.memory_path,
+        claude_bin       = str(cfg.paths.claude_bin) if cfg.paths.claude_bin else None,
+        model            = cfg.models.haiku,
+        interval_seconds = 60,
+        extensions       = {".md", ".txt", ".eml", ".vtt", ".html"},
+        on_new_file      = _ingest,
+    )
+
+    def _run():
+        global _watcher_status
+        _watcher_status["running"] = True
+        # First pass: count files already seen
+        _watcher_status["last_scan"] = datetime.now(timezone.utc).isoformat()
+        _watcher.run()
+        _watcher_status["running"] = False
+
+    _watcher_thread = threading.Thread(target=_run, daemon=True, name="engram-watcher")
+    _watcher_thread.start()
+    print(f"[watcher] started — watching {inbox_path}", flush=True)
 
 
 # ─── Claude backend helpers ───────────────────────────────────────────────────
@@ -526,12 +602,12 @@ def stats():
         if oq_f.exists():
             oqd   = json.loads(oq_f.read_text())
             qs    = oqd if isinstance(oqd, list) else oqd.get("questions", [])
-            open_q = len([q for q in qs if q.get("status") not in ("resolved", "dismissed")])
+            open_q = len([q for q in qs if q.get("status") not in ("answered", "resolved", "dismissed", "stale")])
         ct_f = memory_path / "contradictions.json"
         if ct_f.exists():
             ctd  = json.loads(ct_f.read_text())
             cs   = ctd if isinstance(ctd, list) else ctd.get("contradictions", [])
-            contradictions_pending = len([c for c in cs if c.get("status") not in ("resolved", "dismissed")])
+            contradictions_pending = len([c for c in cs if c.get("status") not in ("resolved_A", "resolved_B", "dismissed")])
     except Exception as e:
         print(f"[stats] health: {e}", flush=True)
 
@@ -760,44 +836,143 @@ def health_detail():
     if what == "contradictions":
         p = mem / "contradictions.json"
         if not p.exists():
-            return jsonify({"items": []})
+            return jsonify({"items": [], "total": 0})
         try:
             data  = json.loads(p.read_text(errors="ignore"))
             items = data if isinstance(data, list) else data.get("contradictions", [])
+            active = [it for it in items if it.get("status") not in ("resolved_A", "resolved_B", "dismissed")]
             out   = []
-            for it in items[:100]:
+            for it in active[:50]:
+                ca = it.get("claim_A") or {}
+                cb = it.get("claim_B") or {}
                 out.append({
                     "id":       it.get("id", ""),
-                    "summary":  it.get("summary") or it.get("description") or str(it)[:200],
-                    "entities": it.get("entities", []),
-                    "severity": it.get("severity", ""),
-                    "status":   it.get("status", ""),
+                    "type":     it.get("type", "factual_conflict"),
+                    "severity": it.get("severity", "medium"),
+                    "status":   it.get("status", "unresolved"),
+                    "claim_A":  {
+                        "statement": ca.get("statement", ""),
+                        "source":    ca.get("source", ""),
+                        "date":      (ca.get("date") or "")[:10],
+                        "weight":    round(ca.get("weight", 0.5), 2),
+                    },
+                    "claim_B":  {
+                        "statement": cb.get("statement", ""),
+                        "source":    cb.get("source", ""),
+                        "date":      (cb.get("date") or "")[:10],
+                        "weight":    round(cb.get("weight", 0.5), 2),
+                    },
                 })
-            return jsonify({"items": out, "total": len(items)})
+            return jsonify({"items": out, "total": len(active)})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
     elif what == "open_questions":
         p = mem / "open_questions.json"
         if not p.exists():
-            return jsonify({"items": []})
+            return jsonify({"items": [], "total": 0})
         try:
             data = json.loads(p.read_text(errors="ignore"))
             qs   = data if isinstance(data, list) else data.get("questions", [])
+            active = [q for q in qs if q.get("status") not in ("answered", "dismissed", "resolved", "closed", "stale")]
             out  = []
-            for q in qs:
-                if q.get("status") not in ("resolved", "dismissed", "closed"):
-                    out.append({
-                        "text":     q.get("text", ""),
-                        "salience": q.get("salience", 0),
-                        "source":   q.get("source", ""),
-                        "status":   q.get("status", "open"),
-                    })
-            return jsonify({"items": out, "total": len(out)})
+            for q in active[:50]:
+                raw_text = q.get("text", "")
+                # Strip markdown bold/status boilerplate if text is just template
+                clean = re.sub(r"\*\*Status:\*\*.*$", "", raw_text, flags=re.DOTALL).strip()
+                clean = re.sub(r"\*\*Review:\*\*.*$", "", clean, flags=re.DOTALL).strip()
+                if not clean:
+                    clean = raw_text
+                out.append({
+                    "id":       q.get("id", ""),
+                    "text":     clean[:400],
+                    "priority": q.get("priority", "medium"),
+                    "status":   q.get("status", "open"),
+                    "source":   q.get("created_from", q.get("source", "")),
+                    "created":  (q.get("created_at") or "")[:10],
+                })
+            return jsonify({"items": out, "total": len(active)})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
     return jsonify({"error": "unknown"}), 400
+
+
+@app.route("/api/resolve-contradiction", methods=["POST"])
+def resolve_contradiction():
+    cfg = get_cfg()
+    body = request.get_json(force=True, silent=True) or {}
+    item_id    = body.get("id", "")
+    resolution = body.get("resolution", "dismissed")  # resolved_A | resolved_B | dismissed
+
+    if resolution not in ("resolved_A", "resolved_B", "dismissed"):
+        return jsonify({"error": "invalid resolution"}), 400
+
+    p = cfg.memory_path / "contradictions.json"
+    if not p.exists():
+        return jsonify({"error": "file not found"}), 404
+    try:
+        data  = json.loads(p.read_text(errors="ignore"))
+        items = data if isinstance(data, list) else data.get("contradictions", [])
+        found = False
+        for it in items:
+            if it.get("id") == item_id:
+                it["status"]      = resolution
+                it["resolved_by"] = "user"
+                it["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                found = True
+                break
+        if not found:
+            return jsonify({"error": "not found"}), 404
+        if isinstance(data, list):
+            p.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        else:
+            data["contradictions"] = items
+            p.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        return jsonify({"ok": True, "id": item_id, "resolution": resolution})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/resolve-question", methods=["POST"])
+def resolve_question():
+    cfg = get_cfg()
+    body = request.get_json(force=True, silent=True) or {}
+    item_id    = body.get("id", "")
+    resolution = body.get("resolution", "dismissed")  # answered | dismissed
+
+    if resolution not in ("answered", "dismissed"):
+        return jsonify({"error": "invalid resolution"}), 400
+
+    p = cfg.memory_path / "open_questions.json"
+    if not p.exists():
+        return jsonify({"error": "file not found"}), 404
+    try:
+        data = json.loads(p.read_text(errors="ignore"))
+        qs   = data if isinstance(data, list) else data.get("questions", [])
+        found = False
+        for q in qs:
+            if q.get("id") == item_id:
+                q["status"]      = resolution
+                q["answered_by"] = "user"
+                q["answered_at"] = datetime.now(timezone.utc).isoformat()
+                found = True
+                break
+        if not found:
+            return jsonify({"error": "not found"}), 404
+        if isinstance(data, list):
+            p.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        else:
+            data["questions"] = qs
+            p.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        return jsonify({"ok": True, "id": item_id, "resolution": resolution})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/watcher-status")
+def watcher_status():
+    return jsonify(_watcher_status)
 
 
 # ─── Main page ────────────────────────────────────────────────────────────────
@@ -1010,6 +1185,26 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .fp-body pre {{ font-size: 12px; font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace;
                 white-space: pre-wrap; word-break: break-word; color: #333; line-height: 1.65; }}
 .fp-loading {{ color: #ccc; font-size: 12px; font-style: italic; }}
+
+/* Health detail cards */
+.hd-card {{ border: 1px solid #efefef; border-radius: 10px; padding: 14px 16px;
+             margin-bottom: 12px; background: #fafafa; transition: opacity .3s; }}
+.hd-claim {{ background: #fff; border: 1px solid #e8e8e8; border-radius: 8px; padding: 10px 12px; }}
+.hd-claim.claim-a {{ border-left: 3px solid #3b82f6; }}
+.hd-claim.claim-b {{ border-left: 3px solid #f59e0b; }}
+.hd-claim-label {{ font-size: 10px; font-weight: 700; color: #aaa; text-transform: uppercase;
+                    letter-spacing: .5px; margin-bottom: 5px; }}
+.hd-claim-text {{ font-size: 12px; color: #1a1a1a; line-height: 1.5; margin-bottom: 4px; }}
+.hd-claim-meta  {{ font-size: 10px; color: #bbb; }}
+.hd-actions {{ display: flex; gap: 6px; flex-wrap: wrap; }}
+.hd-btn {{ font-size: 11px; font-weight: 600; border: none; border-radius: 6px;
+            padding: 5px 12px; cursor: pointer; transition: opacity .15s; }}
+.hd-btn:hover {{ opacity: .8; }}
+.hd-btn:disabled {{ opacity: .45; cursor: default; }}
+.hd-btn-a       {{ background: #ebf5ff; color: #1d4ed8; }}
+.hd-btn-b       {{ background: #fef3c7; color: #92400e; }}
+.hd-btn-resolve {{ background: #dcfce7; color: #15803d; }}
+.hd-btn-dismiss {{ background: #f3f4f6; color: #6b7280; }}
 
 /* Chat main */
 .chat-main {{ flex: 1; display: flex; flex-direction: column; overflow: hidden; }}
@@ -1847,9 +2042,24 @@ function renderHealth(data) {{
 
   const health = d.health || {{}};
   const covPct = Math.round((health.coverage_score||0)*100);
+  // Watcher chip — fetch async
+  let watcherChip = '';
+  try {{
+    const wr = await fetch('/api/watcher-status');
+    const ws = await wr.json();
+    if (ws.inbox) {{
+      const inbox = ws.inbox.split('/').pop();
+      const newCount = ws.files_new || 0;
+      watcherChip = ws.running
+        ? `<div class="alert-chip ok" title="Monitoring ${{ws.inbox}}">&#128065; Watching ${{inbox}}${{newCount ? ' · ' + newCount + ' new' : ''}}</div>`
+        : `<div class="alert-chip warn" title="Watcher not running">&#128065; Watcher idle</div>`;
+    }}
+  }} catch(e) {{}}
+
   const alerts = [
     d.contradictions_pending>0?`<div class="alert-chip warn" onclick="openHealthDetail('contradictions')">&#9888; ${{d.contradictions_pending}} contradictions</div>`:'',
     d.open_questions>0?`<div class="alert-chip info" onclick="openHealthDetail('open_questions')">&#10067; ${{d.open_questions}} open questions</div>`:'',
+    watcherChip,
     !d.contradictions_pending&&!d.open_questions?`<div class="alert-chip ok">&#10003; Clean</div>`:'',
   ].filter(Boolean).join('');
 
@@ -1931,7 +2141,10 @@ function renderHealth(data) {{
   </div>`;
 }}
 
+let _hdWhat = null;
+
 async function openHealthDetail(what) {{
+  _hdWhat = what;
   const overlay  = document.getElementById('health-detail-overlay');
   const titleEl  = document.getElementById('health-detail-title');
   const bodyEl   = document.getElementById('health-detail-body');
@@ -1940,6 +2153,10 @@ async function openHealthDetail(what) {{
   bodyEl.innerHTML    = '<div class="fp-loading">Loading…</div>';
   overlay.classList.add('open');
 
+  await _renderHealthDetail(what, bodyEl);
+}}
+
+async function _renderHealthDetail(what, bodyEl) {{
   try {{
     const res  = await fetch('/api/health-detail?what=' + what);
     const data = await res.json();
@@ -1947,32 +2164,110 @@ async function openHealthDetail(what) {{
     if (data.error) {{ bodyEl.innerHTML = '<p style="color:#e00">&#9888; ' + data.error + '</p>'; return; }}
 
     const items = data.items || [];
-    if (!items.length) {{ bodyEl.innerHTML = '<p style="color:#aaa;font-style:italic">None found.</p>'; return; }}
+    if (!items.length) {{
+      bodyEl.innerHTML = '<p style="color:#aaa;font-style:italic;padding:8px 0">None pending.</p>';
+      return;
+    }}
 
-    let html = `<p style="font-size:11px;color:#aaa;margin-bottom:14px">${{items.length}} item${{items.length !== 1 ? 's' : ''}}</p>`;
+    const total = data.total || items.length;
+    let html = `<p style="font-size:11px;color:#aaa;margin-bottom:16px">${{total}} pending</p>`;
 
     if (what === 'contradictions') {{
-      html += items.map(it => `
-        <div style="border:1px solid #efefef;border-radius:8px;padding:12px 14px;margin-bottom:10px">
-          <div style="font-size:12px;color:#1a1a1a;line-height:1.5">${{it.summary}}</div>
-          ${{it.entities && it.entities.length ? `<div style="font-size:10px;color:#aaa;margin-top:6px">Entities: ${{it.entities.join(', ')}}</div>` : ''}}
-          ${{it.severity ? `<span style="font-size:10px;color:#e07000;background:#fff3e0;padding:1px 6px;border-radius:10px;margin-top:4px;display:inline-block">${{it.severity}}</span>` : ''}}
-        </div>`).join('');
-    }} else {{
-      html += items.map((q, i) => `
-        <div style="display:flex;gap:10px;padding:8px 0;border-bottom:1px solid #f5f5f5">
-          <div style="font-size:11px;font-weight:700;color:#bbb;width:20px;flex-shrink:0">${{i+1}}</div>
-          <div style="flex:1">
-            <div style="font-size:13px;color:#1a1a1a;line-height:1.5">${{q.text}}</div>
-            ${{q.source ? `<div style="font-size:10px;color:#aaa;margin-top:3px">Source: ${{q.source}}</div>` : ''}}
+      const sevColor = {{ high: '#e53e3e', medium: '#dd6b20', low: '#718096' }};
+      html += items.map(it => {{
+        const sa = it.claim_A || {{}};
+        const sb = it.claim_B || {{}};
+        const sev = it.severity || 'medium';
+        const sc  = sevColor[sev] || '#718096';
+        return `
+        <div class="hd-card" data-id="${{it.id}}" data-what="contradictions">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+            <span style="font-size:10px;font-weight:700;color:${{sc}};background:${{sc}}18;padding:2px 8px;border-radius:10px;text-transform:uppercase">${{sev}}</span>
+            <span style="font-size:10px;color:#bbb">${{it.type || 'factual conflict'}}</span>
           </div>
-          <div style="font-size:10px;color:#bbb;white-space:nowrap">${{(q.salience * 100).toFixed(0)}}%</div>
-        </div>`).join('');
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+            <div class="hd-claim claim-a">
+              <div class="hd-claim-label">Claim A</div>
+              <div class="hd-claim-text">${{sa.statement || '—'}}</div>
+              ${{sa.source ? `<div class="hd-claim-meta">Source: ${{sa.source.split('/').pop()}}</div>` : ''}}
+              ${{sa.weight ? `<div class="hd-claim-meta">Confidence: ${{Math.round(sa.weight*100)}}%</div>` : ''}}
+            </div>
+            <div class="hd-claim claim-b">
+              <div class="hd-claim-label">Claim B</div>
+              <div class="hd-claim-text">${{sb.statement || '—'}}</div>
+              ${{sb.source ? `<div class="hd-claim-meta">Source: ${{sb.source.split('/').pop()}}</div>` : ''}}
+              ${{sb.weight ? `<div class="hd-claim-meta">Confidence: ${{Math.round(sb.weight*100)}}%</div>` : ''}}
+            </div>
+          </div>
+          <div class="hd-actions">
+            <button class="hd-btn hd-btn-a" onclick="resolveItem('contradictions','${{it.id}}','resolved_A',this)">✓ A is correct</button>
+            <button class="hd-btn hd-btn-b" onclick="resolveItem('contradictions','${{it.id}}','resolved_B',this)">✓ B is correct</button>
+            <button class="hd-btn hd-btn-dismiss" onclick="resolveItem('contradictions','${{it.id}}','dismissed',this)">✕ Dismiss</button>
+          </div>
+        </div>`;
+      }}).join('');
+    }} else {{
+      const priColor = {{ high: '#e53e3e', medium: '#dd6b20', low: '#718096' }};
+      html += items.map((q, i) => {{
+        const pri = q.priority || 'medium';
+        const pc  = priColor[pri] || '#718096';
+        return `
+        <div class="hd-card" data-id="${{q.id}}" data-what="open_questions">
+          <div style="display:flex;align-items:flex-start;gap:10px;margin-bottom:10px">
+            <span style="font-size:10px;font-weight:700;color:${{pc}};background:${{pc}}18;padding:2px 8px;border-radius:10px;text-transform:uppercase;white-space:nowrap">${{pri}}</span>
+            <div style="flex:1;font-size:13px;color:#1a1a1a;line-height:1.5">${{q.text || '—'}}</div>
+          </div>
+          ${{q.source ? `<div style="font-size:10px;color:#aaa;margin-bottom:10px">Source: ${{q.source.split('/').pop()}}</div>` : ''}}
+          <div class="hd-actions">
+            <button class="hd-btn hd-btn-resolve" onclick="resolveItem('open_questions','${{q.id}}','answered',this)">✓ Mark resolved</button>
+            <button class="hd-btn hd-btn-dismiss" onclick="resolveItem('open_questions','${{q.id}}','dismissed',this)">✕ Dismiss</button>
+          </div>
+        </div>`;
+      }}).join('');
     }}
 
     bodyEl.innerHTML = html;
   }} catch (err) {{
     bodyEl.innerHTML = '<p style="color:#e00">&#9888; ' + err.message + '</p>';
+  }}
+}}
+
+async function resolveItem(what, id, resolution, btn) {{
+  const endpoint = what === 'contradictions' ? '/api/resolve-contradiction' : '/api/resolve-question';
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {{
+    const res  = await fetch(endpoint, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ id, resolution }})
+    }});
+    const data = await res.json();
+    if (data.ok) {{
+      // Remove card with fade
+      const card = btn.closest('.hd-card');
+      if (card) {{
+        card.style.opacity = '0';
+        card.style.transition = 'opacity 0.3s';
+        setTimeout(() => {{
+          card.remove();
+          // Update counter
+          const remaining = document.querySelectorAll('.hd-card').length;
+          const p = document.querySelector('#health-detail-body > p');
+          if (p) p.textContent = remaining + ' pending';
+          if (!remaining) {{
+            document.querySelector('#health-detail-body').innerHTML =
+              '<p style="color:#aaa;font-style:italic;padding:8px 0">All resolved.</p>';
+          }}
+        }}, 300);
+      }}
+    }} else {{
+      btn.disabled = false;
+      btn.textContent = '⚠ retry';
+    }}
+  }} catch(e) {{
+    btn.disabled = false;
+    btn.textContent = '⚠ retry';
   }}
 }}
 
@@ -2020,4 +2315,11 @@ if __name__ == "__main__":
     print(f"  Health → http://localhost:{port}/health", flush=True)
     print(f"  Memory: {cfg.memory_path}", flush=True)
     print(f"  Wiki:   {cfg.wiki_path}", flush=True)
+
+    # Auto-start inbox watcher if inbox is configured
+    try:
+        _start_watcher(cfg)
+    except Exception as e:
+        print(f"[watcher] failed to start: {e}", flush=True)
+
     app.run(host="0.0.0.0", port=port, debug=False)
