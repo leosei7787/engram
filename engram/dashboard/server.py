@@ -222,6 +222,20 @@ def _stream_cli(messages: list, system_prompt: str, cli_bin: str, model: str | N
     """
     user_msg = _format_messages_for_cli(messages)
 
+    # subprocess.Popen rejects any string containing \x00 with "embedded null
+    # byte". These show up when upstream PDF/Word extractors mangle ligatures
+    # (fl/fi → \x00). Strip defensively so a single bad source file can't
+    # take down the chat. Tracked count goes to the log for visibility.
+    def _strip_nulls(s: str) -> tuple[str, int]:
+        if not s or "\x00" not in s:
+            return (s, 0)
+        return (s.replace("\x00", ""), s.count("\x00"))
+
+    user_msg, n_user_nulls   = _strip_nulls(user_msg)
+    system_prompt, n_sys_nulls = _strip_nulls(system_prompt)
+    if n_user_nulls or n_sys_nulls:
+        print(f"[chat/cli] stripped null bytes: user={n_user_nulls} system={n_sys_nulls}", flush=True)
+
     cmd = [cli_bin, "-p", user_msg, "--output-format", "stream-json", "--verbose"]
     if system_prompt:
         cmd += ["--system-prompt", system_prompt]
