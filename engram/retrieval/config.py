@@ -183,6 +183,8 @@ class WikiRetrievalConfig:
     max_pages:           int   = 4
     proper_noun_boost:   float = 3.0
     max_count_per_token: int   = 5
+    use_qmd:             bool  = True   # prefer QMD BM25 backend (fallback to index scan)
+    qmd_collection:      str   = "wiki" # QMD collection name for compiled wiki pages
 
 
 @dataclass
@@ -261,6 +263,17 @@ class SystemPromptConfig:
 
 
 @dataclass
+class ChatConfig:
+    """Controls which backend the dashboard uses to generate responses."""
+    # "api"  — Anthropic Python SDK (requires ANTHROPIC_API_KEY env var)
+    # "cli"  — Claude CLI subprocess (uses your logged-in Claude account,
+    #           no separate API key needed; streams via --output-format stream-json)
+    backend:   str           = "api"
+    cli_bin:   Optional[str] = None    # full path to claude binary; auto-detected if None
+    cli_model: Optional[str] = None    # override model for CLI (None = CLI default)
+
+
+@dataclass
 class EngramConfig:
     """Top-level engram configuration object."""
     identity:       IdentityConfig       = field(default_factory=IdentityConfig)
@@ -273,6 +286,7 @@ class EngramConfig:
     deep_work:      DeepWorkConfig       = field(default_factory=DeepWorkConfig)
     dashboard:      DashboardConfig      = field(default_factory=DashboardConfig)
     system_prompt:  SystemPromptConfig   = field(default_factory=SystemPromptConfig)
+    chat:           ChatConfig           = field(default_factory=ChatConfig)
 
     # Convenience shortcuts (populated by load_config)
     @property
@@ -442,6 +456,8 @@ def _build_config(raw: dict) -> EngramConfig:
             max_pages           = int(wi.get("max_pages", 4)),
             proper_noun_boost   = float(wi.get("proper_noun_boost", 3.0)),
             max_count_per_token = int(wi.get("max_count_per_token", 5)),
+            use_qmd             = bool(wi.get("use_qmd", True)),
+            qmd_collection      = str(wi.get("qmd_collection", "wiki")),
         ),
         context_budget = ContextBudgetConfig(
             max_total_chars          = int(cb.get("max_total_chars", 80000)),
@@ -504,6 +520,14 @@ def _build_config(raw: dict) -> EngramConfig:
         user_tone        = str(sp.get("user_tone", "Direct, execution-focused.")),
         always_load      = list(sp.get("always_load", ["preferences.md"])),
         instructions     = dict(sp.get("instructions", {})),
+    )
+
+    # ── chat ──
+    ch_raw = raw.get("chat", {})
+    cfg.chat = ChatConfig(
+        backend   = str(ch_raw.get("backend",   "api")),
+        cli_bin   = ch_raw.get("cli_bin",   None) or None,
+        cli_model = ch_raw.get("cli_model", None) or None,
     )
 
     return cfg

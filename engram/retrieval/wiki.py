@@ -26,7 +26,10 @@ Resilience features (v0.2):
 from __future__ import annotations
 
 import difflib
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -76,6 +79,60 @@ def _get_cached(topic: str, index_file: Path) -> list[tuple[str, str]]:
     return _wiki_index_cache.get(topic, [])
 
 
+# ─── QMD backend ─────────────────────────────────────────────────────────────
+
+def _qmd_available() -> bool:
+    """True if the qmd CLI is on PATH."""
+    return shutil.which("qmd") is not None
+
+
+def _qmd_wiki_scan(
+    query: str,
+    wiki_path: Path,
+    *,
+    max_pages: int = 4,
+    collection: str = "wiki",
+) -> list[str]:
+    """
+    Search the wiki via QMD BM25 (no vector model required).
+
+    Expects a 'wiki' collection indexed against wiki_path.
+    If the collection doesn't exist or qmd fails, returns [].
+
+    QMD URI format: qmd://wiki/topic/page.md
+    Converted to:   {wiki_path}/topic/page.md
+    """
+    try:
+        result = subprocess.run(
+            ["qmd", "search", "--json", "--collection", collection, query],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        data = json.loads(result.stdout)
+        if not isinstance(data, list):
+            return []
+
+        prefix = f"qmd://{collection}/"
+        paths: list[str] = []
+        for item in data:
+            file_uri = item.get("file", "")
+            if not file_uri.startswith(prefix):
+                continue
+            rel = file_uri[len(prefix):]          # e.g. "competition/BetaMotors.md"
+            abs_path = wiki_path / rel
+            if abs_path.exists() and str(abs_path) not in paths:
+                paths.append(str(abs_path))
+            if len(paths) >= max_pages:
+                break
+
+        return paths
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, Exception) as e:
+        print(f"[wiki/qmd] {type(e).__name__}: {e}", flush=True)
+        return []
+
+
 # ─── Main scan ────────────────────────────────────────────────────────────────
 
 def wiki_scan(
@@ -87,14 +144,17 @@ def wiki_scan(
     max_count_per_token: int = 5,
     topics: Optional[list] = None,
     synonyms: Optional[dict] = None,
+    use_qmd: bool = True,
+    qmd_collection: str = "wiki",
 ) -> list[str]:
     """
-    Search wiki topic indexes for pages relevant to the query.
+    Search wiki pages for pages relevant to the query.
 
-    Scoring layers (applied in order, accumulated):
-      1. Exact token match against page name + description
-      2. Stem match for tokens that didn't exact-match (0.6x weight)
-      3. Fuzzy match of long proper nouns against page name tokens (0.8x weight)
+    Backends (tried in order):
+      1. QMD BM25 (if use_qmd=True and qmd CLI is available and has a 'wiki' collection)
+         — proper fuzzy BM25 search, handles stemming/synonyms natively
+      2. Index-based token scan (_index.md files) with stemming + fuzzy fallback
+         — used when QMD isn't available or returns nothing
 
     Returns a list of absolute paths to the best matching wiki pages,
     up to max_pages. Returns [] if the wiki directory doesn't exist or
@@ -104,17 +164,30 @@ def wiki_scan(
         query:              Natural language user query.
         wiki_path:          Root of the knowledge-base-wiki directory.
         max_pages:          Maximum number of wiki pages to return.
-        proper_noun_boost:  Score multiplier for proper-noun tokens.
-        max_count_per_token: Cap token count per page (avoids over-scoring).
-        topics:             If set, only scan these topic directories.
-                            Defaults to all topic directories found.
+        proper_noun_boost:  Score multiplier for proper-noun tokens (index backend).
+        max_count_per_token: Cap token count per page (index backend).
+        topics:             If set, only scan these topic directories (index backend).
         synonyms:           Dict of {term: [equivalent, ...]} for query expansion.
-                            Same format as keyword.fast_file_score().
+        use_qmd:            Try QMD backend first (default True).
+        qmd_collection:     Name of the QMD collection for compiled wiki pages.
     """
     wiki_pages_dir = wiki_path / "wiki"
     if not wiki_pages_dir.exists():
         return []
 
+    # ── Backend 1: QMD BM25 ───────────────────────────────────────────────────
+    if use_qmd and _qmd_available():
+        qmd_results = _qmd_wiki_scan(
+            query, wiki_pages_dir,
+            max_pages=max_pages,
+            collection=qmd_collection,
+        )
+        if qmd_results:
+            print(f"[wiki/qmd] {len(qmd_results)} pages via QMD", flush=True)
+            return qmd_results
+        # QMD returned nothing — fall through to index scan
+
+    # ── Backend 2: index-based token scan ────────────────────────────────────
     q_toks = query_tokens(query)
 
     # Synonym expansion (bidirectional)
