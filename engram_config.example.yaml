@@ -1,0 +1,351 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# engram — example configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy this file to ~/.engram/config.yaml (or set ENGRAM_CONFIG_FILE to any
+# path) and fill in your values. All keys have safe defaults — you only need
+# to set the ones that differ from the defaults.
+#
+# Override priority (highest → lowest):
+#   1. ENGRAM_* environment variables
+#   2. This config file
+#   3. Hardcoded defaults in engram/retrieval/config.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── Identity ──────────────────────────────────────────────────────────────────
+identity:
+  org_name:     "Acme Corp"              # shown in dashboard + system prompts
+  user_name:    "Jane Smith"             # primary user of this instance
+  user_role:    "CPO"                    # role label, injected into prompts
+  user_email:   "jane@acme.com"
+  system_name:  "Knowledge System"       # title shown in dashboard
+  accent_color: "#6366f1"               # hex, used in dashboard UI
+
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+paths:
+  # Root of the memory store (graph.json, open_questions.json, etc.)
+  memory_path:  "/path/to/memory-store"
+
+  # Root of the compiled wiki directory
+  wiki_path:    "/path/to/knowledge-base-wiki"
+
+  # Folder that sync_and_ingest.sh watches for new documents
+  inbox_src:    "/path/to/inbox"
+
+  # Where generated outputs go (optional)
+  outputs_path: "/path/to/outputs"
+
+  # Session transcripts — defaults to {memory_path}/sessions
+  sessions_dir: null
+
+  # Claude CLI binary — defaults to $(which claude)
+  claude_bin:   null
+
+  # Base project directory (parent of memory_path in some setups)
+  # If set, relative paths in file scores are resolved against this
+  base_path:    null
+
+
+# ── Models ────────────────────────────────────────────────────────────────────
+models:
+  # Primary model for main chat responses
+  primary:    "claude-sonnet-4-5"
+
+  # Fast/cheap model for routing, reconsolidation checks, deep-work specialist calls
+  haiku:      "claude-haiku-4-5"
+
+  # Model used by deep-work specialist advisors
+  deep_work:  "claude-haiku-4-5"
+
+  # Local model (Ollama, LM Studio, etc.) for offline synthesis
+  # Set to null to disable local model support
+  local:      null   # e.g. "ollama/llama3"
+
+
+# ── Memory system ─────────────────────────────────────────────────────────────
+memory:
+
+  # Four-tier decay rates (fraction of confidence lost per week).
+  # High-salience facts decay slower (modulated in salience.py).
+  tier_decay:
+    working:      0.40   # decays completely in ~48h
+    episodic:     0.035  # mid-range; most meeting notes
+    semantic:     0.006  # stable knowledge; slow drift
+    crystallised: 0.001  # permanent record; almost never decays
+
+  # Salience modifier weights (added to base 0.5 when flag is true).
+  # Total is clamped to [0.0, 1.0].
+  salience_modifiers:
+    is_decision:          0.30   # tied to a decision event
+    is_risk:              0.25   # risk node
+    source_is_user:       0.20   # user themselves stated this
+    active_deal:          0.15   # involves an active deal / contract
+    recent_upload:        0.10   # uploaded within the past 7 days
+    contradicts_existing: 0.20   # contradiction makes the fact salient
+
+  # Retrieval-Induced Strengthening (RIS)
+  ris:
+    retrieval_boost:          0.05   # confidence boost per retrieval
+    max_boost:                0.20   # cap on accumulated RIS boost
+    decay_inhibition_factor:  0.70   # high-salience → 70% slower decay
+
+  # Memory compression (forgetting)
+  compression:
+    min_confidence_to_keep:  0.25   # drop entities below this confidence
+    min_salience_to_keep:    0.15   # drop entities below this salience
+    max_working_age_hours:   48     # working-tier entities expire after N hours
+
+  # Nightly sleep / reconsolidation cycle
+  sleep_cycle:
+    enabled:  true
+    schedule: "02:00"   # local 24h time for launchd/cron trigger
+    phases:
+      - deduplication
+      - contradiction_resolution
+      - insight_surfacing
+      - tier_promotion
+      - compression
+
+
+# ── Retrieval pipeline ────────────────────────────────────────────────────────
+retrieval:
+
+  # ── Stage 1: Keyword scan ──────────────────────────────────────────────────
+  keyword:
+    # How many files to return from the keyword scan
+    max_files:        8
+
+    # How many characters of each file body to index (larger = slower but better recall)
+    body_read_chars:  8000
+
+    # Path-segment → score multiplier. First matching segment wins.
+    # Higher = more likely to be included. Tune these for your folder layout.
+    path_boosts:
+      "/accounts/":       2.5
+      "/decisions/":      1.8
+      "/weekly/":         1.6
+      "/context/":        1.4
+      "/saved/":          1.4
+      "/research/":       1.3
+      "/daily/emails/":   1.0
+      "/daily/":          0.9
+      "/episodic/":       1.1
+      "/archive/":        0.6
+
+    # Filename-match multipliers
+    filename_match:
+      stem_hit_multiplier: 3.0   # query token in filename stem → 3× boost
+      path_hit_multiplier: 1.5   # query token in path (not stem) → 1.5× boost
+
+    # Score formula weights
+    score_components:
+      overlap_log_factor:  1.0   # base overlap × log(1+overlap) contribution
+      proper_noun_factor:  3.0   # each proper-noun hit adds 3× to score
+      tf_log_factor:       0.4   # term-frequency (log-scaled) contribution
+
+    # Dynamic result caps based on query type
+    dynamic_caps:
+      proper_noun_query_cap: 12   # max files when query contains named entities
+      meeting_query_cap:     15   # max files for meeting/email prep queries
+
+    # Meeting-from-person boost: for "prep 1:1 with X" queries,
+    # boost emails that were sent BY person X (not just mention X).
+    meeting_from_person:
+      base_multiplier:              2.0
+      short_email_threshold_bytes:  1500
+      short_email_multiplier:       6.0
+      recent_days_strong:           7
+      recent_strong_multiplier:     4.0
+      recent_days_weak:             14
+      recent_weak_multiplier:       2.0
+
+    # Atomic claims signal (requires v5 facts module)
+    claims_signal:
+      max_claims_to_consider: 30
+      boost_per_claim:        0.6
+      salience_weight:        2.0
+      max_total_boost:        15.0
+
+    # Paths / file patterns to always skip during scan
+    scan_exclude:
+      - "/sessions/"
+      - "/_raw/"
+      - "/_pre_compression_backups/"
+      - "/proposals/"
+      - "/priming/"
+      - "/health/"
+
+  # ── Stage 2: Graph spreading activation ───────────────────────────────────
+  graph:
+    depth:                    2      # number of hops to spread activation
+    hop_decay:                0.6    # activation multiplied by this per hop
+    threshold:                0.12   # minimum activation to retain a node
+    max_graph_extra_files:    3      # max new files surfaced by graph spread
+    high_activation_threshold:    0.50   # shown as "High relevance" in context block
+    related_activation_threshold: 0.25   # shown as "Also related"
+
+  # ── Stage 3: Wiki scan ─────────────────────────────────────────────────────
+  wiki:
+    max_pages:          4      # max wiki pages to inject per query
+    proper_noun_boost:  3.0    # proper-noun token → 3× score multiplier
+    max_count_per_token: 5     # cap token occurrence count (avoids over-scoring)
+
+  # ── Context budget ─────────────────────────────────────────────────────────
+  context_budget:
+    max_total_chars:        80000   # total character budget across all loaded content
+    wiki_page_truncate_chars: 3500  # truncate individual wiki pages to this length
+    graph_block_max_high:     6     # max "High relevance" entities in graph block
+    graph_block_max_related:  4     # max "Also related" entities in graph block
+
+
+# ── Domain bundles ────────────────────────────────────────────────────────────
+# Force-load specific file path patterns when query matches trigger words.
+# Add/remove bundles freely — no code change needed.
+domain_bundles:
+  - name: org_team
+    description: "Org chart, headcount, people files"
+    triggers:
+      - org
+      - team
+      - people
+      - headcount
+      - fte
+      - hire
+      - hiring
+      - vp
+      - director
+      - manager
+    patterns:
+      - context/org_
+      - context/people
+      - context/responsibility_
+
+  - name: financials
+    description: "Revenue, budget, compensation"
+    triggers:
+      - budget
+      - revenue
+      - arr
+      - cost
+      - margin
+      - financial
+      - financials
+      - bonus
+      - compensation
+    patterns:
+      - context/financials
+
+  - name: accounts
+    description: "Customer accounts and deals"
+    triggers:
+      - account
+      - customer
+      - deal
+      - sourcing
+      - contract
+      - pipeline
+    patterns:
+      - accounts/
+
+
+# ── Wiki ingestion ────────────────────────────────────────────────────────────
+wiki:
+  # Topic directories to scan during retrieval
+  topics:
+    - competition
+    - concepts
+    - decisions
+    - people
+    - problems
+    - projects
+    - systems
+
+  # Ingestion pipeline settings (used by sync_and_ingest.sh)
+  ingest:
+    schedule_minutes:   10    # how often sync_and_ingest.sh runs (via launchd)
+    batch_size:         20    # max files per ingest batch
+    model:              "claude-sonnet-4-5"  # model used during wiki write
+
+
+# ── Deep Work team ────────────────────────────────────────────────────────────
+# Multi-agent advisory team for complex strategic questions.
+# Each specialist runs in parallel and produces a perspective.
+deep_work:
+  enabled:          true
+  specialist_model: "claude-haiku-4-5"    # model for each specialist
+  routing_model:    "claude-haiku-4-5"    # model for routing decision
+  synthesis_model:  "claude-sonnet-4-5"   # model for final synthesis
+
+  specialists:
+    contrarian:
+      enabled: true
+      label:   "Contrarian"
+      icon:    "😈"
+      color:   "#ef4444"
+
+    cfo:
+      enabled: true
+      label:   "CFO"
+      icon:    "💰"
+      color:   "#10b981"
+
+    commercial:
+      enabled: true
+      label:   "Commercial"
+      icon:    "🤝"
+      color:   "#3b82f6"
+
+    marketing:
+      enabled: true
+      label:   "Marketing"
+      icon:    "📣"
+      color:   "#a855f7"
+
+    hr:
+      enabled: true
+      label:   "People & Org"
+      icon:    "🧑‍🤝‍🧑"
+      color:   "#f59e0b"
+
+    strategy:
+      enabled: true
+      label:   "Strategy"
+      icon:    "🎯"
+      color:   "#8b5cf6"
+
+    engineering:
+      enabled: true
+      label:   "Engineering"
+      icon:    "⚙️"
+      color:   "#0891b2"
+
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+dashboard:
+  enabled:          true
+  refresh_seconds:  30
+  show_pillars:
+    compile:  true
+    dream:    true
+    retrieve: true
+
+
+# ── System prompt behaviour ───────────────────────────────────────────────────
+system_prompt:
+  # Human-readable description of the primary user (injected into system prompt)
+  user_description: "Jane Smith, CPO of Acme Corp"
+
+  # Tone instruction for drafted communications
+  user_tone: "Direct, no preamble, execution-focused."
+
+  # Memory files always loaded regardless of query (relative to memory_path)
+  always_load:
+    - preferences.md
+
+  # Instruction blocks to inject into the system prompt
+  # Set to null to use the default text, or override with your own
+  instructions:
+    context_loading:  null    # how to use loaded context files
+    writing_tone:     null    # how to match user tone
+    memory_update:    null    # when to propose memory updates
