@@ -11,9 +11,15 @@ build/
 venv/
 env/
 
-# Memory store data (not committed — configure via ENGRAM_MEMORY_PATH)
-memory-store/
-*.jsonl
+# Memory store — folder structure is tracked (.gitkeep); data files are not
+memory-store/**
+!memory-store/**/
+!memory-store/**/.gitkeep
+
+# Knowledge base — same rule
+knowledge-base/**
+!knowledge-base/**/
+!knowledge-base/**/.gitkeep
 
 # macOS
 .DS_Store
@@ -28,3 +34,6 @@ memory-store/
 
 # Logs
 *.log
+
+# Raw data files (only exist in user's local instance)
+*.jsonl
