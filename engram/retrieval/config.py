@@ -199,6 +199,10 @@ class RetrievalConfig:
     graph:          GraphConfig          = field(default_factory=GraphConfig)
     wiki:           WikiRetrievalConfig  = field(default_factory=WikiRetrievalConfig)
     context_budget: ContextBudgetConfig  = field(default_factory=ContextBudgetConfig)
+    # Synonym groups for query expansion (bidirectional).
+    # Any member of a group in the query pulls in all other members.
+    # Example:  {"automotive": ["car", "vehicle"], "vw": ["volkswagen", "cariad"]}
+    synonyms:       dict                 = field(default_factory=dict)
 
 
 @dataclass
@@ -445,6 +449,7 @@ def _build_config(raw: dict) -> EngramConfig:
             graph_block_max_high     = int(cb.get("graph_block_max_high", 6)),
             graph_block_max_related  = int(cb.get("graph_block_max_related", 4)),
         ),
+        synonyms = dict(ret_raw.get("synonyms", {})),
     )
 
     # ── domain bundles ──
