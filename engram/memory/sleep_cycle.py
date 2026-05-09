@@ -289,6 +289,135 @@ def phase5_contradiction_resolve(
     }
 
 
+# ─── Phase 6: CLAUDE.md regeneration ────────────────────────────────────────
+
+def phase6_core_synthesis(
+    memory_dir: Path,
+    *,
+    claude_complete: Optional[Callable] = None,
+    max_entities: int = 40,
+) -> dict:
+    """
+    Regenerate CLAUDE.md from the current graph state.
+
+    Synthesises:
+      • Top entities by salience/confidence (people, accounts, decisions, projects)
+      • Active open questions
+      • Recent decisions log
+      • Preserves the existing CLAUDE.md as a prior so stable facts aren't lost
+
+    Writes to {memory_dir}/CLAUDE.md. Falls back gracefully if no Claude runner
+    is available (leaves the existing file untouched).
+    """
+    t0 = time.time()
+    output_path = memory_dir / "CLAUDE.md"
+
+    if not claude_complete:
+        return {"phase": "core_synthesis", "skipped": True,
+                "reason": "no claude runner", "duration_s": 0}
+
+    # ── Gather inputs ──────────────────────────────────────────────────────
+    graph = _load_graph()
+    entities = graph.get("entities", {})
+
+    # Top entities sorted by salience × confidence
+    def _score(e: dict) -> float:
+        return float(e.get("salience", 0.5)) * float(e.get("confidence", 0.5))
+
+    top_entities = sorted(entities.values(), key=_score, reverse=True)[:max_entities]
+    entity_lines = []
+    for e in top_entities:
+        name  = e.get("name", "?")
+        etype = e.get("type", "entity")
+        desc  = (e.get("description") or "")[:120]
+        conf  = int(float(e.get("confidence", 0.5)) * 100)
+        entity_lines.append(f"- {name} ({etype}, {conf}% conf): {desc}")
+    entities_block = "\n".join(entity_lines) if entity_lines else "(none)"
+
+    # Open questions
+    oq_block = ""
+    try:
+        if V3_OPEN_QUESTIONS.exists():
+            qs = json.loads(V3_OPEN_QUESTIONS.read_text(errors="ignore"))
+            qs = qs if isinstance(qs, list) else qs.get("questions", [])
+            open_qs = [q for q in qs if q.get("status") not in ("resolved", "dismissed", "closed")]
+            open_qs.sort(key=lambda q: -float(q.get("salience", 0.5)))
+            oq_block = "\n".join(f"- {q.get('text', '')}" for q in open_qs[:12])
+    except Exception:
+        pass
+
+    # Recent decisions (last 20 from decisions folder)
+    decisions_block = ""
+    try:
+        dec_files = sorted((memory_dir / "decisions").glob("*.md"),
+                           key=lambda f: f.stat().st_mtime, reverse=True)[:3]
+        parts = []
+        for df in dec_files:
+            parts.append(df.read_text(errors="ignore")[:2000])
+        decisions_block = "\n\n---\n".join(parts)
+    except Exception:
+        pass
+
+    # Existing CLAUDE.md as prior
+    prior = ""
+    try:
+        if output_path.exists():
+            prior = output_path.read_text(errors="ignore")[:8000]
+    except Exception:
+        pass
+
+    # ── Build synthesis prompt ─────────────────────────────────────────────
+    prompt = f"""You are updating CLAUDE.md — the always-on core context file for an AI executive assistant.
+
+CLAUDE.md is loaded into EVERY conversation. It must be compact (<120 lines), factual, and structured.
+
+## Current graph — top entities by salience:
+{entities_block}
+
+## Open questions:
+{oq_block or "(none)"}
+
+## Recent decisions:
+{decisions_block or "(none)"}
+
+## Existing CLAUDE.md (your prior — keep stable facts, update what changed):
+{prior or "(no prior — write from scratch)"}
+
+---
+
+Rewrite CLAUDE.md. Structure:
+1. **Identity & Role** — who the user is, their mandate
+2. **Active Workstreams** — top 5-8 with status and owner
+3. **Key People** — key relationships, reporting lines
+4. **Open Decisions** — unresolved choices with deadlines
+5. **Risks & Open Questions** — top risks and unresolved questions
+
+Rules:
+- Under 120 lines
+- Be specific (names, numbers, dates)
+- Drop anything stale or low-salience
+- No preamble — start directly with `# CLAUDE.md – ...`
+- Use **bold** for names, statuses, deadlines
+- Do NOT fabricate facts not present in the inputs above"""
+
+    # ── Call Claude ────────────────────────────────────────────────────────
+    try:
+        result = claude_complete(prompt, max_tokens=2000)
+        if result and len(result.strip()) > 100:
+            output_path.write_text(result.strip(), encoding="utf-8")
+            return {
+                "phase":      "core_synthesis",
+                "duration_s": round(time.time() - t0, 1),
+                "chars":      len(result),
+                "path":       str(output_path),
+            }
+        return {"phase": "core_synthesis", "duration_s": round(time.time() - t0, 1),
+                "skipped": True, "reason": "empty response"}
+    except Exception as e:
+        return {"phase": "core_synthesis", "duration_s": round(time.time() - t0, 1),
+                "error": str(e)}
+
+
 # ─── Morning briefing ─────────────────────────────────────────────────────
 def build_morning_briefing(cycle_results: list, memory_dir: Path) -> dict:
     """Aggregate cycle results into the morning briefing payload."""
@@ -353,7 +482,7 @@ def run_sleep_cycle(
     skip_compression:     bool = True,
     skip_communities:     bool = False,
 ) -> dict:
-    """Run all 5 phases sequentially. Returns aggregated results."""
+    """Run all 6 phases sequentially. Returns aggregated results."""
     t0 = time.time()
     results = []
     append_audit(V3_AUDIT_LOG, {"event": "sleep_cycle_start"})
@@ -365,7 +494,7 @@ def run_sleep_cycle(
         "current_phase":     None,
         "phase_started_at":  None,
         "phases_completed":  [],
-        "total_phases":      5 if not skip_compression else 4,
+        "total_phases":      6 if not skip_compression else 5,
     })
 
     try:
@@ -440,6 +569,21 @@ def run_sleep_cycle(
             "duration_s":    r5.get("duration_s", 0),
         })
         append_audit(V3_AUDIT_LOG, {"event": "phase5_resolve_done", "duration_s": r5.get("duration_s")})
+
+        # Phase 6 — CLAUDE.md core synthesis
+        _start_phase("phase6_core_synthesis",
+                     "Regenerating CLAUDE.md from current graph state")
+        r6 = phase6_core_synthesis(
+            memory_dir,
+            claude_complete=claude_complete,
+        )
+        results.append(r6)
+        _end_phase("phase6_core_synthesis", {
+            "chars":      r6.get("chars", 0),
+            "skipped":    r6.get("skipped", False),
+            "duration_s": r6.get("duration_s", 0),
+        })
+        append_audit(V3_AUDIT_LOG, {"event": "phase6_core_synthesis_done", **r6})
 
         # Morning briefing
         _start_phase("briefing", "Building morning briefing payload")

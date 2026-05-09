@@ -258,7 +258,12 @@ class DashboardConfig:
 class SystemPromptConfig:
     user_description: str  = ""
     user_tone:        str  = "Direct, execution-focused."
-    always_load:      list = field(default_factory=lambda: ["preferences.md"])
+    # Files loaded into EVERY response regardless of query (relative to memory_path).
+    # CLAUDE.md is the canonical always-on context file, updated nightly by the sleep cycle.
+    always_load:      list = field(default_factory=lambda: ["CLAUDE.md", "preferences.md"])
+    # Glob patterns (relative to memory_path) for calendar/agenda files.
+    # The most-recently-modified match is auto-loaded every turn.
+    calendar_globs:   list = field(default_factory=lambda: ["calendar*.md", "**/calendar*.md"])
     instructions:     dict = field(default_factory=dict)
 
 
@@ -518,7 +523,8 @@ def _build_config(raw: dict) -> EngramConfig:
     cfg.system_prompt = SystemPromptConfig(
         user_description = str(sp.get("user_description", "")),
         user_tone        = str(sp.get("user_tone", "Direct, execution-focused.")),
-        always_load      = list(sp.get("always_load", ["preferences.md"])),
+        always_load      = list(sp.get("always_load", ["CLAUDE.md", "preferences.md"])),
+        calendar_globs   = list(sp.get("calendar_globs", ["calendar*.md", "**/calendar*.md"])),
         instructions     = dict(sp.get("instructions", {})),
     )
 
