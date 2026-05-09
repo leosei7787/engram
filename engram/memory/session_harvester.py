@@ -217,7 +217,77 @@ def extract_turn_signal(
     return out
 
 
-def _proposal_path_for(item: dict) -> str:
+# ─── Canonical name resolution ────────────────────────────────────────────────
+# Haiku may emit "Dave", "Dave Johnson", or even "dave" for the
+# same person. Resolve through the entity graph so all proposals about that
+# person land at the same `context/people/<slug>.md` path.
+
+_name_idx_cache: dict = {"mtime": 0.0, "idx": {}}
+
+
+def _build_name_index(memory_path: Path) -> dict[str, str]:
+    """Return {lowercase token → canonical name} for all `person` entities.
+
+    Cached against graph.json mtime so repeated calls in one harvest don't
+    reload the file.
+    """
+    gpath = memory_path / "graph.json"
+    if not gpath.exists():
+        return {}
+    try:
+        m = gpath.stat().st_mtime
+    except Exception:
+        m = 0.0
+    if _name_idx_cache["idx"] and _name_idx_cache["mtime"] == m:
+        return _name_idx_cache["idx"]
+    try:
+        graph = json.loads(gpath.read_text())
+    except Exception:
+        return {}
+    idx: dict[str, str] = {}
+    for ent_id, ent in (graph.get("entities") or {}).items():
+        if ent.get("type") != "person":
+            continue
+        name = (ent.get("name") or "").strip()
+        if not name:
+            continue
+        idx[name.lower()] = name
+        # Index first name + last name as fallbacks
+        parts = name.split()
+        if parts:
+            first = parts[0].lower()
+            if first and first not in idx:
+                idx[first] = name
+            if len(parts) > 1:
+                last = parts[-1].lower()
+                if last and last not in idx:
+                    idx[last] = name
+    _name_idx_cache["idx"] = idx
+    _name_idx_cache["mtime"] = m
+    return idx
+
+
+def _resolve_canonical_name(subject: str, name_idx: dict[str, str]) -> str:
+    """Return the canonical name for a subject string. Falls back to input."""
+    if not subject:
+        return subject
+    s = subject.strip()
+    sl = s.lower()
+    if sl in name_idx:
+        return name_idx[sl]
+    parts = sl.split()
+    if parts and parts[0] in name_idx:
+        return name_idx[parts[0]]
+    if len(parts) > 1 and parts[-1] in name_idx:
+        return name_idx[parts[-1]]
+    return s
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^\w\-]", "_", text.lower()).strip("_")[:60]
+
+
+def _proposal_path_for(item: dict, name_idx: dict[str, str] | None = None) -> str:
     """Map an extracted item to the canonical memory path it would update."""
     kind     = item["kind"]
     subjects = item.get("subjects") or []
@@ -226,10 +296,8 @@ def _proposal_path_for(item: dict) -> str:
     if kind == "decision":
         return "decisions/chat_harvest.md"
     if subjects:
-        # First subject becomes the canonical target. Crude — proposal review
-        # is where the user disambiguates anyway.
-        slug = re.sub(r"[^\w\-]", "_", subjects[0].lower())[:60]
-        return f"context/people/{slug}.md"
+        canonical = _resolve_canonical_name(subjects[0], name_idx or {})
+        return f"context/people/{_slug(canonical)}.md"
     return "daily/notes/chat_harvest.md"
 
 
@@ -377,6 +445,7 @@ def harvest_session(
 
     # Run extraction over each new turn. Could batch into one Haiku call but
     # keeping per-turn so each item's provenance is unambiguous.
+    name_idx = _build_name_index(memory_path)
     proposals: list[dict] = []
     for t in new_turns:
         items = extract_turn_signal(
@@ -387,7 +456,7 @@ def harvest_session(
         )
         for it in items:
             proposals.append({
-                "path":      _proposal_path_for(it),
+                "path":      _proposal_path_for(it, name_idx),
                 "operation": "update",
                 "reason":    f"[{it['kind']}] {it['text']}",
                 "salience":  max(0.3, min(1.0, it["salience"])),
