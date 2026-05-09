@@ -333,6 +333,9 @@ def chat():
         if rc_match and not getattr(generate, "_in_context_retry", False):
             focused_q = rc_match.group(1).strip()
             print(f"[chat] REQUEST_CONTEXT: {focused_q!r}", flush=True)
+            # Tell client to clear the RC text and show a search pill instead
+            yield f"data: {json.dumps({'clear_response': True})}\n\n"
+            yield f"data: {json.dumps({'request_context': {'query': focused_q[:120]}})}\n\n"
             try:
                 extra_scan = memory_scan(focused_q, cfg, max_files=8)
                 extra_cands = build_candidates(extra_scan, cfg, snippet_chars=200)
@@ -568,6 +571,36 @@ def stats():
     })
 
 
+@app.route("/api/file")
+def serve_file():
+    """Return raw text content of a memory or wiki file for preview."""
+    cfg  = get_cfg()
+    path = request.args.get("path", "").strip()
+    if not path or path.startswith("__raw__"):
+        return jsonify({"error": "no path"}), 400
+
+    p = Path(path) if Path(path).is_absolute() else cfg.memory_path / path
+    if not p.exists():
+        p2 = cfg.wiki_path / path
+        if p2.exists():
+            p = p2
+
+    if not p.exists() or not p.is_file():
+        return jsonify({"error": "not found"}), 404
+
+    # Safety: must be inside memory_path or wiki_path
+    try:
+        p.resolve().relative_to(cfg.memory_path.resolve())
+    except ValueError:
+        try:
+            p.resolve().relative_to(cfg.wiki_path.resolve())
+        except ValueError:
+            return jsonify({"error": "forbidden"}), 403
+
+    content = p.read_text(errors="ignore")[:24000]
+    return jsonify({"path": str(p), "name": p.name, "content": content})
+
+
 @app.route("/api/config")
 def config_info():
     cfg = get_cfg()
@@ -712,6 +745,40 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .ctx-item.ctx-removing {{ animation: ctx-remove .3s ease-in forwards; overflow: hidden; }}
 @keyframes ctx-add    {{ from {{ opacity:0; transform:translateX(-6px); }} to {{ opacity:1; transform:translateX(0); }} }}
 @keyframes ctx-remove {{ to   {{ opacity:0; max-height:0; padding-top:0; padding-bottom:0; }} }}
+
+/* Clickable ctx item body */
+.ctx-item-body {{ flex: 1; cursor: pointer; display: flex; align-items: flex-start;
+                   gap: 7px; min-width: 0; overflow: hidden; }}
+.ctx-item-body:hover .ctx-file {{ color: #D97757; }}
+
+/* Request-context pill (shown when model requests more context) */
+.rc-pill {{ display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px;
+             background: rgba(66,133,244,.08); border: 1px solid rgba(66,133,244,.18);
+             border-radius: 20px; font-size: 11px; color: #4285F4;
+             margin-bottom: 6px; max-width: 100%; overflow: hidden;
+             text-overflow: ellipsis; white-space: nowrap; }}
+
+/* File preview modal */
+.fp-overlay {{ position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 200;
+               display: none; align-items: center; justify-content: center; }}
+.fp-overlay.open {{ display: flex; }}
+.fp-modal {{ background: #fff; border-radius: 12px; width: 700px; max-width: 92vw;
+              max-height: 82vh; display: flex; flex-direction: column;
+              box-shadow: 0 12px 48px rgba(0,0,0,.22); overflow: hidden; }}
+.fp-head {{ padding: 14px 18px; border-bottom: 1px solid #efefef;
+             display: flex; align-items: center; gap: 10px; flex-shrink: 0; }}
+.fp-name {{ font-size: 13px; font-weight: 700; color: #1a1a1a; flex: 1;
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.fp-path {{ font-size: 10px; color: #bbb; margin-top: 2px; overflow: hidden;
+             text-overflow: ellipsis; white-space: nowrap; }}
+.fp-close {{ background: none; border: none; cursor: pointer; font-size: 20px;
+              color: #aaa; padding: 2px 6px; border-radius: 4px; line-height: 1;
+              flex-shrink: 0; }}
+.fp-close:hover {{ color: #333; background: #f0f0f0; }}
+.fp-body {{ flex: 1; overflow-y: auto; padding: 20px 22px; }}
+.fp-body pre {{ font-size: 12px; font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace;
+                white-space: pre-wrap; word-break: break-word; color: #333; line-height: 1.65; }}
+.fp-loading {{ color: #ccc; font-size: 12px; font-style: italic; }}
 
 /* Chat main */
 .chat-main {{ flex: 1; display: flex; flex-direction: column; overflow: hidden; }}
@@ -931,6 +998,20 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 
 </div><!-- .shell -->
 
+<!-- ── File preview modal ─────────────────────────────────────────────── -->
+<div class="fp-overlay" id="fp-overlay" onclick="closeFilePreview(event)">
+  <div class="fp-modal" onclick="event.stopPropagation()">
+    <div class="fp-head">
+      <div style="flex:1;min-width:0">
+        <div class="fp-name" id="fp-name"></div>
+        <div class="fp-path" id="fp-path"></div>
+      </div>
+      <button class="fp-close" onclick="closeFilePreview()">×</button>
+    </div>
+    <div class="fp-body"><pre id="fp-content" class="fp-loading">Loading…</pre></div>
+  </div>
+</div>
+
 <!-- ── Raw doc modal ─────────────────────────────────────────────────────── -->
 <div class="ctx-modal-overlay" id="raw-doc-modal" style="display:none" onclick="closeRawDocModal(event)">
   <div class="ctx-modal" onclick="event.stopPropagation()">
@@ -1027,15 +1108,32 @@ function sendMessage() {{
             const j = JSON.parse(raw);
             if (j.context)        renderContext(j.context);
             if (j.context_update) applyContextUpdate(j.context_update);
+            if (j.clear_response) {{
+              // Model is about to retry with more context — clear the bubble
+              assistantText = '';
+              const bubble = assistantEl.querySelector('.bubble');
+              bubble.textContent = '';
+              bubble.classList.add('typing');
+            }}
+            if (j.request_context) {{
+              // Show a small search pill above the bubble
+              const pill = document.createElement('div');
+              pill.className   = 'rc-pill';
+              pill.textContent = '🔍 Fetching: ' + j.request_context.query;
+              const bubble = assistantEl.querySelector('.bubble');
+              assistantEl.insertBefore(pill, bubble);
+            }}
             if (j.token) {{
               assistantText += j.token;
-              assistantEl.querySelector('.bubble').textContent = assistantText;
-              assistantEl.querySelector('.bubble').classList.remove('typing');
-              assistantEl.querySelector('.bubble').classList.add('typing'); // re-add for cursor
+              const bubble = assistantEl.querySelector('.bubble');
+              bubble.textContent = assistantText;
+              // Keep typing cursor without resetting animation
+              if (!bubble.classList.contains('typing')) bubble.classList.add('typing');
             }}
             if (j.error) {{
-              assistantEl.querySelector('.bubble').textContent = '⚠ ' + j.error;
-              assistantEl.querySelector('.bubble').classList.remove('typing');
+              const bubble = assistantEl.querySelector('.bubble');
+              bubble.textContent = '⚠ ' + j.error;
+              bubble.classList.remove('typing');
             }}
           }} catch(e) {{}}
         }}
@@ -1068,20 +1166,52 @@ function scrollToBottom() {{
 }}
 
 function makeCtxItem(path, type) {{
-  const name    = path.split('/').pop().replace(/\\.md$/, '');
+  const label    = path.split('/').pop().replace(/\\.md$/, '');
   const isPinned = pinnedPaths.has(path);
-  const el      = document.createElement('div');
+  const isRaw    = path.startsWith('__raw__/');
+
+  const el = document.createElement('div');
   el.className    = 'ctx-item';
   el.dataset.path = path;
-  el.innerHTML = `
-    <div class="ctx-dot ${{type}}" style="margin-top:6px"></div>
-    <div class="ctx-file" style="flex:1">${{name}}</div>
-    <div class="ctx-actions">
-      <button class="ctx-btn${{isPinned ? ' pinned' : ''}}" title="${{isPinned ? 'Unpin' : 'Pin (keep in context)'}}"
-        onclick="togglePin('${{path}}', this)">📌</button>
-      <button class="ctx-btn" title="Remove from context"
-        onclick="removeFile('${{path}}')">✕</button>
-    </div>`;
+
+  // Clickable body (dot + name) — opens file preview
+  const body = document.createElement('div');
+  body.className = 'ctx-item-body';
+
+  const dot = document.createElement('div');
+  dot.className = 'ctx-dot ' + type;
+  dot.style.marginTop = '5px';
+  dot.style.flexShrink = '0';
+
+  const nameEl = document.createElement('div');
+  nameEl.className   = 'ctx-file';
+  nameEl.textContent = label;
+
+  body.appendChild(dot);
+  body.appendChild(nameEl);
+  if (!isRaw) body.addEventListener('click', () => openFilePreview(path));
+
+  // Pin / remove actions (revealed on hover)
+  const actions = document.createElement('div');
+  actions.className = 'ctx-actions';
+
+  const pinBtn = document.createElement('button');
+  pinBtn.className   = 'ctx-btn' + (isPinned ? ' pinned' : '');
+  pinBtn.title       = isPinned ? 'Unpin' : 'Pin (keep in context)';
+  pinBtn.textContent = '📌';
+  pinBtn.addEventListener('click', (e) => {{ e.stopPropagation(); togglePin(path, pinBtn); }});
+
+  const removeBtn = document.createElement('button');
+  removeBtn.className   = 'ctx-btn';
+  removeBtn.title       = 'Remove from context';
+  removeBtn.textContent = '✕';
+  removeBtn.addEventListener('click', (e) => {{ e.stopPropagation(); removeFile(path); }});
+
+  actions.appendChild(pinBtn);
+  actions.appendChild(removeBtn);
+
+  el.appendChild(body);
+  el.appendChild(actions);
   return el;
 }}
 
@@ -1112,6 +1242,36 @@ function removeFile(path) {{
   const m = countEl.textContent.match(/of (\\d+)/);
   const total = m ? m[1] : '?';
   countEl.textContent = activeContext.length + ' of ' + total + ' candidate' + (total > 1 ? 's' : '');
+}}
+
+// ── File preview ───────────────────────────────────────────────────────────
+async function openFilePreview(path) {{
+  const overlay   = document.getElementById('fp-overlay');
+  const nameEl    = document.getElementById('fp-name');
+  const pathEl    = document.getElementById('fp-path');
+  const contentEl = document.getElementById('fp-content');
+
+  nameEl.textContent    = path.split('/').pop();
+  pathEl.textContent    = path;
+  contentEl.textContent = 'Loading…';
+  contentEl.className   = 'fp-loading';
+  overlay.classList.add('open');
+
+  try {{
+    const res  = await fetch('/api/file?path=' + encodeURIComponent(path));
+    const data = await res.json();
+    contentEl.className = '';
+    contentEl.textContent = data.error ? ('⚠ ' + data.error) : data.content;
+  }} catch (err) {{
+    contentEl.className   = '';
+    contentEl.textContent = '⚠ Failed to load: ' + err.message;
+  }}
+}}
+
+function closeFilePreview(e) {{
+  if (!e || e.target === document.getElementById('fp-overlay')) {{
+    document.getElementById('fp-overlay').classList.remove('open');
+  }}
 }}
 
 // ── Raw doc modal ──────────────────────────────────────────────────────────
