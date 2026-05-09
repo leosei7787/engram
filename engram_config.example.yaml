@@ -418,9 +418,20 @@ system_prompt:
   # Tone instruction for drafted communications
   user_tone: "Direct, no preamble, execution-focused."
 
-  # Memory files always loaded regardless of query (relative to memory_path)
+  # Files always loaded into EVERY conversation, regardless of query.
+  # Paths are relative to memory_path. CLAUDE.md is the canonical always-on
+  # context file — it is regenerated nightly by the sleep cycle (Phase 6).
   always_load:
-    - preferences.md
+    - CLAUDE.md          # core identity, workstreams, priorities — updated nightly
+    - preferences.md     # personal preferences, tone overrides
+
+  # Glob patterns for calendar/agenda files (relative to memory_path).
+  # The most-recently-modified matching file is auto-loaded every turn so
+  # the assistant is always aware of upcoming meetings and deadlines.
+  calendar_globs:
+    - "calendar*.md"
+    - "**/calendar*.md"
+    - "**/agenda*.md"
 
   # Instruction blocks to inject into the system prompt
   # Set to null to use the default text, or override with your own
