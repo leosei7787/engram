@@ -607,7 +607,7 @@ def stats():
         if ct_f.exists():
             ctd  = json.loads(ct_f.read_text())
             cs   = ctd if isinstance(ctd, list) else ctd.get("contradictions", [])
-            contradictions_pending = len([c for c in cs if c.get("status") not in ("resolved_A", "resolved_B", "dismissed")])
+            contradictions_pending = len([c for c in cs if c.get("status") not in ("resolved_A", "resolved_B", "dismissed", "superseded")])
     except Exception as e:
         print(f"[stats] health: {e}", flush=True)
 
@@ -840,7 +840,7 @@ def health_detail():
         try:
             data  = json.loads(p.read_text(errors="ignore"))
             items = data if isinstance(data, list) else data.get("contradictions", [])
-            active = [it for it in items if it.get("status") not in ("resolved_A", "resolved_B", "dismissed")]
+            active = [it for it in items if it.get("status") not in ("resolved_A", "resolved_B", "dismissed", "superseded")]
             out   = []
             for it in active[:50]:
                 ca = it.get("claim_A") or {}
