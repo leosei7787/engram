@@ -79,6 +79,18 @@ def infer_entity_salience(entity: dict, graph: dict) -> Salience:
     )
 
 
-def effective_decay_rate(base_decay_rate: float, salience_computed: float) -> float:
-    """High-salience facts decay 70% slower than low-salience."""
+def effective_decay_rate(
+    base_decay_rate: float,
+    salience_computed: float,
+    *,
+    priority_floor: bool = False,
+) -> float:
+    """
+    Compute the effective decay rate.
+
+    priority_floor=True: item tagged high-priority → 10× slower decay.
+    Otherwise: high-salience items decay up to 70% slower than low-salience.
+    """
+    if priority_floor:
+        return base_decay_rate * 0.10   # 10× slower — V2 salience floor
     return base_decay_rate * (1.0 - salience_computed * 0.7)

@@ -36,7 +36,8 @@ def compute_edge_weight(edge: dict, *, max_activations_in_graph: int = 100,
     tier = edge.get("tier", "semantic")
     base_decay = float(edge.get("decay_rate") or TIER_DECAY_BASE.get(tier, 0.02))
     salience_computed = float((edge.get("salience") or {}).get("computed", 0.5))
-    decay = effective_decay_rate(base_decay, salience_computed)
+    priority_floor    = bool(edge.get("priority_floor", False))
+    decay = effective_decay_rate(base_decay, salience_computed, priority_floor=priority_floor)
 
     recency_factor = math.exp(-decay * weeks_since)
 
@@ -66,7 +67,8 @@ def compute_entity_weight(entity: dict, now_ts: float = None) -> float:
     tier = entity.get("tier", "semantic")
     base_decay = TIER_DECAY_BASE.get(tier, 0.02)
     salience_computed = float((entity.get("salience") or {}).get("computed", 0.5))
-    decay = effective_decay_rate(base_decay, salience_computed)
+    priority_floor    = bool(entity.get("priority_floor", False))
+    decay = effective_decay_rate(base_decay, salience_computed, priority_floor=priority_floor)
     recency_factor = math.exp(-decay * weeks_since)
 
     activation_count = max(1, int(entity.get("activation_count", 1)))
