@@ -10,6 +10,9 @@ API:
   POST /api/chat          → SSE: memory scan + Claude streaming response
   GET  /api/stats         → live three-pillar stats JSON
   GET  /api/config        → public config info
+  GET  /api/file          → raw file content for preview
+  POST /api/export        → generate DOCX / PPTX / MD / PDF and download
+  GET  /api/outputs       → list recent files in the outputs folder
 
 Usage:
     python3 engram/dashboard/server.py
@@ -612,6 +615,73 @@ def config_info():
     })
 
 
+@app.route("/api/export", methods=["POST"])
+def export_file():
+    """Generate DOCX / PPTX / MD / PDF from chat content and return as download."""
+    from flask import send_file as flask_send_file
+    from engram.export.converters import export as do_export
+
+    data     = request.get_json(force=True) or {}
+    text     = data.get("content", "").strip()
+    fmt      = data.get("format", "md").lower()
+    filename = data.get("filename", "engram_export").strip() or "engram_export"
+
+    if not text:
+        return jsonify({"error": "no content"}), 400
+
+    cfg      = get_cfg()
+    out_dir  = Path(cfg.paths.outputs_path) if getattr(cfg.paths, "outputs_path", None) else \
+               Path(cfg.memory_path).parent / "outputs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    result = do_export(text, fmt, filename, out_dir)
+    if "error" in result:
+        return jsonify(result), 500
+
+    path = Path(result["path"])
+    mime_map = {
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "pdf":  "application/pdf",
+        "md":   "text/markdown; charset=utf-8",
+        "html": "text/html; charset=utf-8",
+    }
+    mime = mime_map.get(result["format"], "application/octet-stream")
+
+    note = result.get("note", "")
+    resp = flask_send_file(str(path), mimetype=mime,
+                           as_attachment=True, download_name=path.name)
+    if note:
+        resp.headers["X-Export-Note"] = note
+    return resp
+
+
+@app.route("/api/outputs")
+def list_outputs():
+    """Return the 20 most-recently modified files in the outputs folder."""
+    cfg     = get_cfg()
+    out_dir = Path(cfg.paths.outputs_path) if getattr(cfg.paths, "outputs_path", None) else \
+              Path(cfg.memory_path).parent / "outputs"
+
+    if not out_dir.exists():
+        return jsonify({"files": [], "dir": str(out_dir)})
+
+    files = sorted(
+        [f for f in out_dir.iterdir() if f.is_file() and not f.name.startswith(".")],
+        key=lambda f: f.stat().st_mtime, reverse=True
+    )[:20]
+
+    return jsonify({
+        "dir": str(out_dir),
+        "files": [
+            {"name": f.name, "size": f.stat().st_size,
+             "modified": f.stat().st_mtime,
+             "ext": f.suffix.lstrip(".")}
+            for f in files
+        ],
+    })
+
+
 # ─── Main page ────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -757,6 +827,37 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
              border-radius: 20px; font-size: 11px; color: #4285F4;
              margin-bottom: 6px; max-width: 100%; overflow: hidden;
              text-overflow: ellipsis; white-space: nowrap; }}
+
+/* Export bar */
+.export-bar {{ display: flex; align-items: center; gap: 6px; margin-top: 8px;
+               padding: 0 2px; opacity: 0; transition: opacity .2s;
+               flex-wrap: wrap; }}
+.message.assistant:hover .export-bar,
+.export-bar.visible {{ opacity: 1; }}
+.export-label {{ font-size: 10px; color: #bbb; text-transform: uppercase;
+                  letter-spacing: 1px; margin-right: 2px; white-space: nowrap; }}
+.export-btn {{ display: inline-flex; align-items: center; gap: 4px;
+               padding: 3px 9px; border-radius: 5px; border: 1px solid #ddd;
+               background: #fff; font-size: 11px; color: #555; cursor: pointer;
+               transition: all .15s; white-space: nowrap; }}
+.export-btn:hover {{ border-color: #D97757; color: #D97757; background: #fff8f5; }}
+.export-btn.loading {{ opacity: .5; pointer-events: none; }}
+.export-btn.done {{ border-color: #34A853; color: #34A853; }}
+
+/* Outputs panel in sidebar */
+.outputs-section {{ border-top: 1px solid #efefef; padding: 8px 0; }}
+.outputs-title {{ font-size: 10px; font-weight: 700; text-transform: uppercase;
+                   letter-spacing: 1.5px; color: #bbb; padding: 4px 16px 6px; }}
+.output-item {{ display: flex; align-items: center; gap: 7px; padding: 3px 16px;
+                font-size: 11px; color: #666; cursor: default; }}
+.output-ext {{ font-size: 9px; font-weight: 700; text-transform: uppercase;
+               padding: 1px 5px; border-radius: 3px; background: #f0f0f0;
+               color: #888; flex-shrink: 0; }}
+.output-ext.docx {{ background: #dbeafe; color: #2563eb; }}
+.output-ext.pptx {{ background: #fce7f3; color: #be185d; }}
+.output-ext.pdf  {{ background: #fee2e2; color: #dc2626; }}
+.output-ext.md   {{ background: #f3f4f6; color: #6b7280; }}
+.output-name {{ flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
 
 /* File preview modal */
 .fp-overlay {{ position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 200;
@@ -965,6 +1066,12 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
         <div class="ctx-legend-item"><div class="ctx-dot wiki"></div>wiki</div>
         <div class="ctx-legend-item"><div class="ctx-dot" style="background:#a855f7"></div>raw</div>
       </div>
+
+      <!-- Outputs panel -->
+      <div class="outputs-section" id="outputs-section" style="display:none">
+        <div class="outputs-title">Recent outputs</div>
+        <div id="outputs-list"></div>
+      </div>
     </div>
 
     <!-- Chat main -->
@@ -1095,6 +1202,7 @@ function sendMessage() {{
         if (done) {{
           assistantEl.querySelector('.bubble').classList.remove('typing');
           messages.push({{role:'assistant', content: assistantText}});
+          if (assistantText.trim()) addExportBar(assistantEl, assistantText);
           document.getElementById('send-btn').disabled = false;
           streaming = false;
           return;
@@ -1275,6 +1383,100 @@ function closeFilePreview(e) {{
     document.getElementById('fp-overlay').classList.remove('open');
   }}
 }}
+
+// ── Export ─────────────────────────────────────────────────────────────────
+const EXPORT_FMTS = [
+  {{ fmt: 'md',   icon: '📋', label: 'MD'   }},
+  {{ fmt: 'docx', icon: '📝', label: 'DOCX' }},
+  {{ fmt: 'pptx', icon: '📊', label: 'PPTX' }},
+  {{ fmt: 'pdf',  icon: '📄', label: 'PDF'  }},
+];
+
+function addExportBar(msgEl, content) {{
+  const bar = document.createElement('div');
+  bar.className = 'export-bar';
+
+  const label = document.createElement('span');
+  label.className   = 'export-label';
+  label.textContent = 'Export as';
+  bar.appendChild(label);
+
+  // Derive a filename from the first non-empty line of the response
+  const firstLine = content.split('\\n').find(l => l.trim()) || 'engram_export';
+  const filename  = firstLine.replace(/^#+\\s*/, '').replace(/\\*\\*/g, '')
+                             .replace(/[^a-zA-Z0-9_\\- ]/g, '').trim()
+                             .replace(/\\s+/g, '_').slice(0, 48) || 'engram_export';
+
+  EXPORT_FMTS.forEach(({{fmt, icon, label: lbl}}) => {{
+    const btn = document.createElement('button');
+    btn.className   = 'export-btn';
+    btn.textContent = icon + ' ' + lbl;
+    btn.title       = 'Export as ' + lbl;
+    btn.addEventListener('click', () => exportAs(fmt, content, filename, btn));
+    bar.appendChild(btn);
+  }});
+
+  msgEl.appendChild(bar);
+}}
+
+async function exportAs(fmt, content, filename, btn) {{
+  if (btn) {{ btn.classList.add('loading'); btn.textContent = '⏳ ' + btn.textContent.slice(2); }}
+  try {{
+    const res = await fetch('/api/export', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{format: fmt, content, filename}}),
+    }});
+    if (!res.ok) {{ throw new Error('Export failed (' + res.status + ')'); }}
+
+    const note = res.headers.get('X-Export-Note');
+    const blob = await res.blob();
+    const cd   = res.headers.get('Content-Disposition') || '';
+    const name = cd.match(/filename="([^"]+)"/)?.[1] || filename + '.' + fmt;
+
+    // Trigger browser download
+    const url = URL.createObjectURL(blob);
+    const a   = document.createElement('a');
+    a.href = url; a.download = name; a.click();
+    URL.revokeObjectURL(url);
+
+    if (btn) {{ btn.classList.remove('loading'); btn.classList.add('done'); }}
+    if (note) {{ alert(note); }}
+
+    // Refresh outputs list in sidebar
+    refreshOutputs();
+  }} catch (err) {{
+    if (btn) {{ btn.classList.remove('loading'); }}
+    alert('Export error: ' + err.message);
+  }}
+}}
+
+async function refreshOutputs() {{
+  try {{
+    const res  = await fetch('/api/outputs');
+    const data = await res.json();
+    const list = document.getElementById('outputs-list');
+    const sec  = document.getElementById('outputs-section');
+
+    if (!data.files || !data.files.length) {{
+      sec.style.display = 'none';
+      return;
+    }}
+    sec.style.display = 'block';
+    list.innerHTML = '';
+    data.files.slice(0, 8).forEach(f => {{
+      const item = document.createElement('div');
+      item.className = 'output-item';
+      item.title     = f.name;
+      item.innerHTML = `<span class="output-ext ${{f.ext}}">${{f.ext}}</span>
+                        <span class="output-name">${{f.name.replace(/_\\d{{8}}_\\d{{6}}(\\.[^.]+)$/, '$1')}}</span>`;
+      list.appendChild(item);
+    }});
+  }} catch (e) {{}}
+}}
+
+// Load outputs on page start
+refreshOutputs();
 
 // ── Raw doc modal ──────────────────────────────────────────────────────────
 function openRawDocModal() {{

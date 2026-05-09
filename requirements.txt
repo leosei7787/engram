@@ -8,3 +8,9 @@ networkx>=3.0
 python-louvain>=0.16
 flask>=3.0
 watchdog>=4.0          # folder watching (engram/ingest/watcher.py)
+
+# Export skills (DOCX / PPTX / PDF generation)
+python-docx>=1.1       # Word documents  (engram/export/converters.py)
+python-pptx>=0.6.21    # PowerPoint      (engram/export/converters.py)
+# weasyprint>=60       # optional: PDF via HTML (pip install weasyprint)
+#                        if not installed, PDF exports fall back to styled HTML
