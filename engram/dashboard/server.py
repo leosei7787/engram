@@ -953,14 +953,131 @@ def health_detail():
     return jsonify({"error": "unknown"}), 400
 
 
+# ── Statement parsing for cascade resolution ──────────────────────────────────
+# Statements are of the form: "<Subject> <relation> <Object>"
+# e.g. "Karl Brown reports_to Bob Smith" → (Karl Brown, reports_to, Bob Smith)
+#
+# Single-valued relations: a subject can have AT MOST ONE object for these.
+# Once we know the truth, all conflicting claims for the same (subject, relation)
+# can be auto-resolved or dismissed.
+SINGLE_VALUED_RELATIONS = {
+    "reports_to", "reports to",
+    "ceo_of", "cfo_of", "cpo_of", "cto_of",
+    "located_in", "born_in", "headquartered_in",
+    "spouse_of", "married_to",
+    "owned_by", "parent_company",
+    "founded_by",
+    "has_role", "current_role",
+    "ceo", "cfo", "cpo", "cto",
+}
+
+# Multi-valued relations (don't dismiss non-matches, only positive-match).
+# Anything not in SINGLE_VALUED_RELATIONS is treated as multi-valued.
+KNOWN_RELATIONS = SINGLE_VALUED_RELATIONS | {
+    "manages", "leads", "owns", "works_with", "collaborates_with",
+    "knows", "advises", "mentors", "reports_from", "has_member",
+    "is_a", "part_of", "related_to", "linked_to",
+}
+
+
+def _parse_statement(stmt: str) -> tuple[str, str, str] | None:
+    """
+    Parse "<Subject> <relation> <Object>" into (subject, relation, object).
+    Tries known relation tokens in order of length (longest first).
+    Returns None if no relation matches.
+    """
+    if not stmt:
+        return None
+    s = stmt.strip()
+    # Try longest relations first to avoid partial matches
+    for rel in sorted(KNOWN_RELATIONS, key=len, reverse=True):
+        for token in (f" {rel} ", f" {rel.replace('_', ' ')} "):
+            idx = s.lower().find(token.lower())
+            if idx > 0:
+                subject = s[:idx].strip()
+                obj     = s[idx + len(token):].strip()
+                return (subject, rel.replace(" ", "_"), obj)
+    return None
+
+
+def _norm(s: str) -> str:
+    """Normalize a name for fuzzy comparison: lowercase, collapse whitespace, strip punctuation."""
+    if not s:
+        return ""
+    return re.sub(r"[\s\-_.,]+", " ", s.lower()).strip()
+
+
+def _cascade_resolve(items: list, source_item: dict, resolution: str) -> int:
+    """
+    Auto-resolve other contradictions about the same (subject, relation)
+    based on the resolved one.
+    Returns count of cascaded resolutions.
+    """
+    if resolution not in ("resolved_A", "resolved_B"):
+        return 0  # only positive resolutions cascade
+
+    winner_stmt = (source_item.get("claim_A" if resolution == "resolved_A" else "claim_B") or {}).get("statement", "")
+    parsed = _parse_statement(winner_stmt)
+    if not parsed:
+        return 0
+    w_subj, w_rel, w_obj = parsed
+    w_subj_n, w_obj_n = _norm(w_subj), _norm(w_obj)
+    is_single_valued = w_rel in SINGLE_VALUED_RELATIONS
+
+    cascaded = 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for it in items:
+        if it.get("id") == source_item.get("id"):
+            continue
+        if it.get("status") not in (None, "", "unresolved", "resolved_neither"):
+            continue
+
+        a_stmt = (it.get("claim_A") or {}).get("statement", "")
+        b_stmt = (it.get("claim_B") or {}).get("statement", "")
+        a_parsed = _parse_statement(a_stmt)
+        b_parsed = _parse_statement(b_stmt)
+
+        # Both claims must reference the same subject + relation as the winner
+        if not (a_parsed and b_parsed):
+            continue
+        if a_parsed[1] != w_rel or b_parsed[1] != w_rel:
+            continue
+        if _norm(a_parsed[0]) != w_subj_n or _norm(b_parsed[0]) != w_subj_n:
+            continue
+
+        a_match = _norm(a_parsed[2]) == w_obj_n
+        b_match = _norm(b_parsed[2]) == w_obj_n
+
+        new_status = None
+        if a_match and not b_match:
+            new_status = "resolved_A"
+        elif b_match and not a_match:
+            new_status = "resolved_B"
+        elif not a_match and not b_match and is_single_valued:
+            # Single-valued relation: if neither claim matches the established truth,
+            # both are wrong → dismiss.
+            new_status = "dismissed"
+        # If both match (rare) or relation is multi-valued with no match: skip.
+
+        if new_status:
+            it["status"]       = new_status
+            it["resolved_by"]  = f"cascade_from_{source_item.get('id')}"
+            it["resolved_at"]  = now_iso
+            cascaded += 1
+
+    return cascaded
+
+
 @app.route("/api/resolve-contradiction", methods=["POST"])
 def resolve_contradiction():
-    cfg = get_cfg()
+    cfg  = get_cfg()
     body = request.get_json(force=True, silent=True) or {}
     item_id    = body.get("id", "")
-    resolution = body.get("resolution", "dismissed")  # resolved_A | resolved_B | dismissed
+    resolution = body.get("resolution", "dismissed")
+    # Accepted: resolved_A | resolved_B | both_true | both_false | dismissed
 
-    if resolution not in ("resolved_A", "resolved_B", "dismissed"):
+    if resolution not in ("resolved_A", "resolved_B", "both_true", "both_false", "dismissed"):
         return jsonify({"error": "invalid resolution"}), 400
 
     p = cfg.memory_path / "contradictions.json"
@@ -969,22 +1086,29 @@ def resolve_contradiction():
     try:
         data  = json.loads(p.read_text(errors="ignore"))
         items = data if isinstance(data, list) else data.get("contradictions", [])
-        found = False
-        for it in items:
-            if it.get("id") == item_id:
-                it["status"]      = resolution
-                it["resolved_by"] = "user"
-                it["resolved_at"] = datetime.now(timezone.utc).isoformat()
-                found = True
-                break
-        if not found:
+        target = next((it for it in items if it.get("id") == item_id), None)
+        if not target:
             return jsonify({"error": "not found"}), 404
+
+        target["status"]      = resolution
+        target["resolved_by"] = "user"
+        target["resolved_at"] = datetime.now(timezone.utc).isoformat()
+
+        # Cascade resolution to related contradictions (only for resolved_A/B)
+        cascaded = _cascade_resolve(items, target, resolution)
+
         if isinstance(data, list):
             p.write_text(json.dumps(data, indent=2, ensure_ascii=False))
         else:
             data["contradictions"] = items
             p.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-        return jsonify({"ok": True, "id": item_id, "resolution": resolution})
+
+        return jsonify({
+            "ok":         True,
+            "id":         item_id,
+            "resolution": resolution,
+            "cascaded":   cascaded,
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1315,10 +1439,19 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
             padding: 5px 12px; cursor: pointer; transition: opacity .15s; }}
 .hd-btn:hover {{ opacity: .8; }}
 .hd-btn:disabled {{ opacity: .45; cursor: default; }}
-.hd-btn-a       {{ background: #ebf5ff; color: #1d4ed8; }}
-.hd-btn-b       {{ background: #fef3c7; color: #92400e; }}
-.hd-btn-resolve {{ background: #dcfce7; color: #15803d; }}
-.hd-btn-dismiss {{ background: #f3f4f6; color: #6b7280; }}
+.hd-btn-a          {{ background: #ebf5ff; color: #1d4ed8; }}
+.hd-btn-b          {{ background: #fef3c7; color: #92400e; }}
+.hd-btn-both-true  {{ background: #dcfce7; color: #15803d; }}
+.hd-btn-both-false {{ background: #fee2e2; color: #b91c1c; }}
+.hd-btn-resolve    {{ background: #dcfce7; color: #15803d; }}
+.hd-btn-dismiss    {{ background: #f3f4f6; color: #6b7280; }}
+
+/* Cascade toast */
+.hd-toast {{ position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+              background: #1a1a1a; color: #fff; padding: 10px 18px; border-radius: 8px;
+              font-size: 12px; font-weight: 500; box-shadow: 0 6px 20px rgba(0,0,0,.25);
+              z-index: 300; opacity: 0; transition: opacity .25s; pointer-events: none; }}
+.hd-toast.show {{ opacity: 1; }}
 
 /* Chat main */
 .chat-main {{ flex: 1; display: flex; flex-direction: column; overflow: hidden; }}
@@ -2375,7 +2508,9 @@ async function _renderHealthDetail(what, bodyEl) {{
           <div class="hd-actions">
             <button class="hd-btn hd-btn-a" onclick="resolveItem('contradictions','${{it.id}}','resolved_A',this)">✓ A is correct</button>
             <button class="hd-btn hd-btn-b" onclick="resolveItem('contradictions','${{it.id}}','resolved_B',this)">✓ B is correct</button>
-            <button class="hd-btn hd-btn-dismiss" onclick="resolveItem('contradictions','${{it.id}}','dismissed',this)">✕ Dismiss</button>
+            <button class="hd-btn hd-btn-both-true" onclick="resolveItem('contradictions','${{it.id}}','both_true',this)" title="Both claims are valid (e.g. dual reporting, historical change)">✓✓ Both true</button>
+            <button class="hd-btn hd-btn-both-false" onclick="resolveItem('contradictions','${{it.id}}','both_false',this)" title="Neither claim is correct (the truth is something else)">✕✕ Both false</button>
+            <button class="hd-btn hd-btn-dismiss" onclick="resolveItem('contradictions','${{it.id}}','dismissed',this)">— Dismiss</button>
           </div>
         </div>`;
       }}).join('');
@@ -2405,6 +2540,20 @@ async function _renderHealthDetail(what, bodyEl) {{
   }}
 }}
 
+function _showToast(msg) {{
+  let t = document.getElementById('hd-toast');
+  if (!t) {{
+    t = document.createElement('div');
+    t.id = 'hd-toast';
+    t.className = 'hd-toast';
+    document.body.appendChild(t);
+  }}
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._tm);
+  t._tm = setTimeout(() => t.classList.remove('show'), 3500);
+}}
+
 async function resolveItem(what, id, resolution, btn) {{
   const endpoint = what === 'contradictions' ? '/api/resolve-contradiction' : '/api/resolve-question';
   btn.disabled = true;
@@ -2417,22 +2566,31 @@ async function resolveItem(what, id, resolution, btn) {{
     }});
     const data = await res.json();
     if (data.ok) {{
-      // Remove card with fade
+      const cascaded = data.cascaded || 0;
       const card = btn.closest('.hd-card');
-      if (card) {{
-        card.style.opacity = '0';
-        card.style.transition = 'opacity 0.3s';
-        setTimeout(() => {{
-          card.remove();
-          // Update counter
-          const remaining = document.querySelectorAll('.hd-card').length;
-          const p = document.querySelector('#health-detail-body > p');
-          if (p) p.textContent = remaining + ' pending';
-          if (!remaining) {{
-            document.querySelector('#health-detail-body').innerHTML =
-              '<p style="color:#aaa;font-style:italic;padding:8px 0">All resolved.</p>';
-          }}
-        }}, 300);
+
+      if (cascaded > 0) {{
+        // Cascade fired — re-render the modal so newly-resolved cards disappear too
+        _showToast(`✓ Resolved + ${{cascaded}} cascaded auto-resolution${{cascaded===1?'':'s'}}`);
+        const bodyEl = document.getElementById('health-detail-body');
+        bodyEl.innerHTML = '<div class="fp-loading">Refreshing…</div>';
+        await _renderHealthDetail(what, bodyEl);
+      }} else {{
+        // Just fade this card out
+        if (card) {{
+          card.style.opacity = '0';
+          card.style.transition = 'opacity 0.3s';
+          setTimeout(() => {{
+            card.remove();
+            const remaining = document.querySelectorAll('.hd-card').length;
+            const p = document.querySelector('#health-detail-body > p');
+            if (p) p.textContent = remaining + ' pending';
+            if (!remaining) {{
+              document.querySelector('#health-detail-body').innerHTML =
+                '<p style="color:#aaa;font-style:italic;padding:8px 0">All resolved.</p>';
+            }}
+          }}, 300);
+        }}
       }}
     }} else {{
       btn.disabled = false;
