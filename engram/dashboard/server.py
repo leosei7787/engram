@@ -181,40 +181,28 @@ def chat():
         # ── Phase 0: Announce scanning ────────────────────────────────────────
         yield f"data: {json.dumps({'context': {'phase': 'scanning', 'candidates_total': 0, 'selected': [], 'reasoning': ''}})}\n\n"
 
-        # ── Phase 1: Wide memory scan (up to 30 direct + graph + wiki) ────────
+        # ── Phase 1: Wide memory scan (up to 40 direct + graph + wiki) ────────
         try:
-            scan = memory_scan(query, cfg, max_files=30)
+            scan = memory_scan(query, cfg, max_files=40)
         except Exception as e:
             scan = {"direct": [], "graph": [], "wiki": [], "graph_context": "", "suggestions": []}
             print(f"[chat] memory_scan error: {e}", flush=True)
 
         # ── Phase 2: Build candidate list with snippets ───────────────────────
         try:
-            all_candidates = build_candidates(scan, cfg, snippet_chars=250)
+            all_candidates = build_candidates(scan, cfg, snippet_chars=400)
         except Exception as e:
             all_candidates = []
             print(f"[chat] build_candidates error: {e}", flush=True)
 
         n_candidates = len(all_candidates)
 
-        # ── Phase 3: Drift detection — skip Haiku if topic hasn't changed ──────
-        has_drift = detect_drift(query, messages)
-
-        if has_drift:
-            # Announce curating (sidebar shows candidate count immediately)
-            yield f"data: {json.dumps({'context': {'phase': 'curating', 'candidates_total': n_candidates, 'selected': [], 'reasoning': ''}})}\n\n"
-
-            # Haiku curator selects which files enter context
-            try:
-                selected, reasoning = curate_context(query, all_candidates, cfg, max_files=10)
-            except Exception as e:
-                selected  = all_candidates[:10]
-                reasoning = "Top-N by scan score (fallback)"
-                print(f"[chat] curator error: {e}", flush=True)
-        else:
-            # No drift — skip Haiku, use top-N by scan order (fast path)
-            selected  = all_candidates[:10]
-            reasoning = "Same topic — context reused"
+        # ── Phase 3: Immediate top-N selection — no Haiku wait ───────────────────
+        # Feed all top candidates directly. Haiku refines AFTER the response
+        # (see Phase 6) so it never blocks time-to-first-token.
+        max_ctx = getattr(cfg.curator, 'max_context_files', 20)
+        selected  = all_candidates[:max_ctx]
+        reasoning = f"Top {len(selected)} of {n_candidates} by relevance score"
 
         sel_payload = [{"path": c["path"], "type": c["type"]} for c in selected]
         yield f"data: {json.dumps({'context': {'phase': 'ready', 'candidates_total': n_candidates, 'selected': sel_payload, 'reasoning': reasoning}})}\n\n"
@@ -251,7 +239,7 @@ def chat():
                     cap   = min(trunc, budget - used)
                     label = f"Wiki: {p.stem}"
                 else:
-                    cap   = min(8000, budget - used)
+                    cap   = min(5000, budget - used)
                     label = f"Context: {c['path']}"
                 if len(content) > cap:
                     content = content[:cap] + "\n…(truncated)"
@@ -615,6 +603,57 @@ def config_info():
     })
 
 
+@app.route("/api/upload", methods=["POST"])
+def upload_doc():
+    """Accept file upload and return extracted text for context injection."""
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "no file"}), 400
+
+    name = f.filename or "document"
+    ext  = Path(name).suffix.lower()
+
+    try:
+        if ext in (".txt", ".md", ".eml", ".vtt", ".csv"):
+            content = f.read().decode("utf-8", errors="ignore")
+
+        elif ext == ".pdf":
+            try:
+                import pypdf
+                reader  = pypdf.PdfReader(f)
+                content = "\n\n".join(
+                    page.extract_text() or "" for page in reader.pages
+                )
+            except ImportError:
+                return jsonify({"error": "pypdf not installed — run: pip install pypdf"}), 500
+
+        elif ext == ".docx":
+            from docx import Document as DocxDoc
+            doc     = DocxDoc(f)
+            content = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+        elif ext == ".pptx":
+            from pptx import Presentation as PptxPrs
+            prs     = PptxPrs(f)
+            content = "\n".join(
+                shape.text for slide in prs.slides
+                for shape in slide.shapes if hasattr(shape, "text") and shape.text.strip()
+            )
+
+        else:
+            return jsonify({"error": f"Unsupported file type: {ext}. Supported: .txt .md .pdf .docx .pptx .eml"}), 400
+
+        content = content.strip()[:20000]
+        if not content:
+            return jsonify({"error": "File appears to be empty or could not be parsed"}), 400
+
+        stem = Path(name).stem
+        return jsonify({"name": stem, "content": content, "chars": len(content)})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/export", methods=["POST"])
 def export_file():
     """Generate DOCX / PPTX / MD / PDF from chat content and return as download."""
@@ -680,6 +719,55 @@ def list_outputs():
             for f in files
         ],
     })
+
+
+@app.route("/api/health-detail")
+def health_detail():
+    cfg  = get_cfg()
+    what = request.args.get("what", "")
+    mem  = cfg.memory_path
+
+    if what == "contradictions":
+        p = mem / "contradictions.json"
+        if not p.exists():
+            return jsonify({"items": []})
+        try:
+            data  = json.loads(p.read_text(errors="ignore"))
+            items = data if isinstance(data, list) else data.get("contradictions", [])
+            out   = []
+            for it in items[:100]:
+                out.append({
+                    "id":       it.get("id", ""),
+                    "summary":  it.get("summary") or it.get("description") or str(it)[:200],
+                    "entities": it.get("entities", []),
+                    "severity": it.get("severity", ""),
+                    "status":   it.get("status", ""),
+                })
+            return jsonify({"items": out, "total": len(items)})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    elif what == "open_questions":
+        p = mem / "open_questions.json"
+        if not p.exists():
+            return jsonify({"items": []})
+        try:
+            data = json.loads(p.read_text(errors="ignore"))
+            qs   = data if isinstance(data, list) else data.get("questions", [])
+            out  = []
+            for q in qs:
+                if q.get("status") not in ("resolved", "dismissed", "closed"):
+                    out.append({
+                        "text":     q.get("text", ""),
+                        "salience": q.get("salience", 0),
+                        "source":   q.get("source", ""),
+                        "status":   q.get("status", "open"),
+                    })
+            return jsonify({"items": out, "total": len(out)})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    return jsonify({"error": "unknown"}), 400
 
 
 # ─── Main page ────────────────────────────────────────────────────────────────
@@ -809,6 +897,18 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
                    background: #D97757; color: #fff; font-size: 12px; cursor: pointer;
                    font-weight: 600; }}
 .ctx-modal-add:hover {{ background: #c06040; }}
+.ctx-modal-upload-zone {{ border: 2px dashed #ddd; border-radius: 8px; padding: 20px;
+                            text-align: center; cursor: pointer; transition: all .15s;
+                            background: #fafafa; }}
+.ctx-modal-upload-zone:hover {{ border-color: #D97757; background: #fff8f5; }}
+.ctx-modal-upload-zone.uploading {{ opacity: .6; pointer-events: none; }}
+.ctx-modal-upload-icon {{ font-size: 24px; margin-bottom: 6px; }}
+.ctx-modal-upload-label {{ font-size: 13px; color: #555; font-weight: 500; }}
+.ctx-modal-upload-sub {{ font-size: 11px; color: #bbb; margin-top: 3px; }}
+.ctx-modal-divider {{ display: flex; align-items: center; gap: 10px; color: #bbb;
+                       font-size: 11px; margin: 4px 0; }}
+.ctx-modal-divider::before, .ctx-modal-divider::after {{ content: ''; flex: 1;
+    height: 1px; background: #efefef; }}
 
 /* Context item animations */
 .ctx-item.ctx-adding   {{ animation: ctx-add .4s ease-out; }}
@@ -1005,7 +1105,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .meter-val {{ font-size: 10px; color: #888; width: 28px; text-align: right; }}
 
 .alert-row {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }}
-.alert-chip {{ padding: 3px 10px; border-radius: 20px; font-size: 10px; font-weight: 600; }}
+.alert-chip {{ padding: 3px 10px; border-radius: 20px; font-size: 10px; font-weight: 600; cursor: pointer; }}
 .alert-chip.warn {{ background: rgba(251,188,4,.1); color: #a07800; border: 1px solid rgba(251,188,4,.25); }}
 .alert-chip.info {{ background: rgba(66,133,244,.08); color: #4285F4; border: 1px solid rgba(66,133,244,.2); }}
 .alert-chip.ok   {{ background: rgba(52,168,83,.08); color: #34A853; border: 1px solid rgba(52,168,83,.2); }}
@@ -1107,6 +1207,19 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 
 </div><!-- .shell -->
 
+<!-- ── Health detail modal ───────────────────────────────────────────────── -->
+<div class="fp-overlay" id="health-detail-overlay" onclick="closeHealthDetail(event)">
+  <div class="fp-modal" onclick="event.stopPropagation()">
+    <div class="fp-head">
+      <div class="fp-name" id="health-detail-title">Detail</div>
+      <button class="fp-close" onclick="closeHealthDetail()">×</button>
+    </div>
+    <div class="fp-body" id="health-detail-body" style="padding:16px 20px">
+      <div class="fp-loading">Loading…</div>
+    </div>
+  </div>
+</div>
+
 <!-- ── File preview modal ─────────────────────────────────────────────── -->
 <div class="fp-overlay" id="fp-overlay" onclick="closeFilePreview(event)">
   <div class="fp-modal" onclick="event.stopPropagation()">
@@ -1125,7 +1238,16 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 <div class="ctx-modal-overlay" id="raw-doc-modal" style="display:none" onclick="closeRawDocModal(event)">
   <div class="ctx-modal" onclick="event.stopPropagation()">
     <div class="ctx-modal-title">Add document to context</div>
-    <div class="ctx-modal-sub">Paste content or a file path. Injected immediately as a raw-tier item; compiled into memory in the background.</div>
+    <div class="ctx-modal-sub">Upload a file or paste content directly. Injected immediately into this conversation's context window.</div>
+    <div class="ctx-modal-upload-zone" id="raw-doc-dropzone" onclick="document.getElementById('raw-doc-file').click()">
+      <input type="file" id="raw-doc-file" style="display:none"
+             accept=".md,.txt,.pdf,.docx,.pptx,.eml,.vtt,.csv"
+             onchange="handleFileUpload(this)">
+      <div class="ctx-modal-upload-icon">📎</div>
+      <div class="ctx-modal-upload-label">Click to upload or drag &amp; drop</div>
+      <div class="ctx-modal-upload-sub">.pdf · .docx · .pptx · .md · .txt</div>
+    </div>
+    <div class="ctx-modal-divider"><span>or paste content</span></div>
     <div class="ctx-modal-row">
       <input class="ctx-modal-name" id="raw-doc-name" placeholder="Document name (optional)" />
     </div>
@@ -1490,6 +1612,36 @@ function closeRawDocModal(e) {{
   }}
 }}
 
+async function handleFileUpload(input) {{
+  const file = input.files[0];
+  if (!file) return;
+
+  const zone = document.getElementById('raw-doc-dropzone');
+  zone.classList.add('uploading');
+  zone.querySelector('.ctx-modal-upload-label').textContent = 'Extracting text…';
+
+  const form = new FormData();
+  form.append('file', file);
+
+  try {{
+    const res  = await fetch('/api/upload', {{ method: 'POST', body: form }});
+    const data = await res.json();
+
+    if (data.error) {{
+      alert('Upload error: ' + data.error);
+    }} else {{
+      document.getElementById('raw-doc-name').value    = data.name;
+      document.getElementById('raw-doc-content').value = data.content;
+      zone.querySelector('.ctx-modal-upload-label').textContent = '✓ ' + file.name + ' (' + data.chars.toLocaleString() + ' chars)';
+    }}
+  }} catch (err) {{
+    alert('Upload failed: ' + err.message);
+  }} finally {{
+    zone.classList.remove('uploading');
+    input.value = '';
+  }}
+}}
+
 function addRawDoc() {{
   const name    = (document.getElementById('raw-doc-name').value.trim() || 'raw_doc_' + (rawDocs.length + 1));
   const content = document.getElementById('raw-doc-content').value.trim();
@@ -1540,14 +1692,21 @@ function renderContext(ctx) {{
     return;
   }}
 
-  // phase === 'ready'
-  activeContext = sel;
-  const n = sel.length;
+  // phase === 'ready' — preserve pinned and raw docs across turns
+  const preserved = activeContext.filter(c =>
+    pinnedPaths.has(c.path) || c.path.startsWith('__raw__/')
+  );
+  const merged = [
+    ...preserved,
+    ...sel.filter(c => !preserved.find(p => p.path === c.path)),
+  ];
+  activeContext = merged;
+  const n = merged.length;
   countEl.textContent  = n + ' of ' + total + ' candidate' + (total !== 1 ? 's' : '');
   reasonEl.textContent = reason;
 
   list.innerHTML = '';
-  for (const f of sel) {{
+  for (const f of merged) {{
     list.appendChild(makeCtxItem(f.path, f.type));
   }}
   if (!n) list.innerHTML = '<div class="ctx-empty">No context loaded</div>';
@@ -1566,7 +1725,8 @@ function applyContextUpdate(upd) {{
 
   // Remove items (animate out) — skip pinned files
   for (const f of toRemove) {{
-    if (pinnedPaths.has(f.path)) continue;   // never remove pinned
+    if (pinnedPaths.has(f.path)) continue;        // never remove pinned
+    if (f.path.startsWith('__raw__/')) continue;  // never remove user-added docs
     for (const el of list.querySelectorAll('.ctx-item')) {{
       if (el.dataset.path === f.path) {{
         el.classList.add('ctx-removing');
@@ -1658,9 +1818,9 @@ function renderHealth(data) {{
   const health = d.health || {{}};
   const covPct = Math.round((health.coverage_score||0)*100);
   const alerts = [
-    d.contradictions_pending>0?`<div class="alert-chip warn">⚠ ${{d.contradictions_pending}} contradictions</div>`:'',
-    d.open_questions>0?`<div class="alert-chip info">❓ ${{d.open_questions}} open questions</div>`:'',
-    !d.contradictions_pending&&!d.open_questions?`<div class="alert-chip ok">✓ Clean</div>`:'',
+    d.contradictions_pending>0?`<div class="alert-chip warn" onclick="openHealthDetail('contradictions')">&#9888; ${{d.contradictions_pending}} contradictions</div>`:'',
+    d.open_questions>0?`<div class="alert-chip info" onclick="openHealthDetail('open_questions')">&#10067; ${{d.open_questions}} open questions</div>`:'',
+    !d.contradictions_pending&&!d.open_questions?`<div class="alert-chip ok">&#10003; Clean</div>`:'',
   ].filter(Boolean).join('');
 
   // Retrieve pillar
@@ -1741,11 +1901,81 @@ function renderHealth(data) {{
   </div>`;
 }}
 
+async function openHealthDetail(what) {{
+  const overlay  = document.getElementById('health-detail-overlay');
+  const titleEl  = document.getElementById('health-detail-title');
+  const bodyEl   = document.getElementById('health-detail-body');
+
+  titleEl.textContent = what === 'contradictions' ? 'Contradictions' : 'Open Questions';
+  bodyEl.innerHTML    = '<div class="fp-loading">Loading…</div>';
+  overlay.classList.add('open');
+
+  try {{
+    const res  = await fetch('/api/health-detail?what=' + what);
+    const data = await res.json();
+
+    if (data.error) {{ bodyEl.innerHTML = '<p style="color:#e00">&#9888; ' + data.error + '</p>'; return; }}
+
+    const items = data.items || [];
+    if (!items.length) {{ bodyEl.innerHTML = '<p style="color:#aaa;font-style:italic">None found.</p>'; return; }}
+
+    let html = `<p style="font-size:11px;color:#aaa;margin-bottom:14px">${{items.length}} item${{items.length !== 1 ? 's' : ''}}</p>`;
+
+    if (what === 'contradictions') {{
+      html += items.map(it => `
+        <div style="border:1px solid #efefef;border-radius:8px;padding:12px 14px;margin-bottom:10px">
+          <div style="font-size:12px;color:#1a1a1a;line-height:1.5">${{it.summary}}</div>
+          ${{it.entities && it.entities.length ? `<div style="font-size:10px;color:#aaa;margin-top:6px">Entities: ${{it.entities.join(', ')}}</div>` : ''}}
+          ${{it.severity ? `<span style="font-size:10px;color:#e07000;background:#fff3e0;padding:1px 6px;border-radius:10px;margin-top:4px;display:inline-block">${{it.severity}}</span>` : ''}}
+        </div>`).join('');
+    }} else {{
+      html += items.map((q, i) => `
+        <div style="display:flex;gap:10px;padding:8px 0;border-bottom:1px solid #f5f5f5">
+          <div style="font-size:11px;font-weight:700;color:#bbb;width:20px;flex-shrink:0">${{i+1}}</div>
+          <div style="flex:1">
+            <div style="font-size:13px;color:#1a1a1a;line-height:1.5">${{q.text}}</div>
+            ${{q.source ? `<div style="font-size:10px;color:#aaa;margin-top:3px">Source: ${{q.source}}</div>` : ''}}
+          </div>
+          <div style="font-size:10px;color:#bbb;white-space:nowrap">${{(q.salience * 100).toFixed(0)}}%</div>
+        </div>`).join('');
+    }}
+
+    bodyEl.innerHTML = html;
+  }} catch (err) {{
+    bodyEl.innerHTML = '<p style="color:#e00">&#9888; ' + err.message + '</p>';
+  }}
+}}
+
+function closeHealthDetail(e) {{
+  if (!e || e.target === document.getElementById('health-detail-overlay')) {{
+    document.getElementById('health-detail-overlay').classList.remove('open');
+  }}
+}}
+
 // Load health on page if on /health
 if (document.getElementById('panel-health').classList.contains('active')) {{
   loadHealth();
   setInterval(loadHealth, 30000);
 }}
+
+// Drag-and-drop on the upload zone
+document.addEventListener('DOMContentLoaded', () => {{
+  const zone = document.getElementById('raw-doc-dropzone');
+  if (!zone) return;
+  zone.addEventListener('dragover', e => {{ e.preventDefault(); zone.style.borderColor = '#D97757'; }});
+  zone.addEventListener('dragleave', () => {{ zone.style.borderColor = ''; }});
+  zone.addEventListener('drop', e => {{
+    e.preventDefault();
+    zone.style.borderColor = '';
+    const file = e.dataTransfer.files[0];
+    if (!file) return;
+    const input = document.getElementById('raw-doc-file');
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    input.files = dt.files;
+    handleFileUpload(input);
+  }});
+}});
 </script>
 </body>
 </html>"""
