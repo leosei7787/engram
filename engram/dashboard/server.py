@@ -235,6 +235,15 @@ def _start_watcher(cfg: EngramConfig):
                 "at":       datetime.now(timezone.utc).isoformat(),
             })
             _watcher_status["recent_files"] = _watcher_status["recent_files"][:20]
+
+            # New email landed in MEMORY/daily/emails/ — schedule a debounced
+            # deadline-extraction pass so the Top of Mind tile stays current
+            # without manual refresh. Multiple emails arriving in a burst
+            # collapse into a single LLM run.
+            try:
+                _schedule_signals_refresh(cfg, delay_s=30)
+            except Exception:
+                pass
             return True
         except Exception as e:
             print(f"[watcher] copy error: {e}", flush=True)
@@ -2131,6 +2140,67 @@ def top_of_mind():
 _signals_refresh_lock = threading.Lock()
 _signals_refreshing = False
 
+# Debouncer for watcher-driven signal refreshes. When new emails land in a
+# burst, each call resets the timer; the extractor runs once after the burst
+# settles. Keeps us from spawning 10 parallel Haiku passes in the same minute.
+_signals_debounce_lock  = threading.Lock()
+_signals_debounce_timer: threading.Timer | None = None
+
+
+def _run_signals_refresh(cfg, *, days_back: int = 14, limit: int = 80) -> None:
+    """Synchronous extraction → save. Used by both the manual endpoint and the
+    watcher-driven debouncer. Single-flight enforced via _signals_refresh_lock.
+    """
+    global _signals_refreshing
+    with _signals_refresh_lock:
+        if _signals_refreshing:
+            return
+        _signals_refreshing = True
+    try:
+        from engram.memory.signal_extractor import (
+            extract_recent_email_signals,
+            save_signals,
+        )
+        user = cfg.identity.user_name or ""
+        sigs = extract_recent_email_signals(
+            memory_path = cfg.memory_path,
+            user_name   = user,
+            cfg         = cfg,
+            days_back   = days_back,
+            limit       = limit,
+        )
+        save_signals(sigs, cfg.memory_path)
+        print(f"[signals] refresh done: {sigs['scanned']} scanned, "
+              f"{len(sigs['deadlines'])} surfaced, "
+              f"{sigs['filtered_out']['past']} past + "
+              f"{sigs['filtered_out']['already_responded']} responded filtered out",
+              flush=True)
+    except Exception:
+        print("[signals] refresh error:\n" + traceback.format_exc(), flush=True)
+    finally:
+        with _signals_refresh_lock:
+            _signals_refreshing = False
+
+
+def _schedule_signals_refresh(cfg, *, delay_s: int = 30) -> None:
+    """Schedule (or reschedule) a background signals refresh in `delay_s`.
+
+    Multiple emails arriving within `delay_s` collapse into one run. Called
+    from the watcher's _ingest after a successful email write.
+    """
+    global _signals_debounce_timer
+    with _signals_debounce_lock:
+        if _signals_debounce_timer is not None:
+            try:
+                _signals_debounce_timer.cancel()
+            except Exception:
+                pass
+        t = threading.Timer(delay_s, _run_signals_refresh, args=(cfg,))
+        t.daemon = True
+        t.name   = "engram-signals-debounced"
+        _signals_debounce_timer = t
+        t.start()
+
 
 @app.route("/api/signals/refresh", methods=["POST"])
 def signals_refresh():
@@ -2140,7 +2210,6 @@ def signals_refresh():
     /api/top-of-mind to see updated deadlines once the pass completes.
     Locks so concurrent presses don't pile up parallel extractions.
     """
-    global _signals_refreshing
     cfg = get_cfg()
     body = request.get_json(force=True, silent=True) or {}
     days_back = int(body.get("days_back", 14))
@@ -2149,36 +2218,12 @@ def signals_refresh():
     with _signals_refresh_lock:
         if _signals_refreshing:
             return jsonify({"status": "already_running"})
-        _signals_refreshing = True
 
-    def _run():
-        global _signals_refreshing
-        try:
-            from engram.memory.signal_extractor import (
-                extract_recent_email_signals,
-                save_signals,
-            )
-            user = cfg.identity.user_name or ""
-            sigs = extract_recent_email_signals(
-                memory_path = cfg.memory_path,
-                user_name   = user,
-                cfg         = cfg,
-                days_back   = days_back,
-                limit       = limit,
-            )
-            save_signals(sigs, cfg.memory_path)
-            print(f"[signals] refresh done: {sigs['scanned']} scanned, "
-                  f"{len(sigs['deadlines'])} surfaced, "
-                  f"{sigs['filtered_out']['past']} past + "
-                  f"{sigs['filtered_out']['already_responded']} responded filtered out",
-                  flush=True)
-        except Exception:
-            print("[signals] refresh error:\n" + traceback.format_exc(), flush=True)
-        finally:
-            with _signals_refresh_lock:
-                _signals_refreshing = False
-
-    threading.Thread(target=_run, daemon=True, name="engram-signals").start()
+    threading.Thread(
+        target=_run_signals_refresh,
+        kwargs={"cfg": cfg, "days_back": days_back, "limit": limit},
+        daemon=True, name="engram-signals",
+    ).start()
     return jsonify({"status": "started", "days_back": days_back, "limit": limit})
 
 
