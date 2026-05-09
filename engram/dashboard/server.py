@@ -956,9 +956,9 @@ const TOPIC_COLORS = {{
 
 let messages      = [];
 let streaming     = false;
-let activeContext = [];      // [{path, type}, ...]
+let activeContext = [];      // [{{path, type}}, ...]
 let pinnedPaths   = new Set(); // paths the user has pinned
-let rawDocs       = [];      // [{name, content}, ...] injected by user
+let rawDocs       = [];      // [{{name, content}}, ...] injected by user
 
 // ── Auto-resize textarea ───────────────────────────────────────────────────
 const input = document.getElementById('input');
