@@ -457,6 +457,7 @@ def chat():
 
     was_interruption = bool(data.get("was_interruption", False))
     interruption_reason = (data.get("interruption_reason", "") or "").strip()[:200]
+    session_id = (data.get("session_id", "") or "").strip()
 
     def generate():
         cfg = get_cfg()
@@ -817,6 +818,37 @@ def chat():
                         yield f"data: {json.dumps({'context_update': {'add': add_pl, 'remove': remove_pl, 'reason': update.get('reason', '')}})}\n\n"
             except Exception as e:
                 print(f"[chat] monitor error: {e}", flush=True)
+
+        # ── Phase 7: Log this turn + harvest proposals in background ─────────
+        # Sessions are stored at MEMORY/sessions/<YYYY-MM>/chat_<id>.md so the
+        # curator's keyword scan picks them up — past conversations naturally
+        # become part of future retrieval. The harvest call is async so it
+        # doesn't add latency to the chat response.
+        if assistant_text and session_id:
+            try:
+                from engram.memory.session_harvester import (
+                    log_turn as _log_turn,
+                    harvest_in_background as _harvest_bg,
+                )
+                _log_turn(
+                    memory_path     = cfg.memory_path,
+                    session_id      = session_id,
+                    user_msg        = query,
+                    assistant_text  = assistant_text,
+                    selected        = selected,
+                    raw_docs        = raw_docs if raw_docs else [],
+                    was_interruption= was_interruption,
+                )
+                _harvest_bg(
+                    memory_path     = cfg.memory_path,
+                    session_id      = session_id,
+                    user_msg        = query,
+                    assistant_text  = assistant_text,
+                    user_name       = cfg.identity.user_name or "",
+                    cfg             = cfg,
+                )
+            except Exception:
+                print("[chat] session log/harvest error:\n" + traceback.format_exc(), flush=True)
 
         yield "data: [DONE]\n\n"
         _end_chat()
@@ -2722,6 +2754,18 @@ let activeContext = [];      // [{{path, type}}, ...]
 let pinnedPaths   = new Set(); // paths the user has pinned
 let rawDocs       = [];      // [{{name, content}}, ...] injected by user
 
+// One stable id per browser tab. Sent with every /api/chat request so the
+// server can append turns to MEMORY/sessions/<YYYY-MM>/chat_<id>.md, making
+// past conversations retrievable by future sessions via the curator's scan.
+const SESSION_ID = (function() {{
+  try {{
+    return (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+      : 'sess_' + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+  }} catch (e) {{
+    return 'sess_' + Date.now();
+  }}
+}})();
+
 // ── Auto-resize textarea ───────────────────────────────────────────────────
 const input = document.getElementById('input');
 input.addEventListener('input', () => {{
@@ -2849,6 +2893,7 @@ function _doSend(text, opts) {{
     pinned:              [...pinnedPaths],
     was_interruption:    !!opts.was_interruption,
     interruption_reason: opts.reason || '',
+    session_id:          SESSION_ID,
   }};
 
   fetch('/api/chat', {{
