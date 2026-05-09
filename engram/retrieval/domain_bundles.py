@@ -103,12 +103,19 @@ def bundles_from_config(config_bundles: list) -> list[dict]:
     """
     result: list[dict] = []
     for b in config_bundles:
-        triggers = b.get("triggers") or []
-        patterns = b.get("patterns") or []
+        # Accept both dict (legacy) and DomainBundle dataclass
+        if isinstance(b, dict):
+            triggers = b.get("triggers") or []
+            patterns = b.get("patterns") or []
+            name     = b.get("name", "")
+        else:
+            triggers = getattr(b, "triggers", None) or []
+            patterns = getattr(b, "patterns", None) or []
+            name     = getattr(b, "name", "")
         if not patterns:
             continue
         result.append({
-            "name":     b.get("name", ""),
+            "name":     name,
             "triggers": set(str(t).lower() for t in triggers),
             "patterns": [str(p) for p in patterns],
         })

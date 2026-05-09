@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from flask import Flask, jsonify, request, Response, stream_with_context
 from engram.retrieval.config import load_config, EngramConfig
 from engram.retrieval.pipeline import memory_scan
+from engram.retrieval.curator import build_candidates, curate_context, monitor_context
 
 app = Flask(__name__)
 _cfg: EngramConfig | None = None
@@ -65,22 +66,43 @@ def _format_messages_for_cli(messages: list) -> str:
 
 def _stream_cli(messages: list, system_prompt: str, cli_bin: str, model: str | None = None):
     """
-    Stream a Claude CLI response token-by-token.
+    Call Claude CLI in print mode and yield response text in small chunks.
 
-    Uses `claude -p <msg> --output-format stream-json [--system ...] [--model ...]`.
-    Parses NDJSON lines for content_block_delta / text_delta events.
+    Uses `claude -p <msg> --output-format stream-json --verbose [--system-prompt ...] [--model ...]`.
+
+    The CLI in -p mode returns batched NDJSON events (not incremental token deltas).
+    We parse the `assistant` message event and emit the text in ~10-word chunks so
+    the typing-indicator UX stays responsive. Falls back to `result` event if needed.
 
     Yields plain text strings (no SSE framing — caller wraps in data: ... \\n\\n).
     """
     user_msg = _format_messages_for_cli(messages)
 
-    cmd = [cli_bin, "-p", user_msg, "--output-format", "stream-json"]
+    cmd = [cli_bin, "-p", user_msg, "--output-format", "stream-json", "--verbose"]
     if system_prompt:
-        cmd += ["--system", system_prompt]
+        cmd += ["--system-prompt", system_prompt]
     if model:
         cmd += ["--model", model]
 
-    print(f"[chat/cli] {cli_bin} -p <{len(user_msg)}chars> --output-format stream-json", flush=True)
+    print(
+        f"[chat/cli] {cli_bin} -p <{len(user_msg)}chars>"
+        f"{' --system-prompt <'+str(len(system_prompt))+'chars>' if system_prompt else ''}",
+        flush=True,
+    )
+
+    def _emit_text(text: str):
+        """Yield text in ~10-word chunks so the cursor appears to stream."""
+        if not text:
+            return
+        words = text.split(" ")
+        chunk: list[str] = []
+        for word in words:
+            chunk.append(word)
+            if len(chunk) >= 10:
+                yield " ".join(chunk) + " "
+                chunk = []
+        if chunk:
+            yield " ".join(chunk)
 
     try:
         proc = subprocess.Popen(
@@ -90,23 +112,51 @@ def _stream_cli(messages: list, system_prompt: str, cli_bin: str, model: str | N
             text=True,
             bufsize=1,
         )
+
+        full_text   = ""
+        result_text = ""
+
         for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
             try:
                 event = json.loads(line)
-                if event.get("type") == "content_block_delta":
+                etype = event.get("type", "")
+
+                # True streaming (future CLI versions or different modes)
+                if etype == "content_block_delta":
                     delta = event.get("delta", {})
                     if delta.get("type") == "text_delta":
                         yield delta.get("text", "")
+
+                # Batched assistant message (current CLI -p --verbose behavior)
+                elif etype == "assistant":
+                    msg = event.get("message", {})
+                    for block in (msg.get("content") or []):
+                        if block.get("type") == "text":
+                            full_text += block.get("text", "")
+
+                # Final result event (fallback)
+                elif etype == "result":
+                    result_text = event.get("result", "") or ""
+
             except json.JSONDecodeError:
                 pass
+
         proc.wait()
         if proc.returncode not in (0, None):
-            err = proc.stderr.read() if proc.stderr else ""
+            err = (proc.stderr.read() if proc.stderr else "").strip()
             if err:
                 print(f"[chat/cli] exit {proc.returncode}: {err[:300]}", flush=True)
+                yield f"\n\n⚠ CLI error (exit {proc.returncode}): {err[:200]}"
+                return
+
+        # Emit the batched text in word-chunks
+        text = full_text or result_text
+        if text:
+            yield from _emit_text(text)
+
     except Exception as e:
         yield f"\n\n⚠ CLI error: {e}"
 
@@ -124,21 +174,41 @@ def chat():
     def generate():
         cfg = get_cfg()
 
-        # Stage 1 — memory scan
+        # ── Phase 0: Announce scanning ────────────────────────────────────────
+        yield f"data: {json.dumps({'context': {'phase': 'scanning', 'candidates_total': 0, 'selected': [], 'reasoning': ''}})}\n\n"
+
+        # ── Phase 1: Wide memory scan (up to 30 direct + graph + wiki) ────────
         try:
-            scan = memory_scan(query, cfg)
+            scan = memory_scan(query, cfg, max_files=30)
         except Exception as e:
             scan = {"direct": [], "graph": [], "wiki": [], "graph_context": "", "suggestions": []}
             print(f"[chat] memory_scan error: {e}", flush=True)
 
-        direct = scan.get("direct", [])
-        graph  = scan.get("graph", [])
-        wiki   = scan.get("wiki", [])
+        # ── Phase 2: Build candidate list with snippets ───────────────────────
+        try:
+            all_candidates = build_candidates(scan, cfg, snippet_chars=250)
+        except Exception as e:
+            all_candidates = []
+            print(f"[chat] build_candidates error: {e}", flush=True)
 
-        yield f"data: {json.dumps({'context': {'direct': direct, 'graph': graph, 'wiki': wiki}})}\n\n"
+        n_candidates = len(all_candidates)
 
-        # Stage 2 — build system prompt
-        system_parts = []
+        # Announce curating (sidebar shows candidate count immediately)
+        yield f"data: {json.dumps({'context': {'phase': 'curating', 'candidates_total': n_candidates, 'selected': [], 'reasoning': ''}})}\n\n"
+
+        # ── Phase 3: Haiku curator selects which files enter context ──────────
+        try:
+            selected, reasoning = curate_context(query, all_candidates, cfg, max_files=10)
+        except Exception as e:
+            selected  = all_candidates[:10]
+            reasoning = "Top-N by scan score (fallback)"
+            print(f"[chat] curator error: {e}", flush=True)
+
+        sel_payload = [{"path": c["path"], "type": c["type"]} for c in selected]
+        yield f"data: {json.dumps({'context': {'phase': 'ready', 'candidates_total': n_candidates, 'selected': sel_payload, 'reasoning': reasoning}})}\n\n"
+
+        # ── Phase 4: Build system prompt from selected files ──────────────────
+        system_parts: list[str] = []
         id_cfg = cfg.identity
         if id_cfg.user_name or id_cfg.user_role:
             system_parts.append(
@@ -150,39 +220,30 @@ def chat():
         if sp.user_tone:
             system_parts.append(f"Tone: {sp.user_tone}")
 
-        # Load context files
         base   = cfg.base_path
         budget = cfg.retrieval.context_budget.max_total_chars
+        trunc  = cfg.retrieval.context_budget.wiki_page_truncate_chars
         used   = 0
 
-        for rel in direct + graph:
+        for c in selected:
             if used >= budget:
                 break
-            p = Path(rel) if Path(rel).is_absolute() else base / rel
+            p = Path(c["path"])
+            if not p.is_absolute():
+                p = base / c["path"]
             if not p.exists():
                 continue
             try:
                 content = p.read_text(errors="ignore")
-                cap = min(8000, budget - used)
+                if c["type"] == "wiki":
+                    cap   = min(trunc, budget - used)
+                    label = f"Wiki: {p.stem}"
+                else:
+                    cap   = min(8000, budget - used)
+                    label = f"Context: {c['path']}"
                 if len(content) > cap:
                     content = content[:cap] + "\n…(truncated)"
-                system_parts.append(f"\n\n---\n# Context: {rel}\n\n{content}")
-                used += len(content)
-            except Exception:
-                pass
-
-        trunc = cfg.retrieval.context_budget.wiki_page_truncate_chars
-        for wp in wiki:
-            if used >= budget:
-                break
-            p = Path(wp)
-            if not p.exists():
-                continue
-            try:
-                content = p.read_text(errors="ignore")
-                if len(content) > trunc:
-                    content = content[:trunc] + "\n…(truncated)"
-                system_parts.append(f"\n\n---\n# Wiki: {p.stem}\n\n{content}")
+                system_parts.append(f"\n\n---\n# {label}\n\n{content}")
                 used += len(content)
             except Exception:
                 pass
@@ -192,12 +253,12 @@ def chat():
 
         system_prompt = "\n".join(system_parts)
 
-        # Stage 3 — stream via configured backend
-        chat_cfg = getattr(cfg, "chat", None)
-        backend  = getattr(chat_cfg, "backend", "api") if chat_cfg else "api"
+        # ── Phase 5: Stream response via configured backend ───────────────────
+        chat_cfg      = getattr(cfg, "chat", None)
+        backend       = getattr(chat_cfg, "backend", "api") if chat_cfg else "api"
+        assistant_text = ""
 
         if backend == "cli":
-            # ── Claude CLI backend ─────────────────────────────────────────────
             cli_bin = (getattr(chat_cfg, "cli_bin", None) or None) or shutil.which("claude")
             if not cli_bin:
                 yield f"data: {json.dumps({'token': '⚠ Claude CLI not found. Install claude or set chat.cli_bin in config.'})}\n\n"
@@ -206,12 +267,12 @@ def chat():
             cli_model = getattr(chat_cfg, "cli_model", None) or None
             try:
                 for text in _stream_cli(messages, system_prompt, cli_bin, model=cli_model):
+                    assistant_text += text
                     yield f"data: {json.dumps({'token': text})}\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
         else:
-            # ── Anthropic API backend (default) ───────────────────────────────
             api_key = os.environ.get("ANTHROPIC_API_KEY", "")
             if not api_key:
                 yield (
@@ -231,9 +292,23 @@ def chat():
                     messages   = messages,
                 ) as stream:
                     for text in stream.text_stream:
+                        assistant_text += text
                         yield f"data: {json.dumps({'token': text})}\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+        # ── Phase 6: Haiku monitor — update context for next turn ─────────────
+        if assistant_text and all_candidates:
+            try:
+                all_msgs = messages + [{"role": "assistant", "content": assistant_text}]
+                update   = monitor_context(all_msgs, selected, all_candidates, cfg)
+                if update.get("action") == "update":
+                    add_pl    = [{"path": c["path"], "type": c["type"]} for c in update.get("add", [])]
+                    remove_pl = [{"path": c["path"], "type": c["type"]} for c in update.get("remove", [])]
+                    if add_pl or remove_pl:
+                        yield f"data: {json.dumps({'context_update': {'add': add_pl, 'remove': remove_pl, 'reason': update.get('reason', '')}})}\n\n"
+            except Exception as e:
+                print(f"[chat] monitor error: {e}", flush=True)
 
         yield "data: [DONE]\n\n"
 
@@ -501,15 +576,25 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .ctx-list {{ flex: 1; overflow-y: auto; padding: 8px 0; }}
 .ctx-item {{ padding: 5px 16px; display: flex; align-items: flex-start; gap: 7px; }}
 .ctx-dot {{ width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }}
+.ctx-dot.memory {{ background: #4285F4; }}
 .ctx-dot.direct {{ background: #4285F4; }}
 .ctx-dot.graph  {{ background: #34A853; }}
 .ctx-dot.wiki   {{ background: #D97757; }}
 .ctx-file {{ font-size: 11px; color: #555; line-height: 1.4; word-break: break-word; }}
 .ctx-empty {{ padding: 12px 16px; font-size: 11px; color: #bbb; font-style: italic; }}
+.ctx-reasoning {{ padding: 0 16px 8px; font-size: 10px; color: #aaa; font-style: italic;
+                  line-height: 1.5; min-height: 0; }}
 .ctx-legend {{ padding: 10px 16px; border-top: 1px solid #efefef; display: flex;
                gap: 10px; flex-wrap: wrap; }}
 .ctx-legend-item {{ display: flex; align-items: center; gap: 4px;
                     font-size: 10px; color: #aaa; }}
+
+/* Context item animations */
+.ctx-item {{ transition: opacity .2s; }}
+.ctx-item.ctx-adding   {{ animation: ctx-add .4s ease-out; }}
+.ctx-item.ctx-removing {{ animation: ctx-remove .3s ease-in forwards; overflow: hidden; }}
+@keyframes ctx-add    {{ from {{ opacity:0; transform:translateX(-6px); }} to {{ opacity:1; transform:translateX(0); }} }}
+@keyframes ctx-remove {{ to   {{ opacity:0; max-height:0; padding-top:0; padding-bottom:0; }} }}
 
 /* Chat main */
 .chat-main {{ flex: 1; display: flex; flex-direction: column; overflow: hidden; }}
@@ -678,14 +763,15 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
     <!-- Context sidebar -->
     <div class="ctx-sidebar">
       <div class="ctx-header">
-        <div class="ctx-title">Live Context</div>
+        <div class="ctx-title">Active Context</div>
         <div class="ctx-count" id="ctx-count">Waiting for query…</div>
       </div>
+      <div class="ctx-reasoning" id="ctx-reasoning"></div>
       <div class="ctx-list" id="ctx-list">
         <div class="ctx-empty">Context files will appear here after your first message.</div>
       </div>
       <div class="ctx-legend">
-        <div class="ctx-legend-item"><div class="ctx-dot direct"></div>memory</div>
+        <div class="ctx-legend-item"><div class="ctx-dot memory"></div>memory</div>
         <div class="ctx-legend-item"><div class="ctx-dot graph"></div>graph</div>
         <div class="ctx-legend-item"><div class="ctx-dot wiki"></div>wiki</div>
       </div>
@@ -731,8 +817,9 @@ const TOPIC_COLORS = {{
   people:'#34A853', problems:'#EA4335', projects:'#E8906E', systems:'#00ACC1',
 }};
 
-let messages = [];
-let streaming = false;
+let messages      = [];
+let streaming     = false;
+let activeContext = [];   // [{path, type}, ...]
 
 // ── Auto-resize textarea ───────────────────────────────────────────────────
 const input = document.getElementById('input');
@@ -761,8 +848,10 @@ function sendMessage() {{
   streaming = true;
 
   // Reset context sidebar
-  document.getElementById('ctx-list').innerHTML = '<div class="ctx-empty">Scanning…</div>';
-  document.getElementById('ctx-count').textContent = 'Scanning…';
+  activeContext = [];
+  document.getElementById('ctx-list').innerHTML = '<div class="ctx-empty">Scanning memory…</div>';
+  document.getElementById('ctx-count').textContent = 'Scanning memory…';
+  document.getElementById('ctx-reasoning').textContent = '';
 
   const evtSrc = new EventSource('/api/chat?' + new URLSearchParams({{
     _body: JSON.stringify({{messages}})
@@ -797,7 +886,8 @@ function sendMessage() {{
           if (raw === '[DONE]') continue;
           try {{
             const j = JSON.parse(raw);
-            if (j.context) renderContext(j.context);
+            if (j.context)        renderContext(j.context);
+            if (j.context_update) applyContextUpdate(j.context_update);
             if (j.token) {{
               assistantText += j.token;
               assistantEl.querySelector('.bubble').textContent = assistantText;
@@ -838,23 +928,90 @@ function scrollToBottom() {{
   m.scrollTop = m.scrollHeight;
 }}
 
+function makeCtxItem(path, type) {{
+  const name = path.split('/').pop().replace(/\\.md$/, '');
+  const el   = document.createElement('div');
+  el.className    = 'ctx-item';
+  el.dataset.path = path;
+  el.innerHTML    = `<div class="ctx-dot ${{type}}"></div><div class="ctx-file">${{name}}</div>`;
+  return el;
+}}
+
 function renderContext(ctx) {{
-  const direct = ctx.direct || [], graph = ctx.graph || [], wiki = ctx.wiki || [];
-  const total = direct.length + graph.length + wiki.length;
-  document.getElementById('ctx-count').textContent = total + ' file' + (total !== 1 ? 's' : '') + ' loaded';
-  const list = document.getElementById('ctx-list');
+  const phase  = ctx.phase  || 'ready';
+  const total  = ctx.candidates_total || 0;
+  const sel    = ctx.selected || [];
+  const reason = ctx.reasoning || '';
+
+  const countEl    = document.getElementById('ctx-count');
+  const reasonEl   = document.getElementById('ctx-reasoning');
+  const list       = document.getElementById('ctx-list');
+
+  if (phase === 'scanning') {{
+    countEl.textContent  = 'Scanning memory…';
+    reasonEl.textContent = '';
+    list.innerHTML = '<div class="ctx-empty">Scanning…</div>';
+    return;
+  }}
+
+  if (phase === 'curating') {{
+    countEl.textContent  = total + ' candidates — curating…';
+    reasonEl.textContent = '';
+    // Keep list as-is (still shows scanning placeholder)
+    return;
+  }}
+
+  // phase === 'ready'
+  activeContext = sel;
+  const n = sel.length;
+  countEl.textContent  = n + ' of ' + total + ' candidate' + (total !== 1 ? 's' : '');
+  reasonEl.textContent = reason;
+
   list.innerHTML = '';
-  const add = (files, type) => files.forEach(f => {{
-    const name = f.split('/').pop().replace(/\\.md$/, '');
-    const item = document.createElement('div');
-    item.className = 'ctx-item';
-    item.innerHTML = '<div class="ctx-dot ' + type + '"></div><div class="ctx-file">' + name + '</div>';
-    list.appendChild(item);
-  }});
-  add(direct, 'direct');
-  add(graph,  'graph');
-  add(wiki,   'wiki');
-  if (!total) list.innerHTML = '<div class="ctx-empty">No context loaded</div>';
+  for (const f of sel) {{
+    list.appendChild(makeCtxItem(f.path, f.type));
+  }}
+  if (!n) list.innerHTML = '<div class="ctx-empty">No context loaded</div>';
+}}
+
+function applyContextUpdate(upd) {{
+  const toAdd    = upd.add    || [];
+  const toRemove = upd.remove || [];
+  const reason   = upd.reason || '';
+
+  if (!toAdd.length && !toRemove.length) return;
+
+  const list    = document.getElementById('ctx-list');
+  const reasonEl = document.getElementById('ctx-reasoning');
+  reasonEl.textContent = '↻ ' + reason;
+
+  // Remove items (animate out)
+  for (const f of toRemove) {{
+    for (const el of list.querySelectorAll('.ctx-item')) {{
+      if (el.dataset.path === f.path) {{
+        el.classList.add('ctx-removing');
+        setTimeout(() => el.remove(), 320);
+        break;
+      }}
+    }}
+    activeContext = activeContext.filter(c => c.path !== f.path);
+  }}
+
+  // Add items (animate in)
+  for (const f of toAdd) {{
+    if (!activeContext.find(c => c.path === f.path)) {{
+      activeContext.push(f);
+      const el = makeCtxItem(f.path, f.type);
+      el.classList.add('ctx-adding');
+      list.appendChild(el);
+    }}
+  }}
+
+  // Update count
+  const countEl = document.getElementById('ctx-count');
+  const m = countEl.textContent.match(/of (\\d+)/);
+  const total = m ? m[1] : '?';
+  countEl.textContent = activeContext.length + ' of ' + total + ' candidate' + (total > 1 ? 's' : '');
 }}
 
 // ── Health tab ─────────────────────────────────────────────────────────────
@@ -931,9 +1088,11 @@ function renderHealth(data) {{
   const typeRows = (gs.top_types||[]).map(([t,n])=>`<tr><td>${{t}}</td><td>${{n}}</td></tr>`).join('');
   const commList = (r.communities||[]).map(c=>`<div class="community-chip"><span class="chip-label">${{c.label}}</span><span class="chip-size">${{c.size}} nodes</span></div>`).join('');
   const modes = [
-    {{col:'#D97757',lbl:'Keyword scan',   desc:'BM25-style · proper-noun boost · TF component · meeting-person boost'}},
-    {{col:'#4285F4',lbl:'Graph spread',   desc:'Spreading activation · multi-hop entity graph · surfaces related files'}},
-    {{col:'#34A853',lbl:'Wiki scan',      desc:'Index-based topic lookup · mtime-cached · proper-noun 3× boost'}},
+    {{col:'#D97757',lbl:'Keyword scan (30+)', desc:'BM25-style · proper-noun boost · stemming · synonym expansion · fuzzy PN matching'}},
+    {{col:'#4285F4',lbl:'Graph spread',       desc:'Spreading activation · multi-hop entity graph · surfaces related files'}},
+    {{col:'#34A853',lbl:'Wiki scan (QMD)',     desc:'QMD BM25 on 2000+ compiled wiki pages · falls back to _index.md token scan'}},
+    {{col:'#a855f7',lbl:'Haiku curator',      desc:'LLM selects ≤10 files from ~40 candidates · reasoning shown in sidebar'}},
+    {{col:'#0891b2',lbl:'Haiku monitor',      desc:'Post-response context update · adds/removes files for next turn'}},
   ].map(m=>`<div class="mode-row"><div class="mode-accent" style="background:${{m.col}}"></div>
     <div><div class="mode-label">${{m.lbl}}</div><div class="mode-desc">${{m.desc}}</div></div></div>`).join('');
 
