@@ -993,6 +993,178 @@ def chat_interject():
 
 # ─── Stats API ────────────────────────────────────────────────────────────────
 
+# ─── Pinned answers ───────────────────────────────────────────────────────────
+# Users can pin an assistant answer from the chat. Pinned items show up on the
+# Top of Mind tab and clicking restores the chat with that conversation's
+# context so the user can keep going from that point.
+
+_pinned_lock = threading.Lock()
+
+
+def _pinned_index_path(memory_path: Path) -> Path:
+    return memory_path / "pinned" / "index.json"
+
+
+def _load_pinned_index(memory_path: Path) -> list:
+    p = _pinned_index_path(memory_path)
+    if not p.exists():
+        return []
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return []
+
+
+def _save_pinned_index(memory_path: Path, items: list) -> None:
+    p = _pinned_index_path(memory_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with _pinned_lock:
+        p.write_text(json.dumps(items, indent=2))
+
+
+@app.route("/api/pinned/list")
+def pinned_list():
+    cfg = get_cfg()
+    items = _load_pinned_index(cfg.memory_path)
+    items.sort(key=lambda p: p.get("pinned_at", ""), reverse=True)
+    return jsonify({"items": items})
+
+
+@app.route("/api/pinned/add", methods=["POST"])
+def pinned_add():
+    """Pin an assistant answer. Body: {session_id, turn_index, title?}.
+
+    Reads the live session file to capture the user msg + assistant text +
+    active context at that turn — those are the source of truth, not whatever
+    the client thinks.
+    """
+    import uuid as _uuid
+
+    cfg = get_cfg()
+    body = request.get_json(force=True, silent=True) or {}
+    session_id = (body.get("session_id", "") or "").strip()
+    turn_index = body.get("turn_index")
+    title      = (body.get("title", "") or "").strip()[:160]
+    if not session_id or turn_index is None:
+        return jsonify({"error": "session_id and turn_index required"}), 400
+
+    try:
+        from engram.memory.session_harvester import parse_session_file
+        turns = parse_session_file(cfg.memory_path, session_id)
+    except Exception:
+        print("[pinned/add] parse error:\n" + traceback.format_exc(), flush=True)
+        return jsonify({"error": "could not read session file"}), 500
+
+    try:
+        ti = int(turn_index)
+    except Exception:
+        return jsonify({"error": "turn_index must be an integer"}), 400
+    if ti < 0 or ti >= len(turns):
+        return jsonify({"error": f"turn_index {ti} out of range (0–{len(turns)-1})"}), 400
+
+    turn = turns[ti]
+    user_msg = (turn.get("user") or "").strip()
+    asst     = (turn.get("assistant") or "").strip()
+    auto_title = user_msg.split("\n", 1)[0][:140] or "Pinned answer"
+
+    pin = {
+        "pin_id":            f"pin_{int(time.time())}_{_uuid.uuid4().hex[:8]}",
+        "session_id":        session_id,
+        "turn_index":        ti,
+        "turn_ts":           turn.get("ts", ""),
+        "title":             title or auto_title,
+        "user_msg":          user_msg[:600],
+        "assistant_snippet": asst[:600],
+        "active_context":    turn.get("active_context", []),
+        "pinned_at":         datetime.now().isoformat(timespec="seconds"),
+    }
+
+    items = _load_pinned_index(cfg.memory_path)
+    # If this exact (session, turn_index) is already pinned, return that record
+    # rather than creating a duplicate.
+    existing = next(
+        (it for it in items
+         if it.get("session_id") == session_id and it.get("turn_index") == ti),
+        None,
+    )
+    if existing:
+        return jsonify(existing)
+
+    items.append(pin)
+    _save_pinned_index(cfg.memory_path, items)
+    return jsonify(pin)
+
+
+@app.route("/api/pinned/remove", methods=["POST"])
+def pinned_remove():
+    cfg = get_cfg()
+    body = request.get_json(force=True, silent=True) or {}
+    pin_id = (body.get("pin_id", "") or "").strip()
+    # Allow remove by (session_id, turn_index) for the unpin button on bubbles
+    session_id = (body.get("session_id", "") or "").strip()
+    turn_index = body.get("turn_index")
+
+    items = _load_pinned_index(cfg.memory_path)
+    before = len(items)
+    if pin_id:
+        items = [it for it in items if it.get("pin_id") != pin_id]
+    elif session_id and turn_index is not None:
+        try:
+            ti = int(turn_index)
+        except Exception:
+            return jsonify({"error": "turn_index invalid"}), 400
+        items = [it for it in items
+                 if not (it.get("session_id") == session_id and it.get("turn_index") == ti)]
+    else:
+        return jsonify({"error": "pin_id or (session_id, turn_index) required"}), 400
+
+    if len(items) == before:
+        return jsonify({"removed": 0})
+    _save_pinned_index(cfg.memory_path, items)
+    return jsonify({"removed": before - len(items)})
+
+
+@app.route("/api/pinned/restore")
+def pinned_restore():
+    """Return the conversation up through a pinned turn so the chat tab can
+    rehydrate. Frontend swaps SESSION_ID to match so new turns continue the
+    same session file.
+    """
+    cfg = get_cfg()
+    pin_id = (request.args.get("pin_id", "") or "").strip()
+    if not pin_id:
+        return jsonify({"error": "pin_id required"}), 400
+
+    items = _load_pinned_index(cfg.memory_path)
+    record = next((it for it in items if it.get("pin_id") == pin_id), None)
+    if not record:
+        return jsonify({"error": "pin not found"}), 404
+
+    try:
+        from engram.memory.session_harvester import parse_session_file
+        turns = parse_session_file(cfg.memory_path, record["session_id"])
+    except Exception:
+        return jsonify({"error": "could not read session"}), 500
+
+    ti = record["turn_index"]
+    if ti >= len(turns):
+        return jsonify({"error": "turn_index past end of session — file may have been truncated"}), 400
+
+    messages: list = []
+    for t in turns[: ti + 1]:
+        messages.append({"role": "user",      "content": t.get("user", "")})
+        messages.append({"role": "assistant", "content": t.get("assistant", "")})
+
+    return jsonify({
+        "pin":            record,
+        "session_id":     record["session_id"],
+        "messages":       messages,
+        "active_context": turns[ti].get("active_context", []),
+        "turn_index":     ti,
+        "total_turns":    len(turns),
+    })
+
+
 @app.route("/api/sessions/harvest", methods=["POST"])
 def sessions_harvest():
     """Manually trigger harvest for a session.
@@ -2079,22 +2251,21 @@ def top_of_mind():
         except Exception:
             pass
 
-    # 2) Pending proposals (newest first within salience tier)
-    proposals_out: list = []
+    # 2) Pinned chat answers — user pinned them while chatting; clicking
+    # restores the conversation with full context so they can keep going.
+    pinned_out: list = []
     try:
-        idx = load_proposals_index(mem / "proposals" / "index.json")
-        pending = [p for p in idx if p.get("status") == "pending"]
-        pending.sort(key=lambda p: p.get("ts", ""), reverse=True)
-        pending.sort(key=lambda p: p.get("salience") or 0, reverse=True)
-        for p in pending[:30]:
-            proposals_out.append({
-                "uid":       p.get("uid", ""),
-                "path":      p.get("path", ""),
-                "operation": p.get("operation", "update"),
-                "reason":    (p.get("reason") or "")[:240],
-                "salience":  round(p.get("salience") or 0, 2),
-                "source":    p.get("source", ""),
-                "ts":        (p.get("ts") or "")[:10],
+        items = _load_pinned_index(mem)
+        items.sort(key=lambda p: p.get("pinned_at", ""), reverse=True)
+        for p in items[:30]:
+            pinned_out.append({
+                "pin_id":            p.get("pin_id", ""),
+                "title":             p.get("title", "")[:160],
+                "user_msg":          (p.get("user_msg") or "")[:240],
+                "assistant_snippet": (p.get("assistant_snippet") or "")[:280],
+                "session_id":        p.get("session_id", ""),
+                "turn_index":        p.get("turn_index", 0),
+                "pinned_at":         p.get("pinned_at", ""),
             })
     except Exception:
         pass
@@ -2121,7 +2292,7 @@ def top_of_mind():
 
     return jsonify({
         "events":    events_out,
-        "proposals": proposals_out,
+        "pinned":    pinned_out,
         "deadlines": deadlines_out,
         "deadlines_meta": {
             "extracted_at": extracted_at,
@@ -2129,7 +2300,7 @@ def top_of_mind():
         },
         "counts": {
             "events":    len(events_out),
-            "proposals": len(proposals_out),
+            "pinned":    len(pinned_out),
             "deadlines": len(deadlines_out),
         },
         "days_ahead": days_ahead,
@@ -2414,6 +2585,17 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .export-btn:hover {{ border-color: #D97757; color: #D97757; background: #fff8f5; }}
 .export-btn.loading {{ opacity: .5; pointer-events: none; }}
 .export-btn.done {{ border-color: #34A853; color: #34A853; }}
+
+/* Pin button — appears below assistant bubbles, lets user pin to Top of Mind */
+.pin-btn {{ display: inline-flex; align-items: center; gap: 4px; margin-top: 8px;
+            padding: 4px 11px; border-radius: 14px; border: 1px solid #e0e0e0;
+            background: #fff; font-size: 11px; color: #777; cursor: pointer;
+            transition: all .15s; opacity: 0; }}
+.message.assistant:hover .pin-btn,
+.pin-btn.pinned {{ opacity: 1; }}
+.pin-btn:hover {{ border-color: #D97757; color: #D97757; }}
+.pin-btn.pinned {{ border-color: #D97757; color: #D97757; background: #fff8f5; font-weight: 600; }}
+.pin-btn:disabled {{ opacity: .5; cursor: wait; }}
 
 /* Outputs panel in sidebar */
 .outputs-section {{ border-top: 1px solid #efefef; padding: 8px 0; }}
@@ -2864,7 +3046,8 @@ let rawDocs       = [];      // [{{name, content}}, ...] injected by user
 // One stable id per browser tab. Sent with every /api/chat request so the
 // server can append turns to MEMORY/sessions/<YYYY-MM>/chat_<id>.md, making
 // past conversations retrievable by future sessions via the curator's scan.
-const SESSION_ID = (function() {{
+// `let` (not const) so restoring a pinned conversation can swap it.
+let SESSION_ID = (function() {{
   try {{
     return (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
       : 'sess_' + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
@@ -2872,6 +3055,10 @@ const SESSION_ID = (function() {{
     return 'sess_' + Date.now();
   }}
 }})();
+
+// Tracks how many (user, assistant) pairs have been completed in this
+// session — used as the turn_index when pinning an answer.
+let TURN_INDEX = 0;
 
 // ── Auto-resize textarea ───────────────────────────────────────────────────
 const input = document.getElementById('input');
@@ -3017,7 +3204,12 @@ function _doSend(text, opts) {{
         if (done) {{
           assistantEl.querySelector('.bubble').classList.remove('typing');
           messages.push({{role:'assistant', content: assistantText}});
-          if (assistantText.trim()) addExportBar(assistantEl, assistantText);
+          if (assistantText.trim()) {{
+            addExportBar(assistantEl, assistantText);
+            // This is now a complete turn — let the user pin it.
+            const myTurn = TURN_INDEX++;
+            addPinButton(assistantEl, myTurn);
+          }}
           streaming = false;
           currentAssistantEl = null;
 
@@ -3216,6 +3408,134 @@ const EXPORT_FMTS = [
   {{ fmt: 'pptx', icon: '📊', label: 'PPTX' }},
   {{ fmt: 'pdf',  icon: '📄', label: 'PDF'  }},
 ];
+
+// ── Pin / unpin chat answers ─────────────────────────────────────────────
+function addPinButton(msgEl, turnIndex) {{
+  const btn = document.createElement('button');
+  btn.className   = 'pin-btn';
+  btn.title       = 'Pin this answer to your Top of Mind';
+  btn.dataset.ti  = String(turnIndex);
+  btn.textContent = '📌 Pin';
+  btn.onclick = async () => {{
+    if (btn.disabled) return;
+    btn.disabled = true;
+    if (btn.dataset.pinned === '1') {{
+      // Unpin
+      try {{
+        await fetch('/api/pinned/remove', {{
+          method:  'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body:    JSON.stringify({{session_id: SESSION_ID, turn_index: turnIndex}}),
+        }});
+        btn.dataset.pinned = '';
+        btn.dataset.pinId  = '';
+        btn.textContent    = '📌 Pin';
+        btn.classList.remove('pinned');
+      }} catch (e) {{}}
+    }} else {{
+      // Pin
+      try {{
+        const r = await fetch('/api/pinned/add', {{
+          method:  'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body:    JSON.stringify({{session_id: SESSION_ID, turn_index: turnIndex}}),
+        }});
+        const j = await r.json();
+        if (j.pin_id) {{
+          btn.dataset.pinned = '1';
+          btn.dataset.pinId  = j.pin_id;
+          btn.textContent    = '📍 Pinned';
+          btn.classList.add('pinned');
+        }}
+      }} catch (e) {{}}
+    }}
+    btn.disabled = false;
+  }};
+  msgEl.appendChild(btn);
+  return btn;
+}}
+
+async function restorePinnedConversation(pinId) {{
+  if (!pinId) return;
+  let r;
+  try {{
+    r = await fetch('/api/pinned/restore?pin_id=' + encodeURIComponent(pinId));
+  }} catch (e) {{
+    alert('Could not reach server'); return;
+  }}
+  const j = await r.json();
+  if (j.error) {{ alert('Restore failed: ' + j.error); return; }}
+
+  // Switch to the chat tab in-place (preserves URL via pushState).
+  switchTab(null, 'chat');
+
+  // Hard reset of chat state, then rehydrate from the server's view.
+  SESSION_ID = j.session_id;
+  messages   = [];
+  rawDocs    = [];
+  activeContext = [];
+  pinnedPaths   = new Set(j.active_context || []);
+  TURN_INDEX = 0;
+  pendingFollowup = null;
+
+  const msgsEl = document.getElementById('messages');
+  if (msgsEl) msgsEl.innerHTML = '';
+  document.getElementById('empty-state')?.remove();
+
+  // Rehydrate bubbles. j.messages is alternating user/assistant.
+  for (let i = 0; i < j.messages.length; i += 2) {{
+    const u = j.messages[i];
+    const a = j.messages[i + 1];
+    if (u) {{
+      messages.push(u);
+      appendBubble('user', u.content || '');
+    }}
+    if (a) {{
+      messages.push(a);
+      const aEl = appendBubble('assistant', a.content || '');
+      if ((a.content || '').trim()) {{
+        addExportBar(aEl, a.content);
+        const ti = TURN_INDEX++;
+        const pinBtn = addPinButton(aEl, ti);
+        // Pre-mark the originally-pinned turn
+        if (ti === j.turn_index) {{
+          pinBtn.dataset.pinned = '1';
+          pinBtn.dataset.pinId  = j.pin && j.pin.pin_id;
+          pinBtn.textContent    = '📍 Pinned';
+          pinBtn.classList.add('pinned');
+        }}
+      }}
+    }}
+  }}
+
+  // Update sidebar count + render pinned context as preserved files.
+  const list = document.getElementById('ctx-list');
+  if (list) list.innerHTML = '';
+  (j.active_context || []).forEach(p => {{
+    activeContext.push({{path: p, type: 'memory'}});
+    const el = makeCtxItem(p, 'memory');
+    el.dataset.path = p;
+    if (list) list.appendChild(el);
+  }});
+  const countEl = document.getElementById('ctx-count');
+  if (countEl) countEl.textContent = `${{activeContext.length}} restored from pinned turn`;
+  const reasonEl = document.getElementById('ctx-reasoning');
+  if (reasonEl) reasonEl.textContent = `Resumed conversation from pin · turn ${{j.turn_index + 1}} of ${{j.total_turns}}`;
+
+  scrollToBottom();
+}}
+
+function _agoStr(iso) {{
+  if (!iso) return '';
+  try {{
+    const t = new Date(iso).getTime();
+    const m = Math.round((Date.now() - t) / 60000);
+    if (m < 1)   return 'just now';
+    if (m < 60)  return `${{m}}m ago`;
+    if (m < 1440) return `${{Math.round(m/60)}}h ago`;
+    return `${{Math.round(m/1440)}}d ago`;
+  }} catch (e) {{ return ''; }}
+}}
 
 function addExportBar(msgEl, content) {{
   const bar = document.createElement('div');
@@ -3579,7 +3899,7 @@ function escHtml(s) {{
 
 function renderTopOfMind(data) {{
   const events    = data.events    || [];
-  const proposals = data.proposals || [];
+  const pinned    = data.pinned    || [];
   const deadlines = data.deadlines || [];
 
   // High-stakes events grouped by day, tagged with why-they-surface
@@ -3611,25 +3931,19 @@ function renderTopOfMind(data) {{
     }}).join('') + '</div>';
   }}
 
-  // Pending proposals
-  let prHtml = '';
-  if (proposals.length === 0) {{
-    prHtml = '<div class="tom-empty">No pending proposals.</div>';
+  // Pinned chat answers — click to restore the conversation in the Chat tab
+  let pnHtml = '';
+  if (pinned.length === 0) {{
+    pnHtml = '<div class="tom-empty">No pinned answers yet. Pin one with the 📌 below any chat reply.</div>';
   }} else {{
-    prHtml = '<div class="tom-list">' + proposals.map(p => {{
-      const op = p.operation || 'update';
-      const opColor = op === 'create' ? '#34A853' : op === 'delete' ? '#c06040' : '#4285F4';
+    pnHtml = '<div class="tom-list">' + pinned.map(p => {{
+      const ageStr = _agoStr(p.pinned_at);
       return `
-        <div class="tom-item" onclick="openFilePreview('${{escHtml(p.path).replace(/'/g, "\\\\'")}}')" style="cursor:pointer">
-          <div class="tom-item-row">
-            <div class="tom-item-meta" style="color:${{opColor}};font-weight:600">${{escHtml(op)}}</div>
-            <div class="tom-item-main">
-              <div class="tom-item-path">${{escHtml(p.path)}}</div>
-              ${{p.reason ? `<div class="tom-item-aux">${{escHtml(p.reason)}}</div>` : ''}}
-            </div>
-          </div>
-          <div class="tom-item-aux" style="margin-top:4px">
-            ${{escHtml(p.source)}} · salience ${{p.salience}} · ${{escHtml(p.ts)}}
+        <div class="tom-item" onclick="restorePinnedConversation('${{escHtml(p.pin_id)}}')" style="cursor:pointer">
+          <div class="tom-item-main">
+            <div style="font-weight:600;font-size:12.5px;margin-bottom:3px">${{escHtml(p.title)}}</div>
+            ${{p.assistant_snippet ? `<div class="tom-item-aux" style="font-style:italic;color:#666;line-height:1.45">${{escHtml(p.assistant_snippet.slice(0, 200))}}${{p.assistant_snippet.length > 200 ? '…' : ''}}</div>` : ''}}
+            <div class="tom-item-aux" style="margin-top:5px;color:#aaa">📌 ${{ageStr}} · click to resume →</div>
           </div>
         </div>`;
     }}).join('') + '</div>';
@@ -3680,11 +3994,11 @@ function renderTopOfMind(data) {{
     </div>
     <div class="tom-col proposals">
       <div class="tom-col-stripe"></div>
-      <div class="tom-col-num">Decisions</div>
-      <div class="tom-col-title">Pending proposals</div>
-      <div class="tom-col-sub">Memory writes awaiting save / skip · ranked by salience</div>
-      <div class="tom-col-count">${{proposals.length}} pending</div>
-      <div style="margin-top:14px">${{prHtml}}</div>
+      <div class="tom-col-num">Bookmarks</div>
+      <div class="tom-col-title">Pinned</div>
+      <div class="tom-col-sub">Saved chat answers · click to resume the conversation</div>
+      <div class="tom-col-count">${{pinned.length}} saved</div>
+      <div style="margin-top:14px">${{pnHtml}}</div>
     </div>
     <div class="tom-col questions">
       <div class="tom-col-stripe"></div>
