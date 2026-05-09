@@ -783,13 +783,15 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 /* Chat main */
 .chat-main {{ flex: 1; display: flex; flex-direction: column; overflow: hidden; }}
 .messages {{ flex: 1; overflow-y: auto; padding: 24px 0; }}
-.message {{ max-width: 720px; margin: 0 auto 20px; padding: 0 24px; }}
+.message {{ width: 100%; margin: 0 0 20px; padding: 0 28px; }}
 .message.user   {{ display: flex; justify-content: flex-end; }}
 .message.assistant {{ display: flex; justify-content: flex-start; }}
-.bubble {{ padding: 12px 16px; border-radius: 12px; font-size: 14px; line-height: 1.65;
-           max-width: 90%; white-space: pre-wrap; }}
-.message.user .bubble {{ background: #1a1a1a; color: #fff; border-radius: 12px 12px 2px 12px; }}
-.message.assistant .bubble {{ background: #f5f5f5; color: #1a1a1a; border-radius: 12px 12px 12px 2px; }}
+.bubble {{ padding: 12px 18px; border-radius: 12px; font-size: 14px; line-height: 1.65;
+           white-space: pre-wrap; }}
+.message.user .bubble {{ background: #1a1a1a; color: #fff; border-radius: 12px 12px 2px 12px;
+                          max-width: 72%; }}
+.message.assistant .bubble {{ background: #f5f5f5; color: #1a1a1a; border-radius: 12px 12px 12px 2px;
+                               width: 100%; }}
 .bubble a {{ color: #4285F4; }}
 .typing {{ display: inline-block; }}
 .typing::after {{ content: '▋'; animation: blink .7s infinite; }}
@@ -803,8 +805,8 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .empty-sub {{ font-size: 13px; color: #bbb; }}
 
 /* Input bar */
-.input-bar {{ padding: 16px 24px; border-top: 1px solid #e8e8e8; background: #fff; }}
-.input-wrap {{ max-width: 720px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }}
+.input-bar {{ padding: 16px 28px; border-top: 1px solid #e8e8e8; background: #fff; }}
+.input-wrap {{ display: flex; gap: 10px; align-items: flex-end; }}
 .input-box {{ flex: 1; border: 1px solid #ddd; border-radius: 10px; padding: 10px 14px;
               font-size: 14px; font-family: inherit; resize: none; outline: none;
               line-height: 1.5; max-height: 160px; overflow-y: auto;
