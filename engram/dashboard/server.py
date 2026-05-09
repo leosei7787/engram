@@ -40,7 +40,8 @@ from engram.retrieval.pipeline import memory_scan
 from engram.retrieval.curator import build_candidates, curate_context, monitor_context, detect_drift
 from engram.ingest.watcher import InboxWatcher
 from engram.ingest.cleaner import EmailCleaner
-from engram.ingest.ics import parse_ics, format_agenda
+from engram.ingest.ics import parse_ics, format_agenda, upcoming as ics_upcoming
+from engram.memory.proposals import load_index as load_proposals_index
 
 app = Flask(__name__)
 _cfg: EngramConfig | None = None
@@ -806,29 +807,37 @@ def stats():
 
 @app.route("/api/file")
 def serve_file():
-    """Return raw text content of a memory or wiki file for preview."""
+    """Return raw text content of a memory or wiki file for preview.
+
+    Paths may arrive in multiple forms — graph.json stores them with the
+    "MEMORY/" prefix (relative to base_path); keyword scan emits paths
+    relative to memory_path; wiki paths can be absolute. Try each root.
+    """
     cfg  = get_cfg()
     path = request.args.get("path", "").strip()
     if not path or path.startswith("__raw__"):
         return jsonify({"error": "no path"}), 400
 
-    p = Path(path) if Path(path).is_absolute() else cfg.memory_path / path
-    if not p.exists():
-        p2 = cfg.wiki_path / path
-        if p2.exists():
-            p = p2
+    candidates: list[Path] = []
+    if Path(path).is_absolute():
+        candidates.append(Path(path))
+    else:
+        # base_path + "MEMORY/foo" → memory file (graph.json convention)
+        candidates.append(cfg.base_path / path)
+        # memory_path + "foo"      → bare relative path (legacy / keyword scan)
+        candidates.append(cfg.memory_path / path)
+        # wiki_path + "foo"        → wiki page
+        candidates.append(cfg.wiki_path / path)
 
-    if not p.exists() or not p.is_file():
+    p = next((c for c in candidates if c.exists() and c.is_file()), None)
+    if p is None:
         return jsonify({"error": "not found"}), 404
 
-    # Safety: must be inside memory_path or wiki_path
-    try:
-        p.resolve().relative_to(cfg.memory_path.resolve())
-    except ValueError:
-        try:
-            p.resolve().relative_to(cfg.wiki_path.resolve())
-        except ValueError:
-            return jsonify({"error": "forbidden"}), 403
+    # Safety: must resolve inside memory_path, wiki_path, or base_path
+    abs_p = p.resolve()
+    roots = [cfg.memory_path.resolve(), cfg.wiki_path.resolve(), cfg.base_path.resolve()]
+    if not any(str(abs_p).startswith(str(r)) for r in roots):
+        return jsonify({"error": "forbidden"}), 403
 
     content = p.read_text(errors="ignore")[:24000]
     return jsonify({"path": str(p), "name": p.name, "content": content})
@@ -1472,13 +1481,275 @@ def recent_activity():
     return jsonify({"items": items[:50], "total": len(items)})
 
 
+# ─── Top of Mind ──────────────────────────────────────────────────────────────
+# Curates *executive-level* signal from the next two weeks: high-stakes
+# meetings, decisions awaiting save, and deadlines extracted from recent
+# emails. Filtered, not exhaustive — the calendar tab is for everything.
+
+# Words that suggest an event is decision-grade or executive.
+# Matched as whole words (\b…\b) — so "coo" won't fire on "Watercooler".
+_EXEC_KEYWORD_WEIGHTS: dict = {
+    # Decisions & approvals
+    "qbr": 1.6, "go/no-go": 1.6, "go-no-go": 1.6, "approval": 1.2, "approve": 1.0,
+    "decision": 1.2, "sign-off": 1.2, "milestone": 0.9,
+    # Forums
+    "board":     1.5, "steering":  1.4, "committee": 1.0, "council":   1.0,
+    "executive": 1.1, "exec":      0.9, "leadership":1.0, "c-level":   1.4,
+    # Senior individuals
+    "ceo":       1.3, "cfo": 1.2, "cto": 1.2, "cmo": 1.2, "coo": 1.2,
+    "svp":       1.0, "evp": 1.0, "vp": 0.7,
+    # High-stakes commercial
+    "negotiation":   1.0, "contract": 0.9, "rfp": 1.1, "rfq": 0.9, "tender": 0.9,
+    "kickoff":  0.7, "go-live": 1.0, "launch":  0.7,
+    # Strategy / planning
+    "roadmap": 0.7, "okr": 0.7,
+}
+_EXEC_KEYWORD_RX = {
+    kw: re.compile(r"(?<!\w)" + re.escape(kw) + r"(?!\w)", re.IGNORECASE)
+    for kw in _EXEC_KEYWORD_WEIGHTS
+}
+
+# Words that demote an event regardless of other signals.
+_PERSONAL_SKIP_RX = re.compile(
+    r"\b(kids|drop[- ]off|pickup|pick up|school|dentist|doctor|"
+    r"vacation|holiday|ooo|out of office|dns|do not schedule|"
+    r"focus time|lunch|gym|workout|haircut|commute)\b",
+    re.IGNORECASE,
+)
+
+# 1:1s — bilateral meetings; can be high-stakes but usually aren't.
+_ONE_ON_ONE_RX = re.compile(r"\b(1[:\-]?1|one[- ]on[- ]one)\b", re.IGNORECASE)
+
+
+def _classify_event(e) -> tuple[float, list[str]]:
+    """Return (score, tags) for an event. Score >= 0; tags explain the why."""
+    text = " ".join(filter(None, [e.summary or "", e.location or "", e.organizer or ""])).lower()
+
+    if _PERSONAL_SKIP_RX.search(text):
+        return (0.0, ["personal"])
+
+    score = 0.0
+    tags: list[str] = []
+    for kw, w in _EXEC_KEYWORD_WEIGHTS.items():
+        if _EXEC_KEYWORD_RX[kw].search(text):
+            score += w
+            tags.append(kw)
+
+    # Structural signals
+    try:
+        duration_min = (e.end - e.start).total_seconds() / 60
+    except Exception:
+        duration_min = 60
+    if duration_min >= 90 and not e.all_day:
+        score += 0.4
+        tags.append("long")
+    if e.all_day:
+        score += 0.5
+        tags.append("all-day")
+    if e.location and "Microsoft Teams" not in e.location and "Skype" not in e.location:
+        score += 0.3
+        tags.append("in-person")
+
+    # 1:1 demotion (only if no exec keyword fired)
+    if _ONE_ON_ONE_RX.search(text) and score < 1.0:
+        score *= 0.4
+        tags.append("1:1")
+
+    return (round(score, 2), tags[:5])
+
+
+# Deadline extraction from recent emails.
+# A "date-like tail" — what we want as the actual deadline value.
+_DATE_TAIL = (
+    r"(?:EOD|EOW|"
+    r"end\s+of\s+(?:day|week|month|next\s+week|the\s+\w+|\w+day)|"
+    r"tomorrow|today|tonight|"
+    r"next\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|week|month)\w*|"
+    r"this\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*|"
+    r"(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day(?:\s+\d{1,2}(?:st|nd|rd|th)?)?|"
+    r"\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*|"
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2}(?:st|nd|rd|th)?|"
+    r"\d{4}-\d{2}-\d{2}|"
+    r"\d{1,2}/\d{1,2}(?:/\d{2,4})?"
+    r")"
+)
+_DEADLINE_RX = re.compile(
+    r"(?:"
+    # "deadline:" / "deadline is" — keyword strong enough to take any short tail
+    r"deadline(?:\s+is)?\s*[:\-]\s*(?P<d1>[^\.\n;<]{2,80})"
+    # "due by/on/before <date>"
+    r"|\bdue\s+(?:by|on|before)\s+(?P<d2>" + _DATE_TAIL + r"[^\.\n;<]{0,40})"
+    # "due date: ..." / "target date: ..."
+    r"|(?:due|target)\s+date\s*[:\-]\s*(?P<d3>[^\.\n;<]{2,60})"
+    # "submit by/before <date>"
+    r"|submit(?:\w+)?\s+(?:by|before)\s+(?P<d4>" + _DATE_TAIL + r"[^\.\n;<]{0,40})"
+    # "needs to be done|completed|sent|delivered|finalized|reviewed by <date>"
+    r"|need(?:s|ed)?\s+(?:to\s+be\s+)?(?:done|completed|sent|delivered|finalized|reviewed|signed[- ]?off)\s+by\s+(?P<d5>" + _DATE_TAIL + r"[^\.\n;<]{0,40})"
+    # Generic "by <date>" only when followed by a date-like token (avoids "by then" / "by us")
+    r"|\bby\s+(?P<d6>" + _DATE_TAIL + r")"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _extract_deadlines_from_emails(mem: Path, days_back: int = 14, limit: int = 20) -> list[dict]:
+    """Scan recent email files for deadline mentions. Returns list of hits."""
+    emails_dir = mem / "daily" / "emails"
+    if not emails_dir.exists():
+        return []
+    cutoff = time.time() - days_back * 86400
+    hits: list[dict] = []
+    for f in emails_dir.glob("*.md"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                continue
+            text = f.read_text(errors="ignore")[:6000]
+        except Exception:
+            continue
+
+        # Pull subject line (frontmatter or first H1) for display
+        subject = f.stem.replace("email_", "").replace("_", " ")
+        # Drop trailing ".digest" suffix that some processed emails carry
+        if subject.endswith(".digest"):
+            subject = subject[:-len(".digest")]
+        m = re.search(r"^(?:subject|Subject)\s*[:=]\s*(.+)$", text, re.MULTILINE)
+        if m:
+            subject = m.group(1).strip().strip('"').strip("'")
+
+        for match in _DEADLINE_RX.finditer(text):
+            phrase = next((g for g in match.groupdict().values() if g), "").strip(" :-,")
+            if not phrase or len(phrase) < 2:
+                continue
+            # Pull a short context window around the match
+            start = max(0, match.start() - 40)
+            end = min(len(text), match.end() + 40)
+            ctx = re.sub(r"\s+", " ", text[start:end]).strip()
+
+            hits.append({
+                "subject": subject[:120],
+                "phrase":  phrase[:80],
+                "context": ctx[:180],
+                "rel":     str(f.relative_to(mem)),
+                "mtime":   f.stat().st_mtime,
+            })
+            break  # one deadline per email, keep it tidy
+
+    hits.sort(key=lambda h: h["mtime"], reverse=True)
+    return hits[:limit]
+
+
+@app.route("/api/top-of-mind")
+def top_of_mind():
+    cfg = get_cfg()
+    mem = cfg.memory_path
+    days_ahead = int(request.args.get("days", 14))
+
+    # 1) Curated calendar events — only executive-grade
+    events_out: list = []
+    ics_search_dirs: list[Path] = []
+    try:
+        inbox = getattr(cfg.paths, "inbox_src", None) if hasattr(cfg, "paths") else None
+        if inbox and Path(inbox).exists():
+            ics_search_dirs.append(Path(inbox))
+    except Exception:
+        pass
+    ics_search_dirs.append(mem)
+
+    ics_hits: list[Path] = []
+    for d in ics_search_dirs:
+        try:
+            ics_hits.extend(d.rglob("*.ics"))
+        except Exception:
+            continue
+
+    if ics_hits:
+        try:
+            ics_file = max(ics_hits, key=lambda f: f.stat().st_mtime)
+            evs = parse_ics(ics_file)
+            scored: list = []
+            for e in ics_upcoming(evs, days_ahead=days_ahead):
+                score, tags = _classify_event(e)
+                if score < 0.6:
+                    continue
+                scored.append((score, tags, e))
+            # Sort: by date asc within score-tier; cap at 12.
+            scored.sort(key=lambda x: x[2].start)
+            scored.sort(key=lambda x: x[0], reverse=True)
+            for score, tags, e in scored[:12]:
+                local = e.start.astimezone()
+                local_end = e.end.astimezone()
+                if e.all_day:
+                    tline = "all-day"
+                else:
+                    tline = local.strftime("%H:%M") + "–" + local_end.strftime("%H:%M")
+                events_out.append({
+                    "date":      local.strftime("%a %d %b"),
+                    "iso":       local.strftime("%Y-%m-%d"),
+                    "time":      tline,
+                    "summary":   (e.summary or "")[:140],
+                    "location":  "" if (e.location and ("Microsoft Teams" in e.location or "Skype" in e.location)) else (e.location or "")[:60],
+                    "organizer": (e.organizer.split("@")[0] if e.organizer and "@" in e.organizer else ""),
+                    "score":     score,
+                    "tags":      tags,
+                })
+            # Re-sort for display by date asc so the timeline reads naturally.
+            events_out.sort(key=lambda x: x["iso"])
+        except Exception:
+            pass
+
+    # 2) Pending proposals (newest first within salience tier)
+    proposals_out: list = []
+    try:
+        idx = load_proposals_index(mem / "proposals" / "index.json")
+        pending = [p for p in idx if p.get("status") == "pending"]
+        pending.sort(key=lambda p: p.get("ts", ""), reverse=True)
+        pending.sort(key=lambda p: p.get("salience") or 0, reverse=True)
+        for p in pending[:30]:
+            proposals_out.append({
+                "uid":       p.get("uid", ""),
+                "path":      p.get("path", ""),
+                "operation": p.get("operation", "update"),
+                "reason":    (p.get("reason") or "")[:240],
+                "salience":  round(p.get("salience") or 0, 2),
+                "source":    p.get("source", ""),
+                "ts":        (p.get("ts") or "")[:10],
+            })
+    except Exception:
+        pass
+
+    # 3) Deadlines harvested from recent emails
+    deadlines_out: list = []
+    try:
+        deadlines_out = _extract_deadlines_from_emails(mem, days_back=14, limit=15)
+    except Exception:
+        pass
+
+    return jsonify({
+        "events":    events_out,
+        "proposals": proposals_out,
+        "deadlines": deadlines_out,
+        "counts": {
+            "events":    len(events_out),
+            "proposals": len(proposals_out),
+            "deadlines": len(deadlines_out),
+        },
+        "days_ahead": days_ahead,
+    })
+
+
 # ─── Main page ────────────────────────────────────────────────────────────────
 
 @app.route("/")
 @app.route("/health")
+@app.route("/top-of-mind")
 def index():
     cfg          = get_cfg()
-    active_tab   = "health" if request.path == "/health" else "chat"
+    if request.path == "/health":
+        active_tab = "health"
+    elif request.path == "/top-of-mind":
+        active_tab = "top-of-mind"
+    else:
+        active_tab = "chat"
     return _build_html(cfg, active_tab), 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
@@ -1855,6 +2126,63 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .mode-desc  {{ font-size: 10px; color: #aaa; margin-top: 2px; line-height: 1.5; }}
 
 .loading {{ color: #ccc; font-size: 12px; padding: 16px 0; text-align: center; }}
+
+/* ═══════════════════════════════════════════
+   TOP OF MIND PANEL
+═══════════════════════════════════════════ */
+.tom-layout {{ width: 100%; height: 100%; overflow-y: auto; background: #fafafa; }}
+.tom-inner  {{ max-width: 1200px; margin: 0 auto; padding: 28px 32px; }}
+.tom-title  {{ font-size: 20px; font-weight: 700; color: #1a1a1a; margin-bottom: 4px; }}
+.tom-sub    {{ font-size: 13px; color: #999; margin-bottom: 28px; }}
+
+.tom-cols {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }}
+@media (max-width: 980px) {{ .tom-cols {{ grid-template-columns: 1fr; }} }}
+
+.tom-col {{ background: #fff; border-radius: 12px; border: 1px solid #e8e8e8;
+            padding: 22px 20px; overflow: hidden; }}
+.tom-col-stripe {{ height: 3px; border-radius: 2px; margin: -22px -20px 18px; }}
+.tom-col.events    .tom-col-stripe {{ background: #4285F4; }}
+.tom-col.proposals .tom-col-stripe {{ background: #D97757; }}
+.tom-col.questions .tom-col-stripe {{ background: #34A853; }}
+.tom-col-num   {{ font-size: 9px; font-weight: 700; letter-spacing: 2.5px;
+                  text-transform: uppercase; color: #bbb; margin-bottom: 6px; }}
+.tom-col-title {{ font-size: 18px; font-weight: 800; letter-spacing: -0.4px; margin-bottom: 4px; }}
+.tom-col.events    .tom-col-title {{ color: #4285F4; }}
+.tom-col.proposals .tom-col-title {{ color: #D97757; }}
+.tom-col.questions .tom-col-title {{ color: #34A853; }}
+.tom-col-sub   {{ font-size: 11px; color: #aaa; line-height: 1.6; margin-bottom: 16px; }}
+.tom-col-count {{ font-size: 11px; color: #888; font-weight: 600; }}
+
+.tom-list  {{ display: flex; flex-direction: column; gap: 0; }}
+.tom-item  {{ padding: 9px 0; border-bottom: 1px solid #f4f4f4; }}
+.tom-item:last-child {{ border-bottom: none; }}
+.tom-item-row {{ display: flex; align-items: baseline; gap: 8px; }}
+.tom-item-meta {{ font-size: 10px; color: #aaa; flex-shrink: 0; min-width: 70px;
+                  font-variant-numeric: tabular-nums; }}
+.tom-item-main {{ flex: 1; font-size: 12px; color: #333; line-height: 1.45;
+                  word-break: break-word; }}
+.tom-item-aux  {{ font-size: 10px; color: #999; margin-top: 2px; }}
+.tom-item-path {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                  font-size: 10.5px; color: #555; word-break: break-all; }}
+.tom-empty {{ font-size: 11px; color: #ccc; font-style: italic;
+              padding: 16px 0; text-align: center; }}
+
+.tom-pri {{ display: inline-block; padding: 1px 6px; border-radius: 8px;
+            font-size: 9.5px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.5px; margin-right: 6px; vertical-align: middle; }}
+.tom-pri.high   {{ background: rgba(217,119,87,.12); color: #c06040; }}
+.tom-pri.medium {{ background: rgba(66,133,244,.10); color: #4285F4; }}
+.tom-pri.low    {{ background: rgba(150,150,150,.10); color: #888; }}
+
+.tom-day-header {{ font-size: 10px; font-weight: 700; letter-spacing: 1.5px;
+                   text-transform: uppercase; color: #bbb;
+                   padding: 12px 0 4px; border-top: 1px solid #f0f0f0; }}
+.tom-day-header:first-child {{ border-top: none; padding-top: 0; }}
+
+.tom-tags {{ display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }}
+.tom-tag  {{ font-size: 9.5px; font-weight: 600; padding: 1px 7px;
+             border-radius: 8px; background: rgba(66,133,244,.10);
+             color: #4285F4; text-transform: lowercase; letter-spacing: 0.2px; }}
 </style>
 </head>
 <body>
@@ -1868,6 +2196,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
   </a>
   <nav class="tabs">
     <a class="tab {'active' if active_tab == 'chat' else ''}" href="/" id="tab-chat">Chat</a>
+    <a class="tab {'active' if active_tab == 'top-of-mind' else ''}" href="/top-of-mind" id="tab-top-of-mind">Top of Mind</a>
     <a class="tab {'active' if active_tab == 'health' else ''}" href="/health" id="tab-health">Engram Health</a>
   </nav>
   <div class="topbar-right">
@@ -1927,6 +2256,17 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
       </div>
     </div>
 
+  </div>
+</div>
+
+<!-- ══════════════════════ TOP OF MIND PANEL ══════════════════════ -->
+<div class="tab-panel {'active' if active_tab == 'top-of-mind' else ''}" id="panel-top-of-mind">
+  <div class="tom-layout">
+    <div class="tom-inner">
+      <div class="tom-title">Top of Mind</div>
+      <div class="tom-sub">Upcoming events, pending decisions, open questions · refreshes every 60s</div>
+      <div class="tom-cols" id="tom-cols"><div class="loading">Loading…</div></div>
+    </div>
   </div>
 </div>
 
@@ -2522,6 +2862,120 @@ function applyContextUpdate(upd) {{
   countEl.textContent = activeContext.length + ' of ' + total + ' candidate' + (total > 1 ? 's' : '');
 }}
 
+// ── Top of Mind tab ────────────────────────────────────────────────────────
+function loadTopOfMind() {{
+  const panel = document.getElementById('panel-top-of-mind');
+  if (!panel || !panel.classList.contains('active')) return;
+  fetch('/api/top-of-mind').then(r => r.json()).then(renderTopOfMind).catch(() => {{}});
+}}
+
+function escHtml(s) {{
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                      .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}}
+
+function renderTopOfMind(data) {{
+  const events    = data.events    || [];
+  const proposals = data.proposals || [];
+  const deadlines = data.deadlines || [];
+
+  // High-stakes events grouped by day, tagged with why-they-surface
+  let evHtml = '';
+  if (events.length === 0) {{
+    evHtml = '<div class="tom-empty">Nothing executive-grade scheduled in the next ' + (data.days_ahead || 14) + ' days.</div>';
+  }} else {{
+    let lastDay = '';
+    evHtml = '<div class="tom-list">' + events.map(e => {{
+      let header = '';
+      if (e.date !== lastDay) {{
+        header = `<div class="tom-day-header">${{escHtml(e.date)}}</div>`;
+        lastDay = e.date;
+      }}
+      const tags = (e.tags || []).slice(0,3).map(t =>
+        `<span class="tom-tag">${{escHtml(t)}}</span>`
+      ).join('');
+      const loc = e.location ? `<div class="tom-item-aux">${{escHtml(e.location)}}</div>` : '';
+      const org = e.organizer ? `<span style="color:#aaa;font-size:11px"> · ${{escHtml(e.organizer)}}</span>` : '';
+      return header + `
+        <div class="tom-item">
+          <div class="tom-item-row">
+            <div class="tom-item-meta">${{escHtml(e.time)}}</div>
+            <div class="tom-item-main">${{escHtml(e.summary)}}${{org}}</div>
+          </div>
+          ${{tags ? `<div class="tom-tags">${{tags}}</div>` : ''}}
+          ${{loc}}
+        </div>`;
+    }}).join('') + '</div>';
+  }}
+
+  // Pending proposals
+  let prHtml = '';
+  if (proposals.length === 0) {{
+    prHtml = '<div class="tom-empty">No pending proposals.</div>';
+  }} else {{
+    prHtml = '<div class="tom-list">' + proposals.map(p => {{
+      const op = p.operation || 'update';
+      const opColor = op === 'create' ? '#34A853' : op === 'delete' ? '#c06040' : '#4285F4';
+      return `
+        <div class="tom-item" onclick="openFilePreview('${{escHtml(p.path).replace(/'/g, "\\\\'")}}')" style="cursor:pointer">
+          <div class="tom-item-row">
+            <div class="tom-item-meta" style="color:${{opColor}};font-weight:600">${{escHtml(op)}}</div>
+            <div class="tom-item-main">
+              <div class="tom-item-path">${{escHtml(p.path)}}</div>
+              ${{p.reason ? `<div class="tom-item-aux">${{escHtml(p.reason)}}</div>` : ''}}
+            </div>
+          </div>
+          <div class="tom-item-aux" style="margin-top:4px">
+            ${{escHtml(p.source)}} · salience ${{p.salience}} · ${{escHtml(p.ts)}}
+          </div>
+        </div>`;
+    }}).join('') + '</div>';
+  }}
+
+  // Deadlines from recent emails
+  let dHtml = '';
+  if (deadlines.length === 0) {{
+    dHtml = '<div class="tom-empty">No deadlines mentioned in recent emails.</div>';
+  }} else {{
+    dHtml = '<div class="tom-list">' + deadlines.map(d => {{
+      return `
+        <div class="tom-item" onclick="openFilePreview('${{escHtml(d.rel).replace(/'/g, "\\\\'")}}')" style="cursor:pointer">
+          <div class="tom-item-main">
+            <div style="font-weight:600;color:#34A853;font-size:11.5px">${{escHtml(d.phrase)}}</div>
+            <div style="margin-top:3px">${{escHtml(d.subject)}}</div>
+            ${{d.context ? `<div class="tom-item-aux" style="font-style:italic;margin-top:3px">"${{escHtml(d.context)}}"</div>` : ''}}
+          </div>
+        </div>`;
+    }}).join('') + '</div>';
+  }}
+
+  document.getElementById('tom-cols').innerHTML = `
+    <div class="tom-col events">
+      <div class="tom-col-stripe"></div>
+      <div class="tom-col-num">Executive Calendar</div>
+      <div class="tom-col-title">High-stakes events</div>
+      <div class="tom-col-sub">Decisions, reviews, exec forums · next ${{data.days_ahead || 14}} days</div>
+      <div class="tom-col-count">${{events.length}} surfaced</div>
+      <div style="margin-top:14px">${{evHtml}}</div>
+    </div>
+    <div class="tom-col proposals">
+      <div class="tom-col-stripe"></div>
+      <div class="tom-col-num">Decisions</div>
+      <div class="tom-col-title">Pending proposals</div>
+      <div class="tom-col-sub">Memory writes awaiting save / skip · ranked by salience</div>
+      <div class="tom-col-count">${{proposals.length}} pending</div>
+      <div style="margin-top:14px">${{prHtml}}</div>
+    </div>
+    <div class="tom-col questions">
+      <div class="tom-col-stripe"></div>
+      <div class="tom-col-num">Inbox signals</div>
+      <div class="tom-col-title">Deadlines from emails</div>
+      <div class="tom-col-sub">Phrases like "due by", "deadline", "submit by" in last 14 days</div>
+      <div class="tom-col-count">${{deadlines.length}} found</div>
+      <div style="margin-top:14px">${{dHtml}}</div>
+    </div>`;
+}}
+
 // ── Health tab ─────────────────────────────────────────────────────────────
 function fmt(n) {{ return n >= 1000 ? (n/1000).toFixed(1)+'k' : String(n||0); }}
 
@@ -2904,6 +3358,12 @@ if (document.getElementById('panel-health').classList.contains('active')) {{
   setInterval(loadHealth, 30000);
 }}
 
+// Load top-of-mind if on /top-of-mind
+if (document.getElementById('panel-top-of-mind').classList.contains('active')) {{
+  loadTopOfMind();
+  setInterval(loadTopOfMind, 60000);
+}}
+
 // Drag-and-drop on the upload zone
 document.addEventListener('DOMContentLoaded', () => {{
   const zone = document.getElementById('raw-doc-dropzone');
@@ -2933,6 +3393,7 @@ if __name__ == "__main__":
     cfg  = get_cfg()
     print(f"  engram running at http://localhost:{port}", flush=True)
     print(f"  Chat → http://localhost:{port}/", flush=True)
+    print(f"  Top of Mind → http://localhost:{port}/top-of-mind", flush=True)
     print(f"  Health → http://localhost:{port}/health", flush=True)
     print(f"  Memory: {cfg.memory_path}", flush=True)
     print(f"  Wiki:   {cfg.wiki_path}", flush=True)
