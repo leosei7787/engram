@@ -180,7 +180,12 @@ class InboxWatcher:
     # ── Scan ─────────────────────────────────────────────────────────────────
 
     def _scan_once(self) -> int:
-        """Scan inbox, process new files. Returns count of new files found."""
+        """Scan inbox, process new files. Returns count of new files found.
+
+        Files that ingest successfully are moved to ``inbox/_processed/`` so
+        the live folder stays clean and only contains pending work. Files
+        already under ``_processed/`` are skipped on subsequent scans.
+        """
         if not self.inbox_path.exists():
             return 0
 
@@ -192,6 +197,12 @@ class InboxWatcher:
                 continue
             if p.name.startswith("."):
                 continue
+            # Don't re-process archived files
+            try:
+                if "_processed" in p.relative_to(self.inbox_path).parts:
+                    continue
+            except ValueError:
+                pass
 
             try:
                 content = p.read_text(errors="ignore")
@@ -222,8 +233,31 @@ class InboxWatcher:
 
             if success:
                 self._registry.mark_done(p, content)
+                self._archive_processed(p)
 
         return new_count
+
+    def _archive_processed(self, src: Path) -> None:
+        """Move a successfully-ingested file to ``inbox/_processed/`` so the
+        live folder only shows pending work. Preserves the relative directory
+        structure under _processed/ and disambiguates name collisions with a
+        timestamp suffix.
+        """
+        try:
+            rel = src.relative_to(self.inbox_path)
+        except ValueError:
+            return  # not under inbox — nothing to archive
+        if rel.parts and rel.parts[0] == "_processed":
+            return  # already there
+        dest = self.inbox_path / "_processed" / rel
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                dest = dest.with_name(f"{dest.stem}_{int(time.time())}{dest.suffix}")
+            src.rename(dest)
+            self._log(f"  → archived to _processed/{rel}")
+        except Exception as e:
+            self._log(f"  ⚠ archive failed for {src.name}: {e}")
 
     # ── Run ───────────────────────────────────────────────────────────────────
 

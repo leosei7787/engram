@@ -564,7 +564,10 @@ def chat():
         ics_hits: list[Path] = []
         for d in ics_search_dirs:
             try:
-                ics_hits.extend(d.rglob("*.ics"))
+                # Skip files under _processed/ — those are archived after watcher
+                # ingest and would otherwise shadow the live calendar if their
+                # mtime got touched.
+                ics_hits.extend(p for p in d.rglob("*.ics") if "_processed" not in p.parts)
             except Exception:
                 continue
 
@@ -583,10 +586,15 @@ def chat():
                         "available", "busy", "block",
                     ))
                     days_ahead = 14 if is_cal_query else 7
-                    max_events = 60 if is_cal_query else 25
+                    # Generous event budget — at 5-10 events/day, a 14-day
+                    # window can easily hit 100+. Truncating by event count
+                    # silently drops later days (e.g. Friday afternoon vanishes
+                    # while Monday is fully shown). The char cap below is the
+                    # real budget guard.
+                    max_events = 300 if is_cal_query else 60
                     agenda = format_agenda(events, days_ahead=days_ahead, max_events=max_events)
                     # Hard cap to keep TTFT reasonable — bigger prompt = slower first token
-                    agenda_cap = 8000 if is_cal_query else 3500
+                    agenda_cap = 14000 if is_cal_query else 4500
                     agenda = agenda[:agenda_cap]
                     today = datetime.now().strftime("%A %d %b %Y")
                     system_parts.append(
@@ -2011,7 +2019,10 @@ def top_of_mind():
     ics_hits: list[Path] = []
     for d in ics_search_dirs:
         try:
-            ics_hits.extend(d.rglob("*.ics"))
+            # Skip files under _processed/ — those are archived after watcher
+            # ingest and would otherwise shadow the live calendar if their
+            # mtime got touched.
+            ics_hits.extend(p for p in d.rglob("*.ics") if "_processed" not in p.parts)
         except Exception:
             continue
 
