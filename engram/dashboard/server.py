@@ -286,7 +286,8 @@ def chat():
         # ── Phase 3: Immediate top-N selection — no Haiku wait ───────────────────
         # Feed all top candidates directly. Haiku refines AFTER the response
         # (see Phase 6) so it never blocks time-to-first-token.
-        max_ctx = getattr(cfg.curator, 'max_context_files', 20)
+        curator_cfg = getattr(cfg, 'curator', None)
+        max_ctx = getattr(curator_cfg, 'max_context_files', 20) if curator_cfg else 20
         selected  = all_candidates[:max_ctx]
         reasoning = f"Top {len(selected)} of {n_candidates} by relevance score"
 
