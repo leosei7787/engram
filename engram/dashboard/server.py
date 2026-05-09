@@ -140,6 +140,13 @@ def _start_watcher(cfg: EngramConfig):
                 _shutil.copy2(str(path), str(dest))
             else:
                 dest.write_text(cleaned_md, encoding="utf-8")
+                # Preserve the source mtime so recent-activity sorts by when
+                # the email actually arrived, not when we cleaned it.
+                try:
+                    src_mtime = path.stat().st_mtime
+                    os.utime(dest, (src_mtime, src_mtime))
+                except Exception:
+                    pass
 
             _watcher_status["files_new"] += 1
             _watcher_status["last_scan"] = datetime.now(timezone.utc).isoformat()
@@ -1379,9 +1386,14 @@ def clean_emails():
             continue
 
         if res.cleaned_chars < res.original_chars * 0.95 and res.cleaned_chars > 100:
-            # Meaningful reduction — write cleaned markdown back
+            # Meaningful reduction — write cleaned markdown back, preserve mtime
+            orig_mtime = f.stat().st_mtime
             md = res.to_markdown()
             f.write_text(md, encoding="utf-8")
+            try:
+                os.utime(f, (orig_mtime, orig_mtime))
+            except Exception:
+                pass
             cleaned += 1
             bytes_after += len(md)
         else:
@@ -1454,8 +1466,10 @@ def recent_activity():
     except Exception as e:
         return jsonify({"items": [], "error": str(e)})
 
-    items.sort(key=lambda x: x["modified"], reverse=True)
-    return jsonify({"items": items[:20], "total": len(items)})
+    # Sort by mtime (desc); break ties by name so same-second files have
+    # a stable, predictable order (otherwise large bulk-rewrites bury new files).
+    items.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
+    return jsonify({"items": items[:50], "total": len(items)})
 
 
 # ─── Main page ────────────────────────────────────────────────────────────────
