@@ -414,13 +414,27 @@ def chat():
             system_parts.append("\n\n" + scan["graph_context"])
 
         # ── request_more_context tool instruction ─────────────────────────────
+        # Be reluctant — every REQUEST_CONTEXT spawns a 2nd CLI subprocess (~2s).
+        # The user already has 20 candidate files + CLAUDE.md + calendar loaded.
+        # Only use this for genuinely missing specifics (a number from a report,
+        # a quote from an unloaded email, etc.). Never for calendar/agenda
+        # questions or general status — those are covered.
         system_parts.append(
             "\n\n---\n"
             "# Context management\n"
-            "If you cannot answer because you need more specific context not in the files above, "
-            "output exactly this on its own line (nothing else on that line):\n"
-            "REQUEST_CONTEXT: <focused one-sentence query describing what you need>\n"
-            "The system will automatically fetch and inject the missing context and re-run your response."
+            "**Strongly prefer answering from the context above.** It already includes:\n"
+            "  - CLAUDE.md (core identity, workstreams, priorities — always loaded)\n"
+            "  - The most recent calendar/agenda file (always loaded, see top of context)\n"
+            "  - 20 files selected by relevance score for this query\n"
+            "  - Active graph entities and recent decisions\n"
+            "\n"
+            "Do NOT use REQUEST_CONTEXT for: calendar/agenda questions, general status, "
+            "org structure questions, or anything answerable from the loaded files.\n"
+            "\n"
+            "ONLY output REQUEST_CONTEXT when the answer requires a specific concrete fact "
+            "(a number, a quote, a date) that is clearly missing from everything loaded. "
+            "Format (entire line, nothing else):\n"
+            "REQUEST_CONTEXT: <focused one-sentence query>\n"
         )
 
         system_prompt = "\n".join(system_parts)
@@ -1537,11 +1551,12 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .ctx-item-body:hover .ctx-file {{ color: #D97757; }}
 
 /* Request-context pill (shown when model requests more context) */
-.rc-pill {{ display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px;
-             background: rgba(66,133,244,.08); border: 1px solid rgba(66,133,244,.18);
-             border-radius: 20px; font-size: 11px; color: #4285F4;
-             margin-bottom: 6px; max-width: 100%; overflow: hidden;
-             text-overflow: ellipsis; white-space: nowrap; }}
+.rc-pill {{ display: inline-flex; align-self: flex-start; align-items: center; gap: 5px;
+             padding: 3px 10px; background: rgba(66,133,244,.08);
+             border: 1px solid rgba(66,133,244,.18); border-radius: 20px;
+             font-size: 11px; color: #4285F4; margin-bottom: 8px;
+             max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+             white-space: nowrap; }}
 
 /* Export bar */
 .export-bar {{ display: flex; align-items: center; gap: 6px; margin-top: 8px;
@@ -1630,7 +1645,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .messages {{ flex: 1; overflow-y: auto; padding: 24px 0; }}
 .message {{ width: 100%; margin: 0 0 20px; padding: 0 28px; }}
 .message.user   {{ display: flex; justify-content: flex-end; }}
-.message.assistant {{ display: flex; justify-content: flex-start; }}
+.message.assistant {{ display: flex; flex-direction: column; align-items: flex-start; }}
 .bubble {{ padding: 12px 18px; border-radius: 12px; font-size: 14px; line-height: 1.65;
            white-space: pre-wrap; }}
 .message.user .bubble {{ background: #1a1a1a; color: #fff; border-radius: 12px 12px 2px 12px;
