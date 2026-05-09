@@ -449,6 +449,85 @@ def harvest_session_in_background(
     return t
 
 
+# ─── Dream-cycle integration ──────────────────────────────────────────────────
+# Provides a `consolidation_runner` callable suitable for engram.memory.
+# sleep_cycle.run_sleep_cycle()'s Phase 2 (Episodic Harvest). The runner
+# walks every session file modified in the last `max_age_hours`, harvests
+# each (force=True, no throttle — nightly batch), and returns a result dict
+# in the shape the sleep cycle expects.
+
+def make_session_consolidation_runner(
+    *,
+    memory_path:   Path,
+    user_name:     str,
+    cfg,
+    max_age_hours: int = 48,
+):
+    """Return a `consolidation_runner` callable for the sleep cycle.
+
+    Usage:
+
+        from engram.memory.sleep_cycle import run_sleep_cycle
+        runner = make_session_consolidation_runner(
+            memory_path=cfg.memory_path,
+            user_name=cfg.identity.user_name or "",
+            cfg=cfg,
+        )
+        run_sleep_cycle(cfg.memory_path, consolidation_runner=runner)
+
+    The runner is closure-bound so the sleep cycle can call it with no args
+    and still get the right paths + config.
+    """
+    def _runner() -> dict:
+        sessions_root = memory_path / "sessions"
+        if not sessions_root.exists():
+            return {"files_scanned": 0, "proposals": 0, "skipped": "no_sessions_dir"}
+
+        cutoff = time.time() - max_age_hours * 3600
+        # Walk YYYY-MM/chat_<id>.md files
+        targets: list[Path] = []
+        for month_dir in sessions_root.iterdir():
+            if not month_dir.is_dir() or month_dir.name.startswith("."):
+                continue
+            for fp in month_dir.glob("chat_*.md"):
+                try:
+                    if fp.stat().st_mtime >= cutoff:
+                        targets.append(fp)
+                except Exception:
+                    continue
+        targets.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+
+        scanned = 0
+        proposals_total = 0
+        for fp in targets:
+            # Recover session_id from filename (chat_<id>.md → <id>)
+            m = re.match(r"^chat_(.+)$", fp.stem)
+            if not m:
+                continue
+            session_id = m.group(1)
+            try:
+                res = harvest_session(
+                    memory_path = memory_path,
+                    session_id  = session_id,
+                    user_name   = user_name,
+                    cfg         = cfg,
+                    force       = True,   # nightly batch overrides throttle
+                )
+                scanned += 1
+                if res.get("ran"):
+                    proposals_total += int(res.get("added") or 0)
+            except Exception:
+                print(f"[session_consolidation] error on {fp.name}:\n" + traceback.format_exc(), flush=True)
+                continue
+        return {
+            "files_scanned": scanned,
+            "proposals":     proposals_total,
+            "max_age_hours": max_age_hours,
+        }
+
+    return _runner
+
+
 # ─── Backwards-compat shim ────────────────────────────────────────────────────
 # Old call sites used per-turn harvest. Route them through the throttled
 # session-level path so they get the new semantics for free.
