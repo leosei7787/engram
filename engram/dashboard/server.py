@@ -46,6 +46,80 @@ from engram.memory.proposals import load_index as load_proposals_index
 app = Flask(__name__)
 _cfg: EngramConfig | None = None
 
+# ─── In-flight chat state ─────────────────────────────────────────────────────
+# Tracks the single in-flight chat response so /api/chat/interject can:
+#   1. read the in-flight question + partial response (for the classifier)
+#   2. signal abort (the streamer checks the Event between chunks)
+#   3. terminate the CLI subprocess if one is running
+# engram is single-user-per-server, so a singleton is sufficient.
+_chat_lock  = threading.Lock()
+_chat_state: dict = {
+    "active":     False,
+    "abort":      threading.Event(),     # replaced per chat
+    "user_msg":   "",
+    "partial":    [],                    # list of token strings
+    "started_at": 0.0,
+    "proc":       None,                  # subprocess.Popen (CLI backend)
+}
+
+
+def _begin_chat(user_msg: str) -> threading.Event:
+    """Register an in-flight chat. Returns the abort event the streamer should poll."""
+    with _chat_lock:
+        # Aggressively abort any prior chat (defensive; shouldn't happen normally).
+        _chat_state["abort"].set()
+        prev_proc = _chat_state.get("proc")
+        if prev_proc is not None:
+            try: prev_proc.terminate()
+            except Exception: pass
+
+        new_evt = threading.Event()
+        _chat_state.update({
+            "active":     True,
+            "abort":      new_evt,
+            "user_msg":   user_msg,
+            "partial":    [],
+            "started_at": time.time(),
+            "proc":       None,
+        })
+        return new_evt
+
+
+def _end_chat() -> None:
+    with _chat_lock:
+        _chat_state["active"] = False
+        _chat_state["proc"]   = None
+
+
+def _append_partial(text: str) -> None:
+    with _chat_lock:
+        if _chat_state["active"]:
+            _chat_state["partial"].append(text)
+
+
+def _set_chat_proc(proc) -> None:
+    with _chat_lock:
+        _chat_state["proc"] = proc
+
+
+def _snapshot_inflight() -> tuple[bool, str, str]:
+    """Return (active, user_msg, partial_text) for the classifier."""
+    with _chat_lock:
+        if not _chat_state["active"]:
+            return (False, "", "")
+        return (True, _chat_state["user_msg"], "".join(_chat_state["partial"]))
+
+
+def _signal_pivot() -> None:
+    """Set the abort event and terminate any running CLI subprocess."""
+    with _chat_lock:
+        _chat_state["abort"].set()
+        proc = _chat_state["proc"]
+    if proc is not None:
+        try: proc.terminate()
+        except Exception: pass
+
+
 # ─── Watcher state ────────────────────────────────────────────────────────────
 _watcher: InboxWatcher | None = None
 _watcher_thread: threading.Thread | None = None
@@ -208,7 +282,8 @@ def _format_messages_for_cli(messages: list) -> str:
     return f"[Conversation history]\n{history}\n\n[Current question]\n{current}"
 
 
-def _stream_cli(messages: list, system_prompt: str, cli_bin: str, model: str | None = None):
+def _stream_cli(messages: list, system_prompt: str, cli_bin: str, model: str | None = None,
+                abort: threading.Event | None = None):
     """
     Call Claude CLI in print mode and yield response text in small chunks.
 
@@ -217,6 +292,9 @@ def _stream_cli(messages: list, system_prompt: str, cli_bin: str, model: str | N
     The CLI in -p mode returns batched NDJSON events (not incremental token deltas).
     We parse the `assistant` message event and emit the text in ~10-word chunks so
     the typing-indicator UX stays responsive. Falls back to `result` event if needed.
+
+    If `abort` is provided and gets set mid-stream, the subprocess is terminated
+    and the generator stops (used by /api/chat/interject for human-like pivots).
 
     Yields plain text strings (no SSE framing — caller wraps in data: ... \\n\\n).
     """
@@ -270,11 +348,19 @@ def _stream_cli(messages: list, system_prompt: str, cli_bin: str, model: str | N
             text=True,
             bufsize=1,
         )
+        # Register so /api/chat/interject can terminate us on a pivot.
+        _set_chat_proc(proc)
 
         full_text   = ""
         result_text = ""
+        aborted     = False
 
         for line in proc.stdout:
+            if abort is not None and abort.is_set():
+                aborted = True
+                try: proc.terminate()
+                except Exception: pass
+                break
             line = line.strip()
             if not line:
                 continue
@@ -301,6 +387,10 @@ def _stream_cli(messages: list, system_prompt: str, cli_bin: str, model: str | N
 
             except json.JSONDecodeError:
                 pass
+
+        if aborted:
+            # Caller will emit its own "interrupted" notice; just stop quietly.
+            return
 
         proc.wait()
         if proc.returncode not in (0, None):
@@ -329,8 +419,16 @@ def chat():
     if not query:
         return jsonify({"error": "empty query"}), 400
 
+    was_interruption = bool(data.get("was_interruption", False))
+    interruption_reason = (data.get("interruption_reason", "") or "").strip()[:200]
+
     def generate():
         cfg = get_cfg()
+
+        # Register this chat as in-flight so /api/chat/interject can read its
+        # state and signal a pivot. The returned event is checked by the
+        # streamer between chunks.
+        abort_evt = _begin_chat(query)
 
         # ── Phase 0: Announce scanning ────────────────────────────────────────
         yield f"data: {json.dumps({'context': {'phase': 'scanning', 'candidates_total': 0, 'selected': [], 'reasoning': ''}})}\n\n"
@@ -374,6 +472,21 @@ def chat():
         sp = cfg.system_prompt
         if sp.user_tone:
             system_parts.append(f"Tone: {sp.user_tone}")
+
+        # ── Interruption note ────────────────────────────────────────────────
+        # When the previous response was cut off by a new user message, give
+        # the model a short preamble so its reply reads like a human reacting:
+        # "ah, you're right — let me reconsider…" rather than a flat restart.
+        if was_interruption:
+            note = (
+                "The user just interrupted your previous response with this new message. "
+                "Acknowledge the interruption naturally in your opening (e.g. 'Ah, you're right —' "
+                "or 'Got it, let me switch tracks —') and then address their new direction. "
+                "Don't apologise excessively or over-explain the switch."
+            )
+            if interruption_reason:
+                note += f" Classifier reason for the pivot: {interruption_reason}"
+            system_parts.append(note)
 
         base   = cfg.base_path
         budget = cfg.retrieval.context_budget.max_total_chars
@@ -540,12 +653,21 @@ def chat():
             if not cli_bin:
                 yield f"data: {json.dumps({'token': '⚠ Claude CLI not found. Install claude or set chat.cli_bin in config.'})}\n\n"
                 yield "data: [DONE]\n\n"
+                _end_chat()
                 return
             cli_model = getattr(chat_cfg, "cli_model", None) or None
             try:
-                for text in _stream_cli(messages, system_prompt, cli_bin, model=cli_model):
+                for text in _stream_cli(messages, system_prompt, cli_bin, model=cli_model, abort=abort_evt):
+                    if abort_evt.is_set():
+                        yield f"data: {json.dumps({'interrupted': True})}\n\n"
+                        break
                     assistant_text += text
+                    _append_partial(text)
                     yield f"data: {json.dumps({'token': text})}\n\n"
+                if abort_evt.is_set():
+                    yield "data: [DONE]\n\n"
+                    _end_chat()
+                    return
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
@@ -558,6 +680,7 @@ def chat():
                     'add  chat:\\n  backend: cli  to ~/.engram/config.yaml'})}\n\n"
                 )
                 yield "data: [DONE]\n\n"
+                _end_chat()
                 return
             try:
                 import anthropic
@@ -569,8 +692,16 @@ def chat():
                     messages   = messages,
                 ) as stream:
                     for text in stream.text_stream:
+                        if abort_evt.is_set():
+                            yield f"data: {json.dumps({'interrupted': True})}\n\n"
+                            break
                         assistant_text += text
+                        _append_partial(text)
                         yield f"data: {json.dumps({'token': text})}\n\n"
+                if abort_evt.is_set():
+                    yield "data: [DONE]\n\n"
+                    _end_chat()
+                    return
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
@@ -609,8 +740,10 @@ def chat():
                     generate._in_context_retry = True
 
                     if backend == "cli":
-                        for text in _stream_cli(messages, system_prompt, cli_bin, model=cli_model):
+                        for text in _stream_cli(messages, system_prompt, cli_bin, model=cli_model, abort=abort_evt):
+                            if abort_evt.is_set(): break
                             assistant_text += text
+                            _append_partial(text)
                             yield f"data: {json.dumps({'token': text})}\n\n"
                     else:
                         with client.messages.stream(
@@ -618,7 +751,9 @@ def chat():
                             system=system_prompt, messages=messages,
                         ) as stream:
                             for text in stream.text_stream:
+                                if abort_evt.is_set(): break
                                 assistant_text += text
+                                _append_partial(text)
                                 yield f"data: {json.dumps({'token': text})}\n\n"
             except Exception as e:
                 print(f"[chat] REQUEST_CONTEXT retry error: {e}", flush=True)
@@ -640,10 +775,131 @@ def chat():
                 print(f"[chat] monitor error: {e}", flush=True)
 
         yield "data: [DONE]\n\n"
+        _end_chat()
 
     return Response(stream_with_context(generate()),
                     mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ─── Interject (human-like interruption) ──────────────────────────────────────
+# When the user sends a second message while the assistant is still streaming,
+# the frontend POSTs here. A small Haiku call decides whether the assistant
+# should keep its current train of thought ("continue") or pivot to the new
+# message immediately ("pivot"). On pivot, we set the abort event and the
+# in-flight stream stops at its next chunk — feels like cutting someone off.
+
+_INTERJECT_PROMPT = """You are a real-time conversational classifier. The user is talking to an AI assistant. The assistant is mid-response when the user sends a NEW message. You decide what should happen next.
+
+Two possible actions:
+  - "continue": let the assistant finish its current thought, then address the new message naturally as a follow-up. Use this when the new message is a clarifying question, a "yes/ok/go on" acknowledgement, or adds context without redirecting.
+  - "pivot": stop the current response immediately and address the new message. Use this when the new message corrects, contradicts, redirects, or makes the in-flight question moot. Bias toward pivot when the user sounds like they're cutting in.
+
+Return STRICT JSON ONLY: {"action": "continue" | "pivot", "reason": "<one short sentence>"}
+
+In-flight question from user:
+<<<{in_flight}>>>
+
+What the assistant has said so far (may be empty if just started):
+<<<{partial}>>>
+
+User's new message (just arrived):
+<<<{new_msg}>>>
+
+JSON:"""
+
+
+def _classify_interjection(in_flight: str, partial: str, new_msg: str, cfg) -> dict:
+    """Run a Haiku classifier. Returns {'action': 'continue'|'pivot', 'reason': str, 'latency_ms': int, 'source': str}."""
+    import time as _t
+    t0 = _t.time()
+
+    # Truncate inputs to keep the classifier fast and cheap.
+    prompt = _INTERJECT_PROMPT.format(
+        in_flight=in_flight[:600],
+        partial=partial[-400:],
+        new_msg=new_msg[:600],
+    )
+
+    text = ""
+    source = "haiku-api"
+    try:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if api_key:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            resp = client.messages.create(
+                model      = cfg.models.haiku,
+                max_tokens = 120,
+                messages   = [{"role": "user", "content": prompt}],
+            )
+            for block in (resp.content or []):
+                if getattr(block, "type", "") == "text":
+                    text += getattr(block, "text", "")
+        else:
+            # Fall back to CLI Haiku — slower (~3-8s) but works without an API key.
+            cli_bin = (getattr(getattr(cfg, "chat", None), "cli_bin", None) or None) or shutil.which("claude")
+            if not cli_bin:
+                raise RuntimeError("no API key and no claude CLI on PATH")
+            source = "haiku-cli"
+            proc = subprocess.run(
+                [cli_bin, "-p", prompt, "--output-format", "text", "--model", cfg.models.haiku],
+                capture_output=True, text=True, timeout=10,
+            )
+            text = (proc.stdout or "").strip()
+    except Exception as e:
+        return {
+            "action":     "continue",
+            "reason":     f"classifier error — defaulting to continue ({e})",
+            "latency_ms": int((_t.time() - t0) * 1000),
+            "source":     "fallback",
+        }
+
+    # Tolerant JSON extraction — strip code fences, find the first {...} block.
+    cleaned = re.sub(r"```(?:json)?", "", text).strip().strip("`").strip()
+    m = re.search(r"\{.*?\}", cleaned, re.DOTALL)
+    parsed = None
+    if m:
+        try: parsed = json.loads(m.group(0))
+        except Exception: parsed = None
+
+    if not parsed or parsed.get("action") not in ("continue", "pivot"):
+        return {
+            "action":     "continue",
+            "reason":     "classifier output unparseable — defaulting to continue",
+            "latency_ms": int((_t.time() - t0) * 1000),
+            "source":     source,
+        }
+
+    return {
+        "action":     parsed["action"],
+        "reason":     str(parsed.get("reason", ""))[:200],
+        "latency_ms": int((_t.time() - t0) * 1000),
+        "source":     source,
+    }
+
+
+@app.route("/api/chat/interject", methods=["POST"])
+def chat_interject():
+    body = request.get_json(force=True, silent=True) or {}
+    new_msg = (body.get("message", "") or "").strip()
+    if not new_msg:
+        return jsonify({"error": "empty message"}), 400
+
+    active, in_flight, partial = _snapshot_inflight()
+    if not active:
+        return jsonify({"action": "no_active_chat"})
+
+    cfg = get_cfg()
+    verdict = _classify_interjection(in_flight, partial, new_msg, cfg)
+
+    if verdict["action"] == "pivot":
+        _signal_pivot()
+        print(f"[chat/interject] pivot ({verdict['latency_ms']}ms via {verdict['source']}): {verdict['reason']}", flush=True)
+    else:
+        print(f"[chat/interject] continue ({verdict['latency_ms']}ms via {verdict['source']}): {verdict['reason']}", flush=True)
+
+    return jsonify(verdict)
 
 
 # ─── Stats API ────────────────────────────────────────────────────────────────
@@ -2002,7 +2258,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .chat-main {{ flex: 1; display: flex; flex-direction: column; overflow: hidden; }}
 .messages {{ flex: 1; overflow-y: auto; padding: 24px 0; }}
 .message {{ width: 100%; margin: 0 0 20px; padding: 0 28px; }}
-.message.user   {{ display: flex; justify-content: flex-end; }}
+.message.user   {{ display: flex; flex-direction: column; align-items: flex-end; }}
 .message.assistant {{ display: flex; flex-direction: column; align-items: flex-start; }}
 .bubble {{ padding: 12px 18px; border-radius: 12px; font-size: 14px; line-height: 1.65;
            white-space: pre-wrap; }}
@@ -2014,6 +2270,17 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .typing {{ display: inline-block; }}
 .typing::after {{ content: '▋'; animation: blink .7s infinite; }}
 @keyframes blink {{ 0%,100%{{opacity:1}} 50%{{opacity:0}} }}
+
+/* Interruption — bubble cut off mid-stream */
+.bubble.interrupted {{ opacity: .65; border-left: 2px solid #D97757; padding-left: 16px; }}
+.interrupted-mark {{ font-size: 11px; color: #D97757; margin-top: 4px;
+                     letter-spacing: 0.3px; font-weight: 600; }}
+
+/* Queued user message — sent during a stream, awaiting next turn */
+.queued-badge {{ font-size: 10.5px; font-weight: 600; color: #888;
+                 background: #f0f0f0; border: 1px solid #e0e0e0;
+                 padding: 2px 8px; border-radius: 10px; margin-top: 6px;
+                 letter-spacing: 0.2px; align-self: flex-end; }}
 
 /* Empty state */
 .empty-state {{ display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -2373,19 +2640,108 @@ input.addEventListener('keydown', e => {{
 }});
 
 // ── Chat ───────────────────────────────────────────────────────────────────
+// Human-like interruption model:
+//   - Send button never disables. Typing during a response is allowed.
+//   - When user sends mid-response, we ask /api/chat/interject. A Haiku
+//     classifier decides: keep current thought going (continue) or pivot.
+//   - On pivot: in-flight stream stops at next chunk, partial bubble gets
+//     an "interrupted" marker, then a fresh response starts with a system
+//     prompt note so the model phrases its reply naturally.
+//   - On continue: the queued user bubble gets a small "queued" badge and
+//     fires automatically after the current response finishes.
+let currentAssistantEl = null;
+let pendingFollowup    = null;     // {{text, was_interruption, reason, userBubble}}
+let interjectInFlight  = false;
+
 function sendMessage() {{
-  if (streaming) return;
   const text = input.value.trim();
   if (!text) return;
-
-  document.getElementById('empty-state')?.remove();
-  messages.push({{role:'user', content: text}});
-  appendBubble('user', text);
   input.value = ''; input.style.height = 'auto';
+  document.getElementById('empty-state')?.remove();
 
+  // Render the user bubble immediately — feels like speaking up.
+  const userEl = appendBubble('user', text);
+
+  if (!streaming) {{
+    messages.push({{role: 'user', content: text}});
+    _doSend(text, {{was_interruption: false, reason: ''}});
+    return;
+  }}
+
+  // Streaming in progress — don't queue blindly. Ask the classifier.
+  if (interjectInFlight) {{
+    // Already deciding on a previous interjection; tag this bubble queued
+    // and let it ride after the next [DONE].
+    _addQueuedBadge(userEl, 'waiting…');
+    pendingFollowup = {{text, was_interruption: false, reason: '', userBubble: userEl}};
+    return;
+  }}
+  interjectInFlight = true;
+  _addQueuedBadge(userEl, 'deciding…');
+
+  fetch('/api/chat/interject', {{
+    method:  'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body:    JSON.stringify({{message: text}}),
+  }}).then(r => r.json()).then(verdict => {{
+    interjectInFlight = false;
+    if (verdict.action === 'no_active_chat') {{
+      // Race: stream finished while classifier was deciding — just send.
+      _removeQueuedBadge(userEl);
+      messages.push({{role: 'user', content: text}});
+      _doSend(text, {{was_interruption: false, reason: ''}});
+      return;
+    }}
+    if (verdict.action === 'pivot') {{
+      // Mark partial as cut off; a [DONE] will arrive shortly. Send the new
+      // message after that.
+      _markCurrentInterrupted();
+      _setQueuedBadge(userEl, 'pivoting →');
+      pendingFollowup = {{text, was_interruption: true, reason: verdict.reason || '', userBubble: userEl}};
+    }} else {{
+      // continue — wait for current response to finish, then fire.
+      _setQueuedBadge(userEl, 'queued — will answer next');
+      pendingFollowup = {{text, was_interruption: false, reason: '', userBubble: userEl}};
+    }}
+  }}).catch(() => {{
+    interjectInFlight = false;
+    _setQueuedBadge(userEl, 'queued');
+    pendingFollowup = {{text, was_interruption: false, reason: '', userBubble: userEl}};
+  }});
+}}
+
+function _addQueuedBadge(userEl, label) {{
+  let badge = userEl.querySelector('.queued-badge');
+  if (!badge) {{
+    badge = document.createElement('div');
+    badge.className   = 'queued-badge';
+    userEl.appendChild(badge);
+  }}
+  badge.textContent = label;
+}}
+function _setQueuedBadge(userEl, label) {{ _addQueuedBadge(userEl, label); }}
+function _removeQueuedBadge(userEl) {{
+  userEl.querySelector('.queued-badge')?.remove();
+}}
+function _markCurrentInterrupted() {{
+  if (!currentAssistantEl) return;
+  const bubble = currentAssistantEl.querySelector('.bubble');
+  if (!bubble) return;
+  bubble.classList.remove('typing');
+  bubble.classList.add('interrupted');
+  let mark = currentAssistantEl.querySelector('.interrupted-mark');
+  if (!mark) {{
+    mark = document.createElement('div');
+    mark.className   = 'interrupted-mark';
+    mark.textContent = '⏸ interrupted';
+    currentAssistantEl.appendChild(mark);
+  }}
+}}
+
+function _doSend(text, opts) {{
   const assistantEl = appendBubble('assistant', '');
   assistantEl.querySelector('.bubble').classList.add('typing');
-  document.getElementById('send-btn').disabled = true;
+  currentAssistantEl = assistantEl;
   streaming = true;
 
   // Reset context sidebar
@@ -2394,16 +2750,18 @@ function sendMessage() {{
   document.getElementById('ctx-count').textContent = 'Scanning memory…';
   document.getElementById('ctx-reasoning').textContent = '';
 
-  const evtSrc = new EventSource('/api/chat?' + new URLSearchParams({{
-    _body: JSON.stringify({{messages}})
-  }}));
+  const body = {{
+    messages,
+    raw_docs:            rawDocs,
+    pinned:              [...pinnedPaths],
+    was_interruption:    !!opts.was_interruption,
+    interruption_reason: opts.reason || '',
+  }};
 
-  // Use fetch + ReadableStream instead (EventSource doesn't support POST)
-  streaming = true;
   fetch('/api/chat', {{
-    method: 'POST',
+    method:  'POST',
     headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{messages, raw_docs: rawDocs, pinned: [...pinnedPaths]}})
+    body:    JSON.stringify(body),
   }}).then(res => {{
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -2415,8 +2773,17 @@ function sendMessage() {{
           assistantEl.querySelector('.bubble').classList.remove('typing');
           messages.push({{role:'assistant', content: assistantText}});
           if (assistantText.trim()) addExportBar(assistantEl, assistantText);
-          document.getElementById('send-btn').disabled = false;
           streaming = false;
+          currentAssistantEl = null;
+
+          // Drain any pending follow-up: the user's queued/interjected message.
+          if (pendingFollowup) {{
+            const f = pendingFollowup;
+            pendingFollowup = null;
+            _removeQueuedBadge(f.userBubble);
+            messages.push({{role: 'user', content: f.text}});
+            _doSend(f.text, {{was_interruption: f.was_interruption, reason: f.reason}});
+          }}
           return;
         }}
         buf += decoder.decode(value, {{stream: true}});
@@ -2430,15 +2797,17 @@ function sendMessage() {{
             const j = JSON.parse(raw);
             if (j.context)        renderContext(j.context);
             if (j.context_update) applyContextUpdate(j.context_update);
+            if (j.interrupted) {{
+              // Server confirms it stopped streaming — make sure UI reflects.
+              _markCurrentInterrupted();
+            }}
             if (j.clear_response) {{
-              // Model is about to retry with more context — clear the bubble
               assistantText = '';
               const bubble = assistantEl.querySelector('.bubble');
               bubble.textContent = '';
               bubble.classList.add('typing');
             }}
             if (j.request_context) {{
-              // Show a small search pill above the bubble
               const pill = document.createElement('div');
               pill.className   = 'rc-pill';
               pill.textContent = '🔍 Fetching: ' + j.request_context.query;
@@ -2449,7 +2818,6 @@ function sendMessage() {{
               assistantText += j.token;
               const bubble = assistantEl.querySelector('.bubble');
               bubble.textContent = assistantText;
-              // Keep typing cursor without resetting animation
               if (!bubble.classList.contains('typing')) bubble.classList.add('typing');
             }}
             if (j.error) {{
@@ -2467,8 +2835,8 @@ function sendMessage() {{
   }}).catch(err => {{
     assistantEl.querySelector('.bubble').textContent = '⚠ Connection error: ' + err.message;
     assistantEl.querySelector('.bubble').classList.remove('typing');
-    document.getElementById('send-btn').disabled = false;
     streaming = false;
+    currentAssistantEl = null;
   }});
 }}
 
