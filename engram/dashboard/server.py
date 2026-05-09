@@ -984,6 +984,56 @@ def chat_interject():
 
 # ─── Stats API ────────────────────────────────────────────────────────────────
 
+@app.route("/api/sessions/harvest", methods=["POST"])
+def sessions_harvest():
+    """Manually trigger harvest for a session.
+
+    Body: {"session_id": "...", "force": true|false}
+      - force=true bypasses the 1h throttle (button-driven manual run)
+      - force=false (default) respects throttle, useful for "scheduled"
+        triggers from outside the chat path.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    session_id = (body.get("session_id", "") or "").strip()
+    force = bool(body.get("force", True))   # default True for manual button
+    if not session_id:
+        return jsonify({"error": "session_id required"}), 400
+
+    cfg = get_cfg()
+
+    # Run synchronously so the button gets a real result. Cap with a soft
+    # timeout via threading wouldn't help (the SDK doesn't support cancel).
+    try:
+        from engram.memory.session_harvester import harvest_session
+        result = harvest_session(
+            memory_path = cfg.memory_path,
+            session_id  = session_id,
+            user_name   = cfg.identity.user_name or "",
+            cfg         = cfg,
+            force       = force,
+        )
+    except Exception:
+        print("[sessions/harvest] error:\n" + traceback.format_exc(), flush=True)
+        return jsonify({"ran": False, "reason": "internal_error", "added": 0}), 500
+
+    return jsonify(result)
+
+
+@app.route("/api/sessions/harvest-status")
+def sessions_harvest_status():
+    """Return throttle state for a session: last run, age, turn count."""
+    session_id = (request.args.get("session_id", "") or "").strip()
+    if not session_id:
+        return jsonify({"error": "session_id required"}), 400
+    cfg = get_cfg()
+    try:
+        from engram.memory.session_harvester import get_harvest_status
+        return jsonify(get_harvest_status(cfg.memory_path, session_id))
+    except Exception:
+        print("[sessions/harvest-status] error:\n" + traceback.format_exc(), flush=True)
+        return jsonify({"error": "internal_error"}), 500
+
+
 @app.route("/api/stats")
 def stats():
     cfg         = get_cfg()
@@ -2236,7 +2286,14 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
             font-size: 10px; color: #bbb; border-radius: 3px; line-height: 1; }}
 .ctx-btn:hover {{ color: #555; background: #eee; }}
 .ctx-btn.pinned {{ color: #D97757; opacity: 1 !important; }}
-.ctx-add-bar {{ padding: 8px 12px; border-top: 1px solid #efefef; }}
+.ctx-add-bar {{ padding: 8px 12px; border-top: 1px solid #efefef; display: flex; flex-direction: column; gap: 6px; }}
+.ctx-harvest-btn {{ width: 100%; background: transparent; border: 1px solid #e6e6e6;
+                    color: #666; padding: 7px 10px; font-size: 11px; border-radius: 7px;
+                    cursor: pointer; text-align: left; transition: background .15s, border-color .15s;
+                    display: flex; justify-content: space-between; align-items: center; }}
+.ctx-harvest-btn:hover {{ background: #f7f7f7; border-color: #ddd; color: #333; }}
+.ctx-harvest-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+#harvest-btn-status {{ font-size: 10px; color: #aaa; font-weight: 400; }}
 .ctx-add-btn {{ width: 100%; background: #fafafa; border: 1px dashed #ddd;
                 border-radius: 6px; padding: 5px 10px; font-size: 11px; color: #aaa;
                 cursor: pointer; text-align: center; transition: all .15s; }}
@@ -2626,6 +2683,11 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
       </div>
       <div class="ctx-add-bar">
         <button class="ctx-add-btn" onclick="openRawDocModal()">+ Add document</button>
+        <button class="ctx-harvest-btn" id="harvest-btn" onclick="triggerHarvest()"
+                title="Extract proposals from this session's conversation now (otherwise auto-runs hourly)">
+          <span id="harvest-btn-label">↑ Harvest this session</span>
+          <span id="harvest-btn-status"></span>
+        </button>
       </div>
       <div class="ctx-legend">
         <div class="ctx-legend-item"><div class="ctx-dot memory"></div>memory</div>
@@ -3168,6 +3230,59 @@ async function exportAs(fmt, content, filename, btn) {{
     alert('Export error: ' + err.message);
   }}
 }}
+
+// ── Manual session harvest ─────────────────────────────────────────────────
+async function triggerHarvest() {{
+  const btn   = document.getElementById('harvest-btn');
+  const lbl   = document.getElementById('harvest-btn-label');
+  const stat  = document.getElementById('harvest-btn-status');
+  if (!btn || btn.disabled) return;
+  btn.disabled = true;
+  lbl.textContent  = 'Harvesting…';
+  stat.textContent = '';
+  try {{
+    const res = await fetch('/api/sessions/harvest', {{
+      method:  'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body:    JSON.stringify({{session_id: SESSION_ID, force: true}}),
+    }});
+    const j = await res.json();
+    if (j.ran) {{
+      lbl.textContent  = `↑ ${{j.added}} proposal${{j.added === 1 ? '' : 's'}} queued`;
+      stat.textContent = `${{j.new_turns}} new turn${{j.new_turns === 1 ? '' : 's'}}`;
+    }} else {{
+      lbl.textContent  = '↑ Harvest this session';
+      stat.textContent = j.reason || 'nothing new';
+    }}
+  }} catch (e) {{
+    lbl.textContent  = '↑ Harvest this session';
+    stat.textContent = 'error';
+  }} finally {{
+    btn.disabled = false;
+    setTimeout(refreshHarvestStatus, 1000);
+  }}
+}}
+
+async function refreshHarvestStatus() {{
+  try {{
+    const r = await fetch('/api/sessions/harvest-status?session_id=' + encodeURIComponent(SESSION_ID));
+    const j = await r.json();
+    const stat = document.getElementById('harvest-btn-status');
+    if (!stat) return;
+    if (j.last_harvested_at && j.age_seconds != null) {{
+      const m = Math.round(j.age_seconds / 60);
+      const ageStr = m < 60 ? `${{m}}m ago` : `${{Math.round(m/60)}}h ago`;
+      stat.textContent = `last: ${{ageStr}}`;
+    }} else {{
+      stat.textContent = 'never';
+    }}
+  }} catch (e) {{}}
+}}
+
+// Auto-refresh status every 30s + on load
+setInterval(refreshHarvestStatus, 30000);
+setTimeout(refreshHarvestStatus, 1500);
+
 
 let _outputsDir = null;
 

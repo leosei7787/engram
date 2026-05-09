@@ -233,75 +233,239 @@ def _proposal_path_for(item: dict) -> str:
     return "daily/notes/chat_harvest.md"
 
 
-def harvest_turn_to_proposals(
-    *,
-    memory_path:  Path,
-    session_id:   str,
-    user_msg:     str,
-    assistant_text: str,
-    user_name:    str,
-    cfg,
-) -> int:
-    """Extract signal from a turn and add proposals. Returns count added."""
-    items = extract_turn_signal(
-        user_msg=user_msg,
-        assistant_text=assistant_text,
-        user_name=user_name,
-        cfg=cfg,
-    )
-    if not items:
-        return 0
+# ─── Throttle index ───────────────────────────────────────────────────────────
+# Tracks per-session "last harvested" state so we run at most once per hour
+# per session, only when there are new turns since the last run.
 
-    proposals: list[dict] = []
-    for it in items:
-        proposals.append({
-            "path":      _proposal_path_for(it),
-            "operation": "update",
-            "reason":    f"[{it['kind']}] {it['text']}",
-            "salience":  max(0.3, min(1.0, it["salience"])),
-        })
+_HARVEST_INDEX = "sessions/.harvest_index.json"
+_DEFAULT_INTERVAL_S = 3600   # 1 hour
+_index_lock = threading.Lock()
 
+
+def _harvest_index_path(memory_path: Path) -> Path:
+    return memory_path / _HARVEST_INDEX
+
+
+def _load_harvest_index(memory_path: Path) -> dict:
+    p = _harvest_index_path(memory_path)
+    if not p.exists():
+        return {}
     try:
-        from engram.memory.proposals import add_proposals
-        idx_path = memory_path / "proposals" / "index.json"
-        added = add_proposals(
-            idx_path, proposals,
-            source=f"chat_session:{_safe_id(session_id)}",
-            harvest_filename=str(_session_file(memory_path, session_id).relative_to(memory_path)),
-        )
-        return added
+        return json.loads(p.read_text())
     except Exception:
-        print("[session_harvester] add_proposals error:\n" + traceback.format_exc(), flush=True)
-        return 0
+        return {}
 
 
-# ─── Background-friendly entrypoint ───────────────────────────────────────────
+def _save_harvest_index(memory_path: Path, idx: dict) -> None:
+    p = _harvest_index_path(memory_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with _index_lock:
+        p.write_text(json.dumps(idx, indent=2))
 
-def harvest_in_background(
+
+def _mark_harvested(memory_path: Path, session_id: str, turn_count: int, items_added: int) -> None:
+    idx = _load_harvest_index(memory_path)
+    idx[_safe_id(session_id)] = {
+        "last_harvested_at": datetime.now().isoformat(timespec="seconds"),
+        "turn_count":        int(turn_count),
+        "last_added":        int(items_added),
+    }
+    _save_harvest_index(memory_path, idx)
+
+
+def get_harvest_status(memory_path: Path, session_id: str) -> dict:
+    """Read current throttle state for a session. Used by the dashboard."""
+    idx = _load_harvest_index(memory_path)
+    entry = idx.get(_safe_id(session_id), {})
+    last_at = entry.get("last_harvested_at")
+    age = None
+    if last_at:
+        try:
+            age = time.time() - datetime.fromisoformat(last_at).timestamp()
+        except Exception:
+            age = None
+    return {
+        "last_harvested_at": last_at,
+        "age_seconds":       age,
+        "turn_count":        entry.get("turn_count", 0),
+        "last_added":        entry.get("last_added", 0),
+    }
+
+
+# ─── Session-file parser ──────────────────────────────────────────────────────
+# Each turn is a "## YYYY-MM-DD HH:MM:SS" header followed by **User:** and
+# **Assistant:** blocks separated by "---". This parser is paired with the
+# writer in log_turn() — keep them in sync.
+
+_TURN_HEADER_RX = re.compile(r"^##\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*$", re.MULTILINE)
+
+
+def _parse_session_turns(content: str) -> list[dict]:
+    """Return list of {ts, user, assistant} for each turn in the file."""
+    if not content:
+        return []
+    headers = list(_TURN_HEADER_RX.finditer(content))
+    out: list[dict] = []
+    for i, h in enumerate(headers):
+        body_start = h.end()
+        body_end = headers[i + 1].start() if i + 1 < len(headers) else len(content)
+        block = content[body_start:body_end]
+        # Pull **User:** … and **Assistant:** … sections
+        u_m = re.search(r"\*\*User:\*\*\s*(.*?)(?=\n\*\*Assistant:\*\*|\Z)", block, re.DOTALL)
+        a_m = re.search(r"\*\*Assistant:\*\*\s*(.*?)(?=\n---|\Z)", block, re.DOTALL)
+        if not u_m or not a_m:
+            continue
+        out.append({
+            "ts":        h.group(1),
+            "user":      u_m.group(1).strip(),
+            "assistant": a_m.group(1).strip(),
+        })
+    return out
+
+
+# ─── Session-level harvest ────────────────────────────────────────────────────
+
+def harvest_session(
     *,
     memory_path: Path,
     session_id:  str,
-    user_msg:    str,
-    assistant_text: str,
     user_name:   str,
     cfg,
+    force:                bool = False,
+    min_interval_seconds: int  = _DEFAULT_INTERVAL_S,
+) -> dict:
+    """Harvest *all* unharvested turns for a session. Returns a status dict.
+
+    Throttle: skipped if the last harvest was less than ``min_interval_seconds``
+    ago and ``force`` is False. ``force=True`` (manual button) bypasses the
+    timer but still respects the turn-count check (no-op if nothing new).
+    """
+    fp = _session_file(memory_path, session_id)
+    if not fp.exists():
+        return {"ran": False, "reason": "no_session_file", "added": 0}
+
+    try:
+        content = fp.read_text(errors="ignore")
+    except Exception:
+        return {"ran": False, "reason": "read_error", "added": 0}
+
+    all_turns = _parse_session_turns(content)
+    if not all_turns:
+        return {"ran": False, "reason": "no_turns_parsed", "added": 0}
+
+    idx = _load_harvest_index(memory_path)
+    entry = idx.get(_safe_id(session_id), {})
+    last_count = int(entry.get("turn_count", 0))
+    new_turns = all_turns[last_count:]
+
+    if not new_turns:
+        return {"ran": False, "reason": "no_new_turns",
+                "added": 0, "turn_count": len(all_turns)}
+
+    if not force:
+        last_at = entry.get("last_harvested_at")
+        if last_at:
+            try:
+                age = time.time() - datetime.fromisoformat(last_at).timestamp()
+                if age < min_interval_seconds:
+                    return {"ran": False,
+                            "reason": f"throttled (last run {int(age/60)}m ago, min interval {int(min_interval_seconds/60)}m)",
+                            "added": 0,
+                            "new_turns": len(new_turns)}
+            except Exception:
+                pass
+
+    # Run extraction over each new turn. Could batch into one Haiku call but
+    # keeping per-turn so each item's provenance is unambiguous.
+    proposals: list[dict] = []
+    for t in new_turns:
+        items = extract_turn_signal(
+            user_msg       = t["user"],
+            assistant_text = t["assistant"],
+            user_name      = user_name,
+            cfg            = cfg,
+        )
+        for it in items:
+            proposals.append({
+                "path":      _proposal_path_for(it),
+                "operation": "update",
+                "reason":    f"[{it['kind']}] {it['text']}",
+                "salience":  max(0.3, min(1.0, it["salience"])),
+            })
+
+    added = 0
+    if proposals:
+        try:
+            from engram.memory.proposals import add_proposals
+            idx_path = memory_path / "proposals" / "index.json"
+            added = add_proposals(
+                idx_path, proposals,
+                source=f"chat_session:{_safe_id(session_id)}",
+                harvest_filename=str(fp.relative_to(memory_path)),
+            )
+        except Exception:
+            print("[session_harvester] add_proposals error:\n" + traceback.format_exc(), flush=True)
+
+    _mark_harvested(memory_path, session_id, len(all_turns), added)
+
+    return {
+        "ran":         True,
+        "added":       added,
+        "new_turns":   len(new_turns),
+        "turn_count":  len(all_turns),
+        "force":       force,
+    }
+
+
+def harvest_session_in_background(
+    *,
+    memory_path: Path,
+    session_id:  str,
+    user_name:   str,
+    cfg,
+    force:                bool = False,
+    min_interval_seconds: int  = _DEFAULT_INTERVAL_S,
 ) -> threading.Thread:
-    """Fire-and-forget the harvest call so the chat response path stays fast."""
+    """Fire-and-forget wrapper around harvest_session for the chat path."""
     def _run():
         try:
-            n = harvest_turn_to_proposals(
-                memory_path=memory_path,
-                session_id=session_id,
-                user_msg=user_msg,
-                assistant_text=assistant_text,
-                user_name=user_name,
-                cfg=cfg,
+            res = harvest_session(
+                memory_path          = memory_path,
+                session_id           = session_id,
+                user_name            = user_name,
+                cfg                  = cfg,
+                force                = force,
+                min_interval_seconds = min_interval_seconds,
             )
-            if n:
-                print(f"[session_harvester] {session_id}: {n} proposal(s) queued", flush=True)
+            if res.get("ran"):
+                print(f"[session_harvester] {session_id}: harvested {res['new_turns']} turn(s) → {res['added']} proposal(s)", flush=True)
+            else:
+                print(f"[session_harvester] {session_id}: skipped — {res['reason']}", flush=True)
         except Exception:
             print("[session_harvester] background harvest error:\n" + traceback.format_exc(), flush=True)
 
     t = threading.Thread(target=_run, daemon=True, name="engram-session-harvest")
     t.start()
     return t
+
+
+# ─── Backwards-compat shim ────────────────────────────────────────────────────
+# Old call sites used per-turn harvest. Route them through the throttled
+# session-level path so they get the new semantics for free.
+
+def harvest_in_background(
+    *,
+    memory_path: Path,
+    session_id:  str,
+    user_msg:    str,           # noqa: ARG001 — kept for signature compat
+    assistant_text: str,        # noqa: ARG001
+    user_name:   str,
+    cfg,
+) -> threading.Thread:
+    return harvest_session_in_background(
+        memory_path = memory_path,
+        session_id  = session_id,
+        user_name   = user_name,
+        cfg         = cfg,
+        force       = False,
+    )
