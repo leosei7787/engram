@@ -43,9 +43,25 @@ AUDIT_LOG           = MEMORY_PATH / "health" / "audit_log.jsonl"
 SLEEP_STATUS        = MEMORY_PATH / ".sleep_cycle_status.json"
 COST_LOG            = MEMORY_PATH / "health" / "cost_log.jsonl"
 
+# Backwards-compatible V3_ aliases. sleep_cycle.py and any older code that
+# pre-dates the rename still imports these by their previous names. New code
+# should use the un-prefixed names above.
+V3_GRAPH           = GRAPH_FILE
+V3_OPEN_QUESTIONS  = OPEN_QUESTIONS_FILE
+V3_CONTRADICTIONS  = CONTRADICTIONS_FILE
+V3_COMMUNITIES     = COMMUNITIES_FILE
+V3_PRIMING         = PRIMING_FILE
+V3_HEALTH          = HEALTH_FILE
+V3_AUDIT_LOG       = AUDIT_LOG
+V3_SLEEP_STATUS    = SLEEP_STATUS
+V3_COST_LOG        = COST_LOG
+
 __all__ = [
     "MEMORY_PATH",
     "GRAPH_FILE", "OPEN_QUESTIONS_FILE", "CONTRADICTIONS_FILE",
     "COMMUNITIES_FILE", "PRIMING_FILE", "HEALTH_FILE",
     "AUDIT_LOG", "SLEEP_STATUS", "COST_LOG",
+    "V3_GRAPH", "V3_OPEN_QUESTIONS", "V3_CONTRADICTIONS",
+    "V3_COMMUNITIES", "V3_PRIMING", "V3_HEALTH",
+    "V3_AUDIT_LOG", "V3_SLEEP_STATUS", "V3_COST_LOG",
 ]
