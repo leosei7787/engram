@@ -2859,7 +2859,8 @@ def _run_calendar_refresh(cfg) -> None:
             print(f"[calendar] graph: +{gr['meetings_added']} meetings · "
                   f"+{gr['edges_added']} edges · "
                   f"{gr['skipped_unresolved']} unresolved · "
-                  f"{gr['old_meetings_purged']} purged", flush=True)
+                  f"{gr['old_meetings_purged']} purged · "
+                  f"{gr.get('past_occurrences_attached', 0)} past notes linked", flush=True)
         except Exception:
             print("[calendar] graph write error:\n" + traceback.format_exc(), flush=True)
     except Exception:

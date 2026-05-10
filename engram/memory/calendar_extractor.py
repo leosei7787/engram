@@ -338,6 +338,93 @@ def extract_calendar_signals(
     }
 
 
+# ─── Past-occurrence finder (Stage 3) ─────────────────────────────────────────
+# When a recurring meeting series surfaces, the curator should pre-load notes
+# from prior occurrences. We do that by populating the meeting entity's
+# `sources` list with paths to past transcripts / session logs / notes that
+# reference the meeting series. The curator's spread-activation already
+# includes entity sources as candidates, so no curator changes needed.
+
+_PAST_OCCURRENCE_DIRS = (
+    "daily/transcripts",
+    "sessions",
+    "daily/notes",
+    "daily/documents",
+)
+
+
+def _stem_tokens(s: str) -> set[str]:
+    """Coarse tokenisation used for matching meeting summaries to past
+    occurrence files. Drops obvious filler words."""
+    if not s:
+        return set()
+    skip = {
+        "the", "and", "for", "with", "from", "into", "call", "meeting",
+        "weekly", "monthly", "biweekly", "review", "sync",
+    }
+    out: set = set()
+    for tok in re.findall(r"[a-z][a-z0-9]+", s.lower()):
+        if len(tok) >= 3 and tok not in skip:
+            out.add(tok)
+    return out
+
+
+def _find_past_occurrences(memory_path: Path, summary: str, *, limit: int = 4,
+                           days_back: int = 90) -> list[str]:
+    """Find recent files whose name or first ~500 chars reference the
+    meeting summary. Returns relative paths (relative to memory_path's
+    parent so the curator's path joins resolve correctly). At most
+    ``limit`` files, sorted newest first.
+    """
+    needle = _stem_tokens(summary)
+    if not needle:
+        return []
+    cutoff = time.time() - days_back * 86400
+    base   = memory_path.parent           # base_path; sources are stored relative to it
+    hits: list[tuple[float, str, int]] = []   # (mtime, rel_path, score)
+
+    for sub in _PAST_OCCURRENCE_DIRS:
+        d = memory_path / sub
+        if not d.exists():
+            continue
+        try:
+            for f in d.rglob("*.md"):
+                try:
+                    mt = f.stat().st_mtime
+                    if mt < cutoff:
+                        continue
+                    if "_processed" in f.parts or any(p.startswith("_") for p in f.parts):
+                        # Skip backups / archives
+                        pass
+                except Exception:
+                    continue
+                # Score: filename-stem token overlap is cheap and effective for
+                # summary-named files (e.g. "Maps Product Leadership Weekly call.md").
+                stem_tokens = _stem_tokens(f.stem.replace("_", " "))
+                score = len(needle & stem_tokens)
+                if score == 0:
+                    # Fall back to first ~600 chars of content (cheap-ish)
+                    try:
+                        head = f.read_text(errors="ignore")[:600].lower()
+                    except Exception:
+                        continue
+                    body_score = sum(1 for tok in needle if tok in head)
+                    if body_score < max(2, len(needle) // 2):
+                        continue
+                    score = body_score
+                try:
+                    rel = str(f.relative_to(base))
+                except ValueError:
+                    rel = str(f)
+                hits.append((mt, rel, score))
+        except Exception:
+            continue
+
+    # Best score first, then newest
+    hits.sort(key=lambda x: (-x[2], -x[0]))
+    return [rel for (_, rel, _) in hits[:limit]]
+
+
 # ─── Graph integration (Stage 2) ──────────────────────────────────────────────
 # Writes meeting entities + attended_by / about_account edges to MEMORY/
 # graph.json so the curator's spread-activation surfaces meeting context
@@ -427,8 +514,23 @@ def write_meetings_to_graph(*, memory_path: Path, signals: dict) -> dict:
 
         now_iso = datetime.now().isoformat(timespec="seconds")
 
+        # Stage 3: only bother finding past occurrences for recurring series
+        # (one-off events can't have prior occurrences by definition).
+        # Per-write cost: ~200 file stat()s on a typical inbox; well under
+        # the LLM extraction time so it's not the bottleneck.
+        past_occurrence_count = 0
+
         for rec in events:
             mid = _meeting_entity_id(rec)
+            past_notes: list = []
+            if rec.get("is_recurring"):
+                try:
+                    past_notes = _find_past_occurrences(memory_path, rec.get("summary", ""))
+                except Exception:
+                    past_notes = []
+                if past_notes:
+                    past_occurrence_count += len(past_notes)
+
             ents[mid] = {
                 "id":   mid,
                 "name": rec.get("summary", ""),
@@ -445,7 +547,11 @@ def write_meetings_to_graph(*, memory_path: Path, signals: dict) -> dict:
                     "kind_why":     rec.get("why", []),
                     "action":       rec.get("action_required", ""),
                 },
-                "sources":     [],
+                # Past-occurrence files end up here; the curator's spread
+                # activation pulls entity sources into the candidate set,
+                # so when this meeting surfaces, last week's transcript
+                # comes along automatically.
+                "sources":     past_notes,
                 "salience":    0.7 if rec.get("urgency") == "high" else 0.55,
                 "first_seen":  now_iso,
             }
@@ -487,10 +593,11 @@ def write_meetings_to_graph(*, memory_path: Path, signals: dict) -> dict:
         _save_graph(memory_path, g)
 
         return {
-            "meetings_added":     meetings_added,
-            "edges_added":        edges_added,
-            "skipped_unresolved": unresolved,
-            "old_meetings_purged": len(old_meeting_ids),
+            "meetings_added":       meetings_added,
+            "edges_added":          edges_added,
+            "skipped_unresolved":   unresolved,
+            "old_meetings_purged":  len(old_meeting_ids),
+            "past_occurrences_attached": past_occurrence_count,
         }
 
 
@@ -542,7 +649,8 @@ def refresh_in_background(
                 print(f"[calendar] graph: +{gr['meetings_added']} meetings · "
                       f"+{gr['edges_added']} edges · "
                       f"{gr['skipped_unresolved']} unresolved attendees/accounts · "
-                      f"{gr['old_meetings_purged']} stale meetings purged",
+                      f"{gr['old_meetings_purged']} stale meetings purged · "
+                      f"{gr.get('past_occurrences_attached', 0)} past notes linked to recurring series",
                       flush=True)
             except Exception:
                 print("[calendar] graph write error:\n" + traceback.format_exc(), flush=True)
