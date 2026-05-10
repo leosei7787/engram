@@ -244,6 +244,25 @@ def _start_watcher(cfg: EngramConfig):
                 _schedule_signals_refresh(cfg, delay_s=30)
             except Exception:
                 pass
+
+            # If this email was sent BY the user, also schedule a tone-of-voice
+            # refresh — keeps MEMORY/context/tone_of_voice.md aligned with the
+            # user's actual writing style. Single-flight inside refresh_in_background.
+            try:
+                from engram.memory.tone_extractor import is_from_user, refresh_in_background
+                if is_from_user(
+                    cleaned_md,
+                    user_name  = cfg.identity.user_name or "",
+                    user_email = cfg.identity.user_email or "",
+                ):
+                    refresh_in_background(
+                        memory_path = cfg.memory_path,
+                        user_name   = cfg.identity.user_name or "",
+                        user_email  = cfg.identity.user_email or "",
+                        cfg         = cfg,
+                    )
+            except Exception:
+                pass
             return True
         except Exception as e:
             print(f"[watcher] copy error: {e}", flush=True)
@@ -740,6 +759,16 @@ def chat():
         # ── Always-load files (CLAUDE.md, preferences…) ──────────────────────
         # Prepended before dynamic context — always in window regardless of query.
         always_paths = list(getattr(cfg.system_prompt, "always_load", None) or [])
+
+        # Tone of voice: implicit always-load. Lives at MEMORY/context/
+        # tone_of_voice.md. Holds explicit hard rules + auto-extracted
+        # observations so AI-drafted messages match the user's actual voice
+        # and don't read like AI output.
+        tone_rel = "MEMORY/context/tone_of_voice.md"
+        tone_abs = (cfg.memory_path / "context" / "tone_of_voice.md")
+        if tone_abs.exists() and tone_rel not in always_paths and str(tone_abs) not in always_paths:
+            always_paths.insert(0, str(tone_abs))   # tone first — primes the model
+
         for rel in always_paths:
             p = Path(rel) if Path(rel).is_absolute() else base / rel
             if not p.exists():
@@ -1361,6 +1390,37 @@ def pinned_restore():
         "turn_index":     ti,
         "total_turns":    len(turns),
     })
+
+
+@app.route("/api/tone/refresh", methods=["POST"])
+def tone_refresh():
+    """Force a tone-of-voice extraction pass over recent user-from emails.
+
+    Body (optional): {"days_back": 30, "max_emails": 25}.
+    Runs in a background thread; check the server log for completion.
+    """
+    cfg  = get_cfg()
+    body = request.get_json(force=True, silent=True) or {}
+    days_back  = int(body.get("days_back",  30))
+    max_emails = int(body.get("max_emails", 25))
+
+    def _run():
+        try:
+            from engram.memory.tone_extractor import refresh_tone_observations
+            res = refresh_tone_observations(
+                memory_path = cfg.memory_path,
+                user_name   = cfg.identity.user_name  or "",
+                user_email  = cfg.identity.user_email or "",
+                cfg         = cfg,
+                days_back   = days_back,
+                max_emails  = max_emails,
+            )
+            print(f"[tone] manual refresh: {res}", flush=True)
+        except Exception:
+            print("[tone] manual refresh error:\n" + traceback.format_exc(), flush=True)
+
+    threading.Thread(target=_run, daemon=True, name="engram-tone-manual").start()
+    return jsonify({"status": "started", "days_back": days_back, "max_emails": max_emails})
 
 
 @app.route("/api/sessions/harvest", methods=["POST"])
@@ -5540,5 +5600,13 @@ if __name__ == "__main__":
         _start_sleep_scheduler(cfg)
     except Exception as e:
         print(f"[sleep] scheduler failed to start: {e}", flush=True)
+
+    # Ensure the tone-of-voice file exists so it can be auto-loaded on the
+    # very first chat turn. Hard rules ship in the default template.
+    try:
+        from engram.memory.tone_extractor import ensure_tone_file
+        ensure_tone_file(cfg.memory_path)
+    except Exception as e:
+        print(f"[tone] ensure_tone_file failed: {e}", flush=True)
 
     app.run(host="0.0.0.0", port=port, debug=False)
