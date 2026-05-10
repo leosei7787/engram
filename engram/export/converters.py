@@ -110,15 +110,32 @@ def _parse_sections(text: str, doc_title: str = "") -> list[dict]:
 # ─── Filename helper ──────────────────────────────────────────────────────────
 
 def _safe_name(name: str, ext: str) -> str:
+    """Sanitised filename: strips every character that isn't a-zA-Z0-9_- or
+    space, caps at 48 chars, prepends a timestamp. Output is GUARANTEED to
+    have no path separator, no `..`, and no leading dot."""
     ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = re.sub(r"[^a-zA-Z0-9_\- ]", "", name).strip().replace(" ", "_")[:48]
+    base = re.sub(r"[^a-zA-Z0-9_\- ]", "", name or "").strip().replace(" ", "_")[:48]
+    base = base.lstrip(".")  # belt-and-suspenders against future regex changes
     return f"{base}_{ts}.{ext}" if base else f"output_{ts}.{ext}"
+
+
+def _resolve_output_path(output_dir: Path, filename: str, ext: str) -> Path:
+    """Build output_dir/<safe_name>.<ext> and assert it lives under
+    output_dir. Raises ValueError on traversal — callers should let this
+    propagate to the request handler."""
+    out_dir = Path(output_dir).resolve()
+    out     = (out_dir / _safe_name(filename, ext)).resolve()
+    try:
+        out.relative_to(out_dir)
+    except ValueError as err:
+        raise ValueError(f"output path escaped output_dir: {out}") from err
+    return out
 
 
 # ─── Markdown ─────────────────────────────────────────────────────────────────
 
 def to_md(text: str, filename: str, output_dir: Path) -> Path:
-    out = output_dir / _safe_name(filename, "md")
+    out = _resolve_output_path(output_dir, filename, "md")
     out.write_text(text, encoding="utf-8")
     return out
 
@@ -155,7 +172,7 @@ def to_docx(text: str, filename: str, output_dir: Path) -> Path:
             p = doc.add_paragraph()
             _docx_add_runs(p, line)
 
-    out = output_dir / _safe_name(filename, "docx")
+    out = _resolve_output_path(output_dir, filename, "docx")
     doc.save(out)
     return out
 
@@ -213,7 +230,7 @@ def to_pptx(text: str, filename: str, output_dir: Path) -> Path:
             except (KeyError, IndexError):
                 pass
 
-    out = output_dir / _safe_name(filename, "pptx")
+    out = _resolve_output_path(output_dir, filename, "pptx")
     prs.save(out)
     return out
 
@@ -280,7 +297,7 @@ def to_html(text: str, title: str) -> str:
 
 def to_html_file(text: str, filename: str, output_dir: Path) -> Path:
     html  = to_html(text, filename)
-    out   = output_dir / _safe_name(filename, "html")
+    out   = _resolve_output_path(output_dir, filename, "html")
     out.write_text(html, encoding="utf-8")
     return out
 
@@ -290,7 +307,7 @@ def to_pdf(text: str, filename: str, output_dir: Path) -> Path | None:
     try:
         import weasyprint
         html = to_html(text, filename)
-        out  = output_dir / _safe_name(filename, "pdf")
+        out  = _resolve_output_path(output_dir, filename, "pdf")
         weasyprint.HTML(string=html).write_pdf(str(out))
         return out
     except ImportError:
