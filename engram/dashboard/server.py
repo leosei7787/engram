@@ -3778,12 +3778,12 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
     <div class="ctx-modal-title">Add document to context</div>
     <div class="ctx-modal-sub">Upload a file or paste content directly. Injected immediately into this conversation's context window.</div>
     <div class="ctx-modal-upload-zone" id="raw-doc-dropzone" onclick="document.getElementById('raw-doc-file').click()">
-      <input type="file" id="raw-doc-file" style="display:none"
+      <input type="file" id="raw-doc-file" style="display:none" multiple
              accept=".md,.txt,.pdf,.docx,.pptx,.eml,.vtt,.csv"
              onchange="handleFileUpload(this)">
       <div class="ctx-modal-upload-icon">📎</div>
       <div class="ctx-modal-upload-label">Click to upload or drag &amp; drop</div>
-      <div class="ctx-modal-upload-sub">.pdf · .docx · .pptx · .md · .txt</div>
+      <div class="ctx-modal-upload-sub">one or many · .pdf · .docx · .pptx · .md · .txt</div>
     </div>
     <div class="ctx-modal-divider"><span>or paste content</span></div>
     <div class="ctx-modal-row">
@@ -4598,12 +4598,14 @@ refreshOutputs();
 // current session, AND the original bytes go to the watcher's inbox so the
 // file enters the long-term pipeline (cleaner → memory → graph) for future
 // chats. For paste-only content we POST /api/inbox-save in parallel.
-let _lastUploadInboxPath = null;   // set by /api/upload, consumed by addRawDoc
+//
+// The modal accepts multiple files at once (file picker or drag-drop). Each
+// file becomes its own rawDoc independently — the textarea+name pair is
+// reserved for paste-only single-doc input.
 
 function openRawDocModal() {{
   document.getElementById('raw-doc-modal').style.display = 'flex';
   document.getElementById('raw-doc-content').focus();
-  _lastUploadInboxPath = null;
 }}
 
 function closeRawDocModal(e) {{
@@ -4612,47 +4614,11 @@ function closeRawDocModal(e) {{
   }}
 }}
 
-async function handleFileUpload(input) {{
-  const file = input.files[0];
-  if (!file) return;
-
-  const zone = document.getElementById('raw-doc-dropzone');
-  zone.classList.add('uploading');
-  zone.querySelector('.ctx-modal-upload-label').textContent = 'Extracting text…';
-
-  const form = new FormData();
-  form.append('file', file);
-
-  try {{
-    const res  = await fetch('/api/upload', {{ method: 'POST', body: form }});
-    const data = await res.json();
-
-    if (data.error) {{
-      alert('Upload error: ' + data.error);
-    }} else {{
-      document.getElementById('raw-doc-name').value    = data.name;
-      document.getElementById('raw-doc-content').value = data.content;
-      _lastUploadInboxPath = data.saved_to_inbox || null;
-      const inboxNote = _lastUploadInboxPath ? '  ·  saved for future sessions' : '';
-      zone.querySelector('.ctx-modal-upload-label').textContent =
-        '✓ ' + file.name + ' (' + data.chars.toLocaleString() + ' chars)' + inboxNote;
-    }}
-  }} catch (err) {{
-    alert('Upload failed: ' + err.message);
-  }} finally {{
-    zone.classList.remove('uploading');
-    input.value = '';
-  }}
-}}
-
-function addRawDoc() {{
-  const name    = (document.getElementById('raw-doc-name').value.trim() || 'raw_doc_' + (rawDocs.length + 1));
-  const content = document.getElementById('raw-doc-content').value.trim();
-  if (!content) return;
-
+// Push one extracted document into the rawDocs list and the sidebar. Shared
+// by the multi-file upload path and the paste textarea path.
+function _pushRawDoc(name, content, savedToInbox) {{
   rawDocs.push({{name, content}});
 
-  // Show in sidebar immediately
   const list = document.getElementById('ctx-list');
   const el   = makeCtxItem('__raw__/' + name, 'raw');
   el.dataset.path = '__raw__/' + name;
@@ -4660,24 +4626,78 @@ function addRawDoc() {{
   list.insertBefore(el, list.firstChild);
   activeContext.unshift({{path: '__raw__/' + name, type: 'raw'}});
 
-  // Update count
   const countEl = document.getElementById('ctx-count');
-  const m = countEl.textContent.match(/of (\\d+)/);
-  const total = m ? m[1] : '?';
+  const m       = countEl.textContent.match(/of (\\d+)/);
+  const total   = m ? m[1] : '?';
   countEl.textContent = activeContext.length + ' of ' + total + ' candidate' + (Number(total) !== 1 ? 's' : '');
 
-  // If the content didn't come from a file upload (i.e. user pasted directly),
-  // ship a markdown copy to the inbox so it enters long-term pipeline. Fire
-  // and forget — failure here just means no long-term persistence; the
-  // current chat still has the rawDoc in context.
-  if (!_lastUploadInboxPath) {{
+  // If the content didn't come from a file upload (paste path), ship a
+  // markdown copy to the inbox so it still enters the long-term pipeline.
+  // Fire-and-forget: failure here means no long-term persistence; the
+  // current chat already has the rawDoc.
+  if (!savedToInbox) {{
     fetch('/api/inbox-save', {{
       method:  'POST',
       headers: {{'Content-Type': 'application/json'}},
       body:    JSON.stringify({{name, content}}),
     }}).catch(() => {{}});
   }}
-  _lastUploadInboxPath = null;
+}}
+
+// Upload one file via /api/upload and add it as a rawDoc.
+// Returns {{ok: true, name}} on success or {{ok: false, error}} on failure.
+async function _uploadOne(file) {{
+  const form = new FormData();
+  form.append('file', file);
+  try {{
+    const res  = await fetch('/api/upload', {{ method: 'POST', body: form }});
+    const data = await res.json();
+    if (data.error) return {{ok: false, error: data.error, name: file.name}};
+    _pushRawDoc(data.name, data.content, data.saved_to_inbox || null);
+    return {{ok: true, name: file.name, chars: data.chars}};
+  }} catch (err) {{
+    return {{ok: false, error: err.message, name: file.name}};
+  }}
+}}
+
+async function handleFileUpload(input) {{
+  const files = Array.from(input.files || []);
+  if (!files.length) return;
+
+  const zone     = document.getElementById('raw-doc-dropzone');
+  const labelEl  = zone.querySelector('.ctx-modal-upload-label');
+  zone.classList.add('uploading');
+
+  let okCount = 0;
+  const errors = [];
+  for (let i = 0; i < files.length; i++) {{
+    labelEl.textContent = 'Extracting ' + (i + 1) + ' of ' + files.length + '…';
+    const r = await _uploadOne(files[i]);
+    if (r.ok) okCount++;
+    else      errors.push(r.name + ': ' + r.error);
+  }}
+
+  zone.classList.remove('uploading');
+  input.value = '';
+
+  if (errors.length) {{
+    labelEl.textContent = '✓ ' + okCount + ' added · ' + errors.length + ' failed';
+    alert('Upload errors:\\n\\n' + errors.join('\\n'));
+  }} else {{
+    labelEl.textContent = '✓ ' + okCount + ' document' + (okCount === 1 ? '' : 's') + ' added';
+  }}
+
+  // If at least one file went through, close the modal — those files are
+  // already attached. The textarea path is independent.
+  if (okCount > 0) closeRawDocModal();
+}}
+
+function addRawDoc() {{
+  const name    = (document.getElementById('raw-doc-name').value.trim() || 'raw_doc_' + (rawDocs.length + 1));
+  const content = document.getElementById('raw-doc-content').value.trim();
+  if (!content) return;
+
+  _pushRawDoc(name, content, null);
 
   document.getElementById('raw-doc-name').value    = '';
   document.getElementById('raw-doc-content').value = '';
@@ -5767,11 +5787,11 @@ document.addEventListener('DOMContentLoaded', () => {{
   zone.addEventListener('drop', e => {{
     e.preventDefault();
     zone.style.borderColor = '';
-    const file = e.dataTransfer.files[0];
-    if (!file) return;
+    const files = Array.from(e.dataTransfer.files || []);
+    if (!files.length) return;
     const input = document.getElementById('raw-doc-file');
     const dt = new DataTransfer();
-    dt.items.add(file);
+    files.forEach(f => dt.items.add(f));
     input.files = dt.files;
     handleFileUpload(input);
   }});
