@@ -496,12 +496,41 @@ def sleep_cycle_trigger():
 # inbox folder — the next watcher cycle (≤60s) ingests it through the full
 # pipeline (cleaner, redactor, future dream-cycle extraction).
 
+def _path_inside(p: Path, root: Path) -> bool:
+    """True iff ``p`` (resolved) lives under ``root`` (resolved). Used as a
+    path-traversal guard everywhere user-controlled strings become paths.
+    Implemented with the older relative_to+ValueError pattern so it works
+    on Python 3.9 where Path.is_relative_to didn't exist yet.
+    """
+    try:
+        Path(p).resolve().relative_to(Path(root).resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _safe_filename(name: str, *, default: str = "file", maxlen: int = 80) -> str:
+    """Strip every char that isn't [A-Za-z0-9_-] and cap length. The result
+    cannot escape its parent directory, no matter what `name` contains."""
+    safe = re.sub(r"[^\w\-]", "_", (name or "")).strip("_")[:maxlen]
+    return safe or default
+
+
+def _safe_extension(ext: str, *, fallback: str = ".md") -> str:
+    """Allow only `.<word>`, max 6 chars. Anything else falls back."""
+    e = (ext or "").lower()
+    if re.fullmatch(r"\.[a-z0-9]{1,5}", e):
+        return e
+    return fallback
+
+
 def _save_to_inbox(filename: str, data: bytes) -> Path | None:
     """Save bytes to the inbox folder for watcher pickup.
 
     Returns the path written, or None if no inbox is configured / save failed.
-    Filename is sanitised and timestamped to avoid collisions; the watcher
-    de-dupes by content hash anyway.
+    Filename is fully sanitised and the resulting path is asserted to live
+    inside the configured inbox folder before any write happens — no path
+    traversal possible regardless of what ``filename`` contains.
     """
     cfg = get_cfg()
     inbox = getattr(getattr(cfg, "paths", None), "inbox_src", None)
@@ -510,17 +539,19 @@ def _save_to_inbox(filename: str, data: bytes) -> Path | None:
     inbox_path = Path(inbox).expanduser()
     if not inbox_path.exists():
         return None
-    stem = Path(filename).stem
-    ext  = Path(filename).suffix or ".md"
-    safe_stem = re.sub(r"[^\w\-]", "_", stem)[:80] or "chat_upload"
+    safe_stem = _safe_filename(Path(filename).stem, default="chat_upload")
+    safe_ext  = _safe_extension(Path(filename).suffix)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    out = inbox_path / f"chat_upload_{ts}_{safe_stem}{ext}"
+    out = inbox_path / f"chat_upload_{ts}_{safe_stem}{safe_ext}"
+    if not _path_inside(out, inbox_path):
+        # Belt-and-suspenders — the sanitisation above already guarantees this.
+        return None
     try:
         out.write_bytes(data)
         print(f"[chat/upload] saved to inbox for pipeline ingest: {out.name}", flush=True)
         return out
-    except Exception as e:
-        print(f"[chat/upload] inbox save failed: {e}", flush=True)
+    except Exception:
+        print("[chat/upload] inbox save failed:\n" + traceback.format_exc(), flush=True)
         return None
 
 
@@ -575,6 +606,15 @@ def _stream_cli(messages: list, system_prompt: str, cli_bin: str, model: str | N
     system_prompt, n_sys_nulls = _strip_nulls(system_prompt)
     if n_user_nulls or n_sys_nulls:
         print(f"[chat/cli] stripped null bytes: user={n_user_nulls} system={n_sys_nulls}", flush=True)
+
+    # cli_bin comes from cfg.chat.cli_bin (config) or shutil.which("claude").
+    # Reject anything that's not an absolute path to an existing executable —
+    # closes the path-injection surface CodeQL flagged on the Popen call.
+    cli_bin_path = Path(cli_bin or "")
+    if not cli_bin_path.is_absolute() or not cli_bin_path.exists() or not os.access(cli_bin_path, os.X_OK):
+        yield f"\n\n⚠ Claude CLI binary not valid (must be an absolute path to an executable)."
+        return
+    cli_bin = str(cli_bin_path)
 
     cmd = [cli_bin, "-p", user_msg, "--output-format", "stream-json", "--verbose"]
     if system_prompt:
@@ -1697,25 +1737,31 @@ def browse_tree():
 
 def _resolve_browse_path(cfg, path_in: str) -> Path | None:
     """Accept absolute or relative-to-base paths; reject anything outside
-    wiki_path / memory_path / base_path."""
+    wiki_path / memory_path / base_path. Path-traversal-safe via
+    ``_path_inside`` (resolves symlinks, refuses ``..`` escapes)."""
     if not path_in:
         return None
+    # Disallow obvious traversal hints early — ``Path.resolve`` collapses these
+    # but explicit rejection makes the intent crystal clear to CodeQL.
+    if "\x00" in path_in:
+        return None
+
+    roots = [cfg.memory_path, cfg.wiki_path, cfg.base_path]
     candidates: list[Path] = []
     p_in = Path(path_in)
     if p_in.is_absolute():
         candidates.append(p_in)
     else:
-        candidates.append(cfg.base_path / path_in)
-        candidates.append(cfg.memory_path / path_in)
-        candidates.append(cfg.wiki_path / path_in)
-    p = next((c for c in candidates if c.exists() and c.is_file()), None)
-    if p is None:
-        return None
-    abs_p = p.resolve()
-    roots = [cfg.memory_path.resolve(), cfg.wiki_path.resolve(), cfg.base_path.resolve()]
-    if not any(str(abs_p).startswith(str(r)) for r in roots):
-        return None
-    return abs_p
+        for r in roots:
+            candidates.append(r / path_in)
+
+    for c in candidates:
+        if not c.exists() or not c.is_file():
+            continue
+        abs_c = c.resolve()
+        if any(_path_inside(abs_c, r) for r in roots):
+            return abs_c
+    return None
 
 
 @app.route("/api/browse/save", methods=["POST"])
@@ -2000,22 +2046,36 @@ def export_file():
 
     data     = request.get_json(force=True) or {}
     text     = data.get("content", "").strip()
-    fmt      = data.get("format", "md").lower()
-    filename = data.get("filename", "engram_export").strip() or "engram_export"
+    fmt      = (data.get("format", "md") or "md").strip().lower()
+    raw_name = (data.get("filename", "") or "").strip()
 
     if not text:
         return jsonify({"error": "no content"}), 400
 
+    # Sanitise filename + format here so converters.py can trust the inputs.
+    if fmt not in ("md", "html", "docx", "pptx", "pdf"):
+        return jsonify({"error": f"unsupported format: {fmt}"}), 400
+    filename = _safe_filename(raw_name, default="engram_export")
+
     cfg      = get_cfg()
-    out_dir  = Path(cfg.paths.outputs_path) if getattr(cfg.paths, "outputs_path", None) else \
+    out_dir  = Path(cfg.paths.outputs_path).expanduser() if getattr(cfg.paths, "outputs_path", None) else \
                Path(cfg.memory_path).parent / "outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     result = do_export(text, fmt, filename, out_dir)
     if "error" in result:
-        return jsonify(result), 500
+        # Don't leak internal error details to the client.
+        print(f"[export] converter error: {result.get('error')}", flush=True)
+        return jsonify({"error": "export failed — check server log"}), 500
 
     path = Path(result["path"])
+    # Belt-and-suspenders: ensure the converter's write didn't escape out_dir
+    # (it shouldn't — converters.py uses _safe_name — but assert anyway so a
+    # future bug there can never become a path-traversal serve).
+    if not _path_inside(path, out_dir):
+        print(f"[export] path escape: {path} not under {out_dir}", flush=True)
+        return jsonify({"error": "export failed"}), 500
+
     mime_map = {
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -2069,39 +2129,48 @@ def open_path():
     On macOS uses `open` (with `-R` for reveal).
     """
     body   = request.get_json(force=True, silent=True) or {}
-    path   = body.get("path", "")
+    path   = (body.get("path", "") or "").strip()
     reveal = bool(body.get("reveal", False))
 
-    if not path:
-        return jsonify({"error": "no path"}), 400
+    # Hard reject anything that smells like injection. The platform commands
+    # below take a list-form argv (no shell), but we still don't want a
+    # newline / null-byte / control character in a path we're about to hand
+    # to the OS.
+    if not path or "\x00" in path or "\n" in path or "\r" in path:
+        return jsonify({"error": "invalid path"}), 400
+
+    cfg = get_cfg()
+    allowed_roots = [
+        cfg.memory_path,
+        Path(cfg.paths.outputs_path).expanduser() if getattr(cfg.paths, "outputs_path", None) else None,
+        cfg.wiki_path,
+        cfg.base_path,
+    ]
+    allowed_roots = [r for r in allowed_roots if r]
 
     p = Path(path)
     if not p.exists():
         return jsonify({"error": "not found"}), 404
-
-    cfg = get_cfg()
-    # Safety: only allow paths under memory_path, outputs_path, or wiki_path
-    allowed = [
-        cfg.memory_path,
-        Path(cfg.paths.outputs_path) if getattr(cfg.paths, "outputs_path", None) else None,
-        cfg.wiki_path,
-    ]
-    allowed = [a.resolve() for a in allowed if a]
-    abs_p = p.resolve()
-    if not any(str(abs_p).startswith(str(a)) for a in allowed):
+    if not any(_path_inside(p, r) for r in allowed_roots):
         return jsonify({"error": "path outside allowed roots"}), 403
+    abs_p = p.resolve()
 
     try:
+        # All branches use list-form argv (no shell=True), so abs_p is passed
+        # verbatim and never interpreted as a shell argument. Combined with
+        # the under-roots check above, the OS only ever sees a vetted path.
         if sys.platform == "darwin":
-            cmd = ["open"] + (["-R"] if reveal else []) + [str(abs_p)]
+            cmd = ["/usr/bin/open"] + (["-R"] if reveal else []) + [str(abs_p)]
         elif sys.platform.startswith("linux"):
-            cmd = ["xdg-open", str(abs_p.parent if reveal else abs_p)]
-        else:  # windows
-            cmd = ["explorer", "/select," + str(abs_p)] if reveal else ["start", "", str(abs_p)]
-        subprocess.Popen(cmd)
+            cmd = ["/usr/bin/xdg-open", str(abs_p.parent if reveal else abs_p)]
+        else:  # windows — explorer is the launcher
+            cmd = ["explorer.exe", "/select," + str(abs_p)] if reveal else ["explorer.exe", str(abs_p)]
+        subprocess.Popen(cmd, shell=False)  # noqa: S603 — argv list, no shell
         return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        print("[open-path] error:\n" + traceback.format_exc(), flush=True)
+        return jsonify({"error": "internal error — check server log"}), 500
+
 
 
 @app.route("/api/health-detail")
@@ -2142,8 +2211,8 @@ def health_detail():
                 })
             return jsonify({"items": out, "total": len(active)})
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
+            print("[server] handler error:\n" + traceback.format_exc(), flush=True)
+            return jsonify({"error": "internal error — check server log"}), 500
     elif what == "open_questions":
         p = mem / "open_questions.json"
         if not p.exists():
@@ -2170,8 +2239,8 @@ def health_detail():
                 })
             return jsonify({"items": out, "total": len(active)})
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
+            print("[server] handler error:\n" + traceback.format_exc(), flush=True)
+            return jsonify({"error": "internal error — check server log"}), 500
     elif what == "proposals":
         # Pending memory-write proposals — surfaced in Engram Health since
         # the Top of Mind tile got swapped out for Pinned. Newest first
@@ -2198,8 +2267,8 @@ def health_detail():
                 })
             return jsonify({"items": out, "total": len(pending)})
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
+            print("[server] handler error:\n" + traceback.format_exc(), flush=True)
+            return jsonify({"error": "internal error — check server log"}), 500
     return jsonify({"error": "unknown"}), 400
 
 
@@ -2375,9 +2444,8 @@ def resolve_contradiction():
             "registry_added":  registry_added,
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
+        print("[server] handler error:\n" + traceback.format_exc(), flush=True)
+        return jsonify({"error": "internal error — check server log"}), 500
 @app.route("/api/cleanup-resolved", methods=["POST"])
 def cleanup_resolved():
     """
@@ -2492,9 +2560,8 @@ def resolve_question():
             p.write_text(json.dumps(data, indent=2, ensure_ascii=False))
         return jsonify({"ok": True, "id": item_id, "resolution": resolution})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
+        print("[server] handler error:\n" + traceback.format_exc(), flush=True)
+        return jsonify({"error": "internal error — check server log"}), 500
 @app.route("/api/watcher-status")
 def watcher_status():
     return jsonify(_watcher_status)
@@ -2584,9 +2651,8 @@ def watcher_rescan():
         threading.Thread(target=_watcher.run_once, daemon=True).start()
         return jsonify({"ok": True, "message": "rescan triggered"})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
+        print("[server] handler error:\n" + traceback.format_exc(), flush=True)
+        return jsonify({"error": "internal error — check server log"}), 500
 @app.route("/api/recent-activity")
 def recent_activity():
     """
@@ -2615,8 +2681,8 @@ def recent_activity():
             except Exception:
                 continue
     except Exception as e:
-        return jsonify({"items": [], "error": str(e)})
-
+        print("[server] handler error:\n" + traceback.format_exc(), flush=True)
+        return jsonify({"items": [], "error": "internal error"})
     # Sort by mtime (desc); break ties by name so same-second files have
     # a stable, predictable order (otherwise large bulk-rewrites bury new files).
     items.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
