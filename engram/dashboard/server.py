@@ -497,21 +497,17 @@ def sleep_cycle_trigger():
 # pipeline (cleaner, redactor, future dream-cycle extraction).
 
 def _path_inside(p: Path, root: Path) -> bool:
-    """True iff ``p`` (resolved) lives under ``root`` (resolved). Used as a
-    path-traversal guard everywhere user-controlled strings become paths.
-    Implemented with the older relative_to+ValueError pattern so it works
-    on Python 3.9 where Path.is_relative_to didn't exist yet.
-
-    Note: this function IS the path-traversal validator. The .resolve() call
-    below operates on a path that hasn't been validated yet — that's the
-    point — and .relative_to() raises if the resolved path escapes ``root``.
-    Returns False on any failure, so callers get a hard yes/no.
+    """True iff ``p`` (resolved) lives under ``root`` (resolved). Used as
+    a path-traversal guard everywhere user-controlled strings become
+    paths. Uses ``Path.is_relative_to`` (Python 3.9+) which CodeQL's
+    data-flow analysis recognises as a sanitisation barrier.
     """
     try:
-        Path(p).resolve().relative_to(Path(root).resolve())  # lgtm[py/path-injection] — this IS the validator
-        return True
-    except (ValueError, OSError):
+        p_resolved    = Path(p).resolve(strict=False)
+        root_resolved = Path(root).resolve(strict=False)
+    except OSError:
         return False
+    return p_resolved.is_relative_to(root_resolved)
 
 
 def _safe_filename(name: str, *, default: str = "file", maxlen: int = 80) -> str:
@@ -651,7 +647,7 @@ def _stream_cli(messages: list, system_prompt: str, cli_bin: str, model: str | N
         # cli_bin validated above (must be absolute, executable, exists). The
         # remaining args are user content but Popen is invoked with shell=False
         # (default for list-form cmd), so user content is never shell-evaluated.
-        proc = subprocess.Popen(  # lgtm[py/command-line-injection] — argv list, validated bin
+        proc = subprocess.Popen(  # argv list, validated bin
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1943,7 +1939,7 @@ def serve_file():
     if not any(_path_inside(p, r) for r in roots):
         return jsonify({"error": "forbidden"}), 403
 
-    content = p.read_text(errors="ignore")[:24000]  # lgtm[py/path-injection] — verified inside roots
+    content = p.read_text(errors="ignore")[:24000]  # verified inside roots
     return jsonify({"path": str(p), "name": p.name, "content": content})
 
 
@@ -2103,7 +2099,7 @@ def export_file():
     note = result.get("note", "")
     # path is asserted under out_dir above via _path_inside, so flask_send_file
     # only ever serves files we just wrote inside the export directory.
-    resp = flask_send_file(str(path), mimetype=mime,  # lgtm[py/path-injection] — verified inside out_dir
+    resp = flask_send_file(str(path), mimetype=mime,  # verified inside out_dir
                            as_attachment=True, download_name=path.name)
     if note:
         resp.headers["X-Export-Note"] = note
@@ -2185,7 +2181,7 @@ def open_path():
         # cmd is a list (no shell), the binary is an absolute path to a known
         # OS launcher (open / xdg-open / explorer.exe), and abs_p is verified
         # to live under one of the configured allowed roots.
-        subprocess.Popen(cmd, shell=False)  # lgtm[py/command-line-injection] — argv list, abs binary, vetted path
+        subprocess.Popen(cmd, shell=False)  # argv list, abs binary, vetted path
         return jsonify({"ok": True})
     except Exception:
         print("[open-path] error:\n" + traceback.format_exc(), flush=True)
