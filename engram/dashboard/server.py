@@ -352,8 +352,26 @@ def _run_sleep_cycle_now(cfg: "EngramConfig", *, manual: bool = False) -> None:
     try:
         # Imports inside the try block — if a downstream module fails to load,
         # we log + clear `running` rather than crashing the scheduler thread.
-        from engram.memory.sleep_cycle      import run_sleep_cycle
+        from engram.memory             import sleep_cycle as _sc
         from engram.memory.session_harvester import make_session_consolidation_runner
+
+        # engram.memory.__init__ resolves V3_* / *_FILE constants from the
+        # ENGRAM_MEMORY_PATH env var at import time. The dashboard doesn't
+        # set that env var (it's config-driven), so the constants would
+        # otherwise point at a stale default. Re-bind them to the live
+        # cfg.memory_path so every status / audit / graph write lands where
+        # the rest of the dashboard expects.
+        mp = cfg.memory_path
+        _sc.V3_GRAPH          = mp / "graph.json"
+        _sc.V3_OPEN_QUESTIONS = mp / "open_questions.json"
+        _sc.V3_CONTRADICTIONS = mp / "contradictions.json"
+        _sc.V3_COMMUNITIES    = mp / "communities.json"
+        _sc.V3_HEALTH         = mp / "health" / "health_snapshot.json"
+        _sc.V3_AUDIT_LOG      = mp / "health" / "audit_log.jsonl"
+        _sc.V3_SLEEP_STATUS   = mp / ".sleep_cycle_status.json"
+        _sc.V3_COST_LOG       = mp / "health" / "cost_log.jsonl"
+
+        run_sleep_cycle = _sc.run_sleep_cycle
 
         runner = make_session_consolidation_runner(
             memory_path   = cfg.memory_path,
