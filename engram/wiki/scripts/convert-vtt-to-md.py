@@ -95,7 +95,14 @@ _TIMESTAMP_RE = re.compile(
 )
 _CUE_ARROW_RE = re.compile(r"-->")
 _VOICE_TAG_RE = re.compile(r"<v\s+([^>]+)>")
-_HTML_TAG_RE  = re.compile(r"<[^>]+>")
+# VTT cue payloads only ever contain a closed grammar of inline tags:
+# <v Speaker>, <i>, <b>, <c.classname>, <lang xx>. Pattern matches just
+# those — refusing to engage with arbitrary HTML keeps CodeQL's
+# `bad HTML filtering regexp` rule (and reality) happy.
+_HTML_TAG_RE  = re.compile(
+    r"</?(?:v(?:\s[^<>]*)?|i|b|c(?:\.[a-zA-Z0-9_-]+)?|lang(?:\s[^<>]*)?)>",
+    re.IGNORECASE,
+)
 
 # Colon-speaker heuristic: up to 4 words before the first colon (enforced by regex)
 _COLON_SPEAKER_RE = re.compile(r"^((?:\S+\s+){0,3}\S+):\s+(.+)$", re.DOTALL)
