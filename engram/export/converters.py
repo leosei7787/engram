@@ -110,13 +110,15 @@ def _parse_sections(text: str, doc_title: str = "") -> list[dict]:
 # ─── Filename helper ──────────────────────────────────────────────────────────
 
 def _safe_name(name: str, ext: str) -> str:
-    """Sanitised filename: strips every character that isn't a-zA-Z0-9_- or
-    space, caps at 48 chars, prepends a timestamp. Output is GUARANTEED to
-    have no path separator, no `..`, and no leading dot."""
+    """Sanitised filename built around ``werkzeug.utils.secure_filename`` —
+    a stdlib-ish helper CodeQL recognises as a path-traversal sanitiser.
+    Falls back to a timestamped placeholder if the input collapses to empty.
+    """
+    from werkzeug.utils import secure_filename
     ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = re.sub(r"[^a-zA-Z0-9_\- ]", "", name or "").strip().replace(" ", "_")[:48]
-    base = base.lstrip(".")  # belt-and-suspenders against future regex changes
-    return f"{base}_{ts}.{ext}" if base else f"output_{ts}.{ext}"
+    safe = secure_filename(name or "")[:48]
+    safe = safe.lstrip(".")
+    return f"{safe}_{ts}.{ext}" if safe else f"output_{ts}.{ext}"
 
 
 def _resolve_output_path(output_dir: Path, filename: str, ext: str) -> Path:
@@ -124,17 +126,16 @@ def _resolve_output_path(output_dir: Path, filename: str, ext: str) -> Path:
     output_dir. Raises ValueError on traversal — callers should let this
     propagate to the request handler.
 
-    This function IS the sanitiser for `filename`; it is intended that user
-    input flows in here. _safe_name strips path separators and `..` from the
-    name, .resolve() collapses any remaining shenanigans, and .relative_to
-    enforces containment.
+    Two layers of containment defence:
+      1. ``_safe_name`` (werkzeug.secure_filename) strips path separators
+         and `..` from the user-supplied name.
+      2. ``Path.is_relative_to`` confirms the resolved path lives under
+         the resolved output_dir, catching anything that slipped past.
     """
     out_dir = Path(output_dir).resolve()
-    out     = (out_dir / _safe_name(filename, ext)).resolve()  # lgtm[py/path-injection] — sanitiser
-    try:
-        out.relative_to(out_dir)
-    except ValueError as err:
-        raise ValueError(f"output path escaped output_dir: {out}") from err
+    out     = (out_dir / _safe_name(filename, ext)).resolve()
+    if not out.is_relative_to(out_dir):
+        raise ValueError(f"output path escaped output_dir: {out}")
     return out
 
 
@@ -142,7 +143,7 @@ def _resolve_output_path(output_dir: Path, filename: str, ext: str) -> Path:
 
 def to_md(text: str, filename: str, output_dir: Path) -> Path:
     out = _resolve_output_path(output_dir, filename, "md")
-    out.write_text(text, encoding="utf-8")  # lgtm[py/path-injection] — sanitised by _resolve_output_path
+    out.write_text(text, encoding="utf-8")  # sanitised by _resolve_output_path
     return out
 
 
@@ -304,7 +305,7 @@ def to_html(text: str, title: str) -> str:
 def to_html_file(text: str, filename: str, output_dir: Path) -> Path:
     html  = to_html(text, filename)
     out   = _resolve_output_path(output_dir, filename, "html")
-    out.write_text(html, encoding="utf-8")  # lgtm[py/path-injection] — sanitised by _resolve_output_path
+    out.write_text(html, encoding="utf-8")  # sanitised by _resolve_output_path
     return out
 
 
