@@ -2686,15 +2686,21 @@ _RECENT_INBOX_EXTS = {".md", ".txt", ".eml", ".pdf", ".docx", ".pptx", ".vtt",
 @app.route("/api/recent-activity")
 def recent_activity():
     """
-    Real-time feed of recently modified files across the user's two
-    durable surfaces: MEMORY/ (cleaned + indexed content) and the inbox
-    (raw arrivals awaiting processing — calendar.ics, freshly-dropped
-    docs, etc.). 14-day window. Sessions and pre-compression backups
-    are excluded; the inbox's _processed/ archive folder is excluded
-    (those files have already shown up via MEMORY).
+    Real-time feed of recently modified content across the three surfaces
+    the user actually consumes:
 
-    Empty files are skipped — usually they're a half-written sync from
-    OneDrive that resolves a moment later.
+      - inbox/   — raw arrivals (calendar.ics, fresh uploads) that
+                   haven't been processed yet
+      - MEMORY/  — *inputs only* (daily/, weekly/). Wiki is canonical
+                   for entity records now, so the legacy entity folders
+                   (accounts/, decisions/, context/, …) are skipped — as
+                   are state directories (signals/, proposals/, pinned/,
+                   priming/, sessions/, _archive/).
+      - wiki/    — curated entity records, so manual or auto wiki edits
+                   surface as activity.
+
+    14-day window. Empty (0-byte) files are skipped — usually a half-
+    synced OneDrive placeholder that resolves seconds later.
     """
     cfg = get_cfg()
     mem    = cfg.memory_path
@@ -2725,13 +2731,20 @@ def recent_activity():
         except Exception:
             return
 
-    # 1) MEMORY/ — only .md, since the rest is binary state files.
+    # 1) MEMORY/ — only the input folders. Entity-record folders moved to
+    # wiki/ (and their MEMORY counterparts are archived via _archive/),
+    # state dirs (signals/, proposals/, …) aren't user-facing activity.
+    memory_input_dirs = ("daily", "weekly")
     try:
-        for f in mem.rglob("*.md"):
-            sf = str(f)
-            if "/sessions/" in sf or "/_pre_compression_backups/" in sf:
+        for sub in memory_input_dirs:
+            sub_root = mem / sub
+            if not sub_root.exists():
                 continue
-            _emit(f, root=mem)
+            for f in sub_root.rglob("*.md"):
+                sf = str(f)
+                if "/sessions/" in sf or "/_pre_compression_backups/" in sf:
+                    continue
+                _emit(f, root=mem)
     except Exception:
         print("[recent-activity] memory scan error:\n" + traceback.format_exc(), flush=True)
 
@@ -2762,6 +2775,24 @@ def recent_activity():
                     _emit(f, root=inbox, label_prefix="inbox/")
     except Exception:
         print("[recent-activity] inbox scan error:\n" + traceback.format_exc(), flush=True)
+
+    # 3) Wiki — curated entity records. Anchors at wiki_path/wiki/ when
+    # present (the standard knowledge-base-wiki layout) and falls back to
+    # wiki_path otherwise. Same labelling pattern as inbox: 'wiki/' prefix
+    # in rel/folder so the UI can group/style them.
+    try:
+        wiki_root = cfg.wiki_path / "wiki"
+        if not wiki_root.exists():
+            wiki_root = cfg.wiki_path
+        if wiki_root.exists():
+            for f in wiki_root.rglob("*.md"):
+                # _index.md files churn on every wiki edit; they'd dominate
+                # the feed without telling the user anything new.
+                if f.name == "_index.md":
+                    continue
+                _emit(f, root=wiki_root, label_prefix="wiki/")
+    except Exception:
+        print("[recent-activity] wiki scan error:\n" + traceback.format_exc(), flush=True)
 
     # Sort by mtime (desc); break ties by name so same-second files have
     # a stable, predictable order (otherwise large bulk-rewrites bury new files).
