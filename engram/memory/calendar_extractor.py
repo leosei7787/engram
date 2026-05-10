@@ -338,6 +338,162 @@ def extract_calendar_signals(
     }
 
 
+# ─── Graph integration (Stage 2) ──────────────────────────────────────────────
+# Writes meeting entities + attended_by / about_account edges to MEMORY/
+# graph.json so the curator's spread-activation surfaces meeting context
+# automatically when the user asks about a person or account.
+
+_graph_lock = threading.Lock()
+
+
+def _load_graph(memory_path: Path) -> dict:
+    p = memory_path / "graph.json"
+    if not p.exists():
+        return {"entities": {}, "edges": []}
+    try:
+        g = json.loads(p.read_text())
+        g.setdefault("entities", {})
+        g.setdefault("edges", [])
+        return g
+    except Exception:
+        return {"entities": {}, "edges": []}
+
+
+def _save_graph(memory_path: Path, g: dict) -> None:
+    p = memory_path / "graph.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    g["updated"] = datetime.now().isoformat(timespec="seconds")
+    p.write_text(json.dumps(g, indent=2))
+
+
+def _build_lookups(graph: dict) -> tuple[dict, dict]:
+    """Return ({lowercase_token → person_id}, {lowercase_token → account_id})
+    for fuzzy resolution of attendees and account_links."""
+    people:   dict = {}
+    accounts: dict = {}
+    for eid, ent in (graph.get("entities") or {}).items():
+        name = (ent.get("name") or "").strip()
+        if not name:
+            continue
+        t = ent.get("type", "")
+        target = people if t == "person" else accounts if t in ("account", "company") else None
+        if target is None:
+            continue
+        target.setdefault(name.lower(), eid)
+        for tok in name.lower().split():
+            target.setdefault(tok, eid)
+    return people, accounts
+
+
+def _meeting_entity_id(rec: dict) -> str:
+    """One ID per meeting series. Recurring meetings collapse to a single
+    entity (we don't want a node per weekly occurrence — too much graph
+    bloat). One-offs get the date appended for distinctness."""
+    summary = rec.get("summary") or "meeting"
+    base = _slug(summary)
+    if rec.get("is_recurring"):
+        return f"meeting:{base}"
+    iso = rec.get("iso") or "unknown"
+    return f"meeting:{base}:{iso}"
+
+
+def write_meetings_to_graph(*, memory_path: Path, signals: dict) -> dict:
+    """Add / refresh meeting entities + attended_by and about_account edges
+    in graph.json. Idempotent per meeting ID. Returns counts for telemetry.
+    """
+    events = [e for e in (signals.get("events") or []) if e.get("is_high_stakes") and not e.get("is_cancelled")]
+    if not events:
+        return {"meetings_added": 0, "edges_added": 0, "skipped_unresolved": 0}
+
+    with _graph_lock:
+        g = _load_graph(memory_path)
+        people_idx, accounts_idx = _build_lookups(g)
+
+        # Drop ALL existing meeting entities + their edges first — the
+        # extraction is the source of truth so a stale recurring meeting
+        # whose summary changed shouldn't linger.
+        ents = g.get("entities") or {}
+        old_meeting_ids = {eid for eid, e in ents.items() if e.get("type") == "meeting"}
+        for eid in old_meeting_ids:
+            ents.pop(eid, None)
+        g["edges"] = [
+            e for e in (g.get("edges") or [])
+            if e.get("from") not in old_meeting_ids and e.get("to") not in old_meeting_ids
+        ]
+
+        meetings_added = 0
+        edges_added    = 0
+        unresolved     = 0
+
+        now_iso = datetime.now().isoformat(timespec="seconds")
+
+        for rec in events:
+            mid = _meeting_entity_id(rec)
+            ents[mid] = {
+                "id":   mid,
+                "name": rec.get("summary", ""),
+                "type": "meeting",
+                "props": {
+                    "kind":         rec.get("kind", ""),
+                    "recurrence":   rec.get("recurrence", "one_off"),
+                    "is_recurring": bool(rec.get("is_recurring")),
+                    "next_iso":     rec.get("iso", ""),
+                    "next_time":    rec.get("time", ""),
+                    "location":     rec.get("location", ""),
+                    "organizer":    rec.get("organizer", ""),
+                    "urgency":      rec.get("urgency", "medium"),
+                    "kind_why":     rec.get("why", []),
+                    "action":       rec.get("action_required", ""),
+                },
+                "sources":     [],
+                "salience":    0.7 if rec.get("urgency") == "high" else 0.55,
+                "first_seen":  now_iso,
+            }
+            meetings_added += 1
+
+            # Resolve people_links / attendees → person entity IDs.
+            for slug in (rec.get("people_links") or []):
+                pid = people_idx.get(slug.lower()) or people_idx.get(slug.replace("_", " ").lower())
+                if not pid:
+                    unresolved += 1
+                    continue
+                g["edges"].append({
+                    "from": mid, "to": pid, "type": "attended_by",
+                    "weight": 0.6, "first_seen": now_iso,
+                })
+                g["edges"].append({
+                    "from": pid, "to": mid, "type": "attends",
+                    "weight": 0.6, "first_seen": now_iso,
+                })
+                edges_added += 2
+
+            # Resolve account_links → account entity IDs.
+            for slug in (rec.get("account_links") or []):
+                aid = accounts_idx.get(slug.lower()) or accounts_idx.get(slug.replace("_", " ").lower())
+                if not aid:
+                    unresolved += 1
+                    continue
+                g["edges"].append({
+                    "from": mid, "to": aid, "type": "about_account",
+                    "weight": 0.7, "first_seen": now_iso,
+                })
+                g["edges"].append({
+                    "from": aid, "to": mid, "type": "discussed_in",
+                    "weight": 0.7, "first_seen": now_iso,
+                })
+                edges_added += 2
+
+        g["entities"] = ents
+        _save_graph(memory_path, g)
+
+        return {
+            "meetings_added":     meetings_added,
+            "edges_added":        edges_added,
+            "skipped_unresolved": unresolved,
+            "old_meetings_purged": len(old_meeting_ids),
+        }
+
+
 # ─── Background-friendly wrapper ──────────────────────────────────────────────
 
 _refresh_lock = threading.Lock()
@@ -376,6 +532,20 @@ def refresh_in_background(
                   f"{sigs['skipped']['cancelled']} cancelled + "
                   f"{sigs['skipped']['personal']} personal + "
                   f"{sigs['skipped']['errors']} errors filtered out", flush=True)
+
+            # Stage 2: also write meeting nodes + attended_by / about_account
+            # edges into graph.json so the curator's spread-activation
+            # surfaces meeting context when the user asks about a person /
+            # account.
+            try:
+                gr = write_meetings_to_graph(memory_path=memory_path, signals=sigs)
+                print(f"[calendar] graph: +{gr['meetings_added']} meetings · "
+                      f"+{gr['edges_added']} edges · "
+                      f"{gr['skipped_unresolved']} unresolved attendees/accounts · "
+                      f"{gr['old_meetings_purged']} stale meetings purged",
+                      flush=True)
+            except Exception:
+                print("[calendar] graph write error:\n" + traceback.format_exc(), flush=True)
         except Exception:
             print("[calendar] background error:\n" + traceback.format_exc(), flush=True)
         finally:

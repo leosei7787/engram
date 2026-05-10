@@ -2834,7 +2834,10 @@ def _run_calendar_refresh(cfg) -> None:
     """Synchronous calendar extraction → save. Used by the manual endpoint
     and the debouncer. Single-flight enforced inside refresh_in_background."""
     try:
-        from engram.memory.calendar_extractor import find_latest_ics, extract_calendar_signals, save_signals
+        from engram.memory.calendar_extractor import (
+            find_latest_ics, extract_calendar_signals, save_signals,
+            write_meetings_to_graph,
+        )
         inbox = getattr(getattr(cfg, "paths", None), "inbox_src", None)
         ics = find_latest_ics(inbox_src=Path(inbox) if inbox else None, memory_path=cfg.memory_path)
         if not ics:
@@ -2849,6 +2852,16 @@ def _run_calendar_refresh(cfg) -> None:
         print(f"[calendar] refresh done: {sigs['scanned']} scanned · "
               f"{sigs['high_stakes']} high-stakes · "
               f"filtered {sigs['skipped']}", flush=True)
+        # Stage 2: also push meeting nodes + edges to graph.json so the
+        # curator's spread-activation surfaces meeting context.
+        try:
+            gr = write_meetings_to_graph(memory_path=cfg.memory_path, signals=sigs)
+            print(f"[calendar] graph: +{gr['meetings_added']} meetings · "
+                  f"+{gr['edges_added']} edges · "
+                  f"{gr['skipped_unresolved']} unresolved · "
+                  f"{gr['old_meetings_purged']} purged", flush=True)
+        except Exception:
+            print("[calendar] graph write error:\n" + traceback.format_exc(), flush=True)
     except Exception:
         print("[calendar] refresh error:\n" + traceback.format_exc(), flush=True)
 
