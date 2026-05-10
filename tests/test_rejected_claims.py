@@ -4,7 +4,7 @@ Golden tests for the rejected-claims registry and source filtering.
 The user's manual resolutions of contradictions must persist across sleep
 cycles. Future extractions from non-authoritative sources (random emails,
 transcripts) must NOT be allowed to overwrite that ground truth with
-nonsense like "Leo Sei reports_to LOT Upgrade".
+nonsense like "Bob Smith reports_to Some Project".
 """
 from __future__ import annotations
 
@@ -38,23 +38,23 @@ def _make_contradiction(a_stmt: str, b_stmt: str) -> dict:
 def test_resolved_B_records_truth_and_rejects_A():
     with tempfile.TemporaryDirectory() as tmp:
         reg = Path(tmp) / "rejected.json"
-        c = _make_contradiction("Leo Sei reports_to LOT Upgrade",
-                                "Leo Sei reports_to Mike Schoofs")
+        c = _make_contradiction("Bob Smith reports_to Some Project",
+                                "Bob Smith reports_to Alice Chen")
         added = record_resolution(reg, c, "resolved_B")
         assert added == 2  # 1 truth + 1 rejection
         r = load_rejected_registry(reg)
         assert len(r["ground_truths"]) == 1
-        assert r["ground_truths"][0]["object"] == "Mike Schoofs"
+        assert r["ground_truths"][0]["object"] == "Alice Chen"
         assert len(r["rejected"]) == 1
-        assert r["rejected"][0]["object"] == "LOT Upgrade"
+        assert r["rejected"][0]["object"] == "Some Project"
         print("✓ resolved_B records truth + rejects losing claim")
 
 
 def test_both_false_rejects_both():
     with tempfile.TemporaryDirectory() as tmp:
         reg = Path(tmp) / "rejected.json"
-        c = _make_contradiction("Leo Sei reports_to Tara Farzami",
-                                "Leo Sei reports_to Joao Laranjeira")
+        c = _make_contradiction("Bob Smith reports_to Iris Cole",
+                                "Bob Smith reports_to Jay Knox")
         record_resolution(reg, c, "both_false")
         r = load_rejected_registry(reg)
         assert len(r["rejected"]) == 2
@@ -75,25 +75,25 @@ def test_purge_removes_rejected_edges():
     """An established truth should cause violating edges to be purged."""
     graph = {
         "entities": {
-            "person:leo_sei":      {"name": "Leo Sei"},
-            "person:mike_schoofs": {"name": "Mike Schoofs"},
-            "company:lot":         {"name": "LOT Upgrade"},
-            "person:tara":         {"name": "Tara Farzami"},
+            "person:bob_smith":      {"name": "Bob Smith"},
+            "person:alice_chen": {"name": "Alice Chen"},
+            "company:lot":         {"name": "Some Project"},
+            "person:tara":         {"name": "Iris Cole"},
         },
         "edges": [
-            {"from": "person:leo_sei", "to": "person:mike_schoofs", "type": "reports_to"},
-            {"from": "person:leo_sei", "to": "company:lot",         "type": "reports_to"},
-            {"from": "person:leo_sei", "to": "person:tara",         "type": "reports_to"},
+            {"from": "person:bob_smith", "to": "person:alice_chen", "type": "reports_to"},
+            {"from": "person:bob_smith", "to": "company:lot",         "type": "reports_to"},
+            {"from": "person:bob_smith", "to": "person:tara",         "type": "reports_to"},
         ],
     }
     registry = {
-        "rejected": [{"subject": "Leo Sei", "relation": "reports_to", "object": "LOT Upgrade"}],
-        "ground_truths": [{"subject": "Leo Sei", "relation": "reports_to", "object": "Mike Schoofs"}],
+        "rejected": [{"subject": "Bob Smith", "relation": "reports_to", "object": "Some Project"}],
+        "ground_truths": [{"subject": "Bob Smith", "relation": "reports_to", "object": "Alice Chen"}],
     }
     purged = purge_rejected_edges_from_graph(graph, registry)
-    assert purged == 2  # LOT Upgrade (rejected) + Tara (ground-truth violation)
+    assert purged == 2  # Some Project (rejected) + Tara (ground-truth violation)
     assert len(graph["edges"]) == 1
-    assert graph["edges"][0]["to"] == "person:mike_schoofs"
+    assert graph["edges"][0]["to"] == "person:alice_chen"
     print(f"✓ purge removed {purged} bad edges, kept the established truth")
 
 
@@ -101,9 +101,9 @@ def test_find_contradictions_skips_non_authoritative_sources():
     """An email-sourced reports_to triple must NOT generate a contradiction."""
     graph = {"entities": {}, "edges": []}
     new_triples = [
-        {"from": "Leo Sei", "to": "LOT Upgrade", "type": "reports_to",
+        {"from": "Bob Smith", "to": "Some Project", "type": "reports_to",
          "confidence": 0.9, "source": "MEMORY/daily/emails/lot_polish_airlines.md"},
-        {"from": "Leo Sei", "to": "Mike Schoofs", "type": "reports_to",
+        {"from": "Bob Smith", "to": "Alice Chen", "type": "reports_to",
          "confidence": 0.9, "source": "MEMORY/context/people.md"},
     ]
     out = find_contradictions(new_triples, graph)
@@ -111,22 +111,22 @@ def test_find_contradictions_skips_non_authoritative_sources():
     # The first because email is non-authoritative; the second because there's nothing to conflict with.
     statements = [c.get("claim_A",{}).get("statement","") + c.get("claim_B",{}).get("statement","") for c in out]
     assert not any("LOT" in s for s in statements), \
-        f"email-sourced LOT Upgrade should be filtered out. Got: {statements}"
+        f"email-sourced Some Project should be filtered out. Got: {statements}"
     print("✓ source filter blocks org-relation extraction from emails")
 
 
 def test_find_contradictions_respects_registry():
     """A previously rejected triple should not generate a new contradiction."""
-    # Existing edge: Leo reports to Mike (the truth)
+    # Existing edge: Bob reports to Alice (the truth)
     graph = {
         "entities": {
-            "leo": {"name": "Leo Sei"},
-            "mike": {"name": "Mike Schoofs"},
+            "leo": {"name": "Bob Smith"},
+            "mike": {"name": "Alice Chen"},
             "tara": {"name": "Tara"},
         },
         "edges": [{"from": "leo", "to": "mike", "type": "reports_to"}],
     }
-    # New triple says Leo reports to Tara — this would normally create a contradiction
+    # New triple says Bob reports to Tara — this would normally create a contradiction
     new_triples = [{"from": "leo", "to": "tara", "type": "reports_to",
                     "confidence": 0.9, "source": "MEMORY/context/people.md"}]
 
@@ -136,7 +136,7 @@ def test_find_contradictions_respects_registry():
 
     # With registry containing the ground truth: silently drops the new triple
     registry = {
-        "ground_truths": [{"subject": "Leo Sei", "relation": "reports_to", "object": "Mike Schoofs"}],
+        "ground_truths": [{"subject": "Bob Smith", "relation": "reports_to", "object": "Alice Chen"}],
         "rejected": [],
     }
     out_filtered = find_contradictions(new_triples, graph, rejected_registry=registry)
@@ -156,11 +156,11 @@ def test_authoritative_source_check():
 
 def test_parse_statement_handles_real_data():
     cases = [
-        ("Leo Sei reports_to Mike Schoofs",     ("Leo Sei", "reports_to", "Mike Schoofs")),
-        ("Benoit Joly reports_to Manuela Locarno Ajayi",
-         ("Benoit Joly", "reports_to", "Manuela Locarno Ajayi")),
-        ("Leo Sei manages TomTom",              ("Leo Sei", "manages", "TomTom")),
-        ("Leo Sei reports to LOT Upgrade",      ("Leo Sei", "reports_to", "LOT Upgrade")),
+        ("Bob Smith reports_to Alice Chen",     ("Bob Smith", "reports_to", "Alice Chen")),
+        ("Karl Brown reports_to Carol Davis",
+         ("Karl Brown", "reports_to", "Carol Davis")),
+        ("Bob Smith manages AcmeCorp",              ("Bob Smith", "manages", "AcmeCorp")),
+        ("Bob Smith reports to Some Project",      ("Bob Smith", "reports_to", "Some Project")),
     ]
     for stmt, expected in cases:
         got = _parse_statement(stmt)

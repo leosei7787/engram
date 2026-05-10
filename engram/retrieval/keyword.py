@@ -14,8 +14,8 @@ Key design choices:
 
 Resilience features (v0.2):
 - Stemming:          morphological variants match (meetings/meeting, hired/hiring)
-- Synonym expansion: config-driven equivalent terms (vw/volkswagen, car/automotive)
-- Fuzzy PN match:    difflib catches typos in proper nouns (Stellantiss->Stellantis)
+- Synonym expansion: config-driven equivalent terms (amx/acmemotors, car/automotive)
+- Fuzzy PN match:    difflib catches typos in proper nouns (BetaMotorss->BetaMotors)
 """
 
 from __future__ import annotations
@@ -142,7 +142,7 @@ def fast_file_score(
     recency  = any(w in q_lower for w in ("latest", "recent", "update", "current", "now", "today"))
     q_toks   = query_tokens(query)
 
-    # Synonym expansion: bidirectional -- "vw" pulls in "volkswagen" and vice-versa
+    # Synonym expansion: bidirectional -- "amx" pulls in "acmemotors" and vice-versa
     if synonyms:
         q_toks = expand_with_synonyms(q_toks, synonyms)
 
@@ -200,7 +200,7 @@ def fast_file_score(
 
         # ── Fuzzy proper-noun matching (typo resilience) ──────────────────────
         # Only on long proper nouns (>=5 chars) to keep false-positive rate low.
-        # difflib cutoff=0.85 is strict: "Stellantiss" matches "Stellantis",
+        # difflib cutoff=0.85 is strict: "BetaMotorss" matches "BetaMotors",
         # but "cat" does not match "car".
         fuzzy_pn_hits = 0
         if pn_long:

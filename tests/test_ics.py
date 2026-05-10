@@ -21,16 +21,16 @@ DTSTAMP:20260509T180135Z
 DTSTART:20260511T080000Z
 DTEND:20260511T083000Z
 SUMMARY:Prep call Discovery Japan
-LOCATION:Microsoft Teams Meeting
-ORGANIZER:MAILTO:Mike.Schoofs@tomtom.com
+LOCATION:MegaCorp Teams Meeting
+ORGANIZER:MAILTO:Alice.Chen@example.com
 DESCRIPTION:
 END:VEVENT
 BEGIN:VEVENT
 UID:event-2@test
 DTSTART:20260511T083000Z
 DTEND:20260511T090000Z
-SUMMARY:1:1 Anthony / Leo
-ORGANIZER:MAILTO:Leo.Sei@tomtom.com
+SUMMARY:1:1 Anthony / Bob
+ORGANIZER:MAILTO:Bob.Smith@example.com
 END:VEVENT
 BEGIN:VEVENT
 UID:event-3@test
@@ -53,7 +53,7 @@ def test_parses_basic_events():
     assert len(events) == 3, f"expected 3 events, got {len(events)}"
     e1 = events[0]
     assert e1.summary == "Prep call Discovery Japan"
-    assert e1.organizer == "Mike.Schoofs@tomtom.com"
+    assert e1.organizer == "Alice.Chen@example.com"
     assert e1.start.year == 2026
     assert e1.start.month == 5
     assert e1.start.day == 11

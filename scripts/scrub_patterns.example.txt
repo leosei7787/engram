@@ -1,0 +1,25 @@
+# Example watchlist for scripts/check-no-pii.py.
+# Copy to ~/.engram/scrub_patterns.txt and edit with your actual list.
+# One pattern per line. Lines starting with # are comments.
+# Default: case-insensitive substring match.
+# Prefix with `re:` for a regex.
+
+# === Personal names ===
+# Mike Schoofs
+# Leo Sei
+# Jane Doe
+
+# === Email domains ===
+# @yourcompany.com
+
+# === Customer / partner accounts ===
+# Volkswagen
+# CARIAD
+# Stellantis
+
+# === Internal codenames / project names ===
+# (project codenames you don't want appearing in public source)
+
+# === Regex examples ===
+# re:\b[A-Z][a-z]+\.[A-Z][a-z]+@yourcompany\.com\b   # matches first.last@yourcompany.com
+# re:\bCONFIDENTIAL[_-][A-Z0-9]+\b                   # internal labels

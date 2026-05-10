@@ -81,9 +81,9 @@ def test_record_resolution_writes_to_disk():
         reg_path = Path(tmp) / ".rejected_claims.json"
         c = {
             "id": "c_test_persist",
-            "claim_A": {"statement": "Leo Sei reports_to LOT Upgrade",
+            "claim_A": {"statement": "Bob Smith reports_to Some Project",
                         "source": "MEMORY/daily/emails/junk.md", "weight": 0.7},
-            "claim_B": {"statement": "Leo Sei reports_to Mike Schoofs",
+            "claim_B": {"statement": "Bob Smith reports_to Alice Chen",
                         "source": "MEMORY/CLAUDE.md", "weight": 0.95},
         }
         # User picks B
@@ -94,9 +94,9 @@ def test_record_resolution_writes_to_disk():
         # Reload and verify persistence — fresh process would see this
         reloaded = load_rejected_registry(reg_path)
         assert len(reloaded["ground_truths"]) == 1
-        assert reloaded["ground_truths"][0]["object"] == "Mike Schoofs"
+        assert reloaded["ground_truths"][0]["object"] == "Alice Chen"
         assert len(reloaded["rejected"]) == 1
-        assert reloaded["rejected"][0]["object"] == "LOT Upgrade"
+        assert reloaded["rejected"][0]["object"] == "Some Project"
 
         # both_false also writes
         c2 = {
