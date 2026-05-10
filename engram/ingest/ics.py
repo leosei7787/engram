@@ -33,13 +33,26 @@ from pathlib import Path
 
 @dataclass
 class Event:
-    start:    datetime
-    end:      datetime
-    summary:  str             = ""
-    location: str             = ""
-    organizer: str            = ""
-    all_day:  bool            = False
-    raw:      dict            = field(default_factory=dict)
+    start:     datetime
+    end:       datetime
+    summary:   str             = ""
+    location:  str             = ""
+    organizer: str             = ""
+    all_day:   bool            = False
+    uid:       str             = ""
+    status:    str             = ""           # CONFIRMED | TENTATIVE | CANCELLED | ""
+    rrule:     str             = ""           # raw RRULE string ("" = one-off)
+    attendees: list            = field(default_factory=list)   # list of email/name strings
+    description: str           = ""
+    raw:       dict            = field(default_factory=dict)
+
+    @property
+    def is_recurring(self) -> bool:
+        return bool(self.rrule)
+
+    @property
+    def is_cancelled(self) -> bool:
+        return (self.status or "").upper() == "CANCELLED"
 
 
 # ─── ICS unfolding ────────────────────────────────────────────────────────────
@@ -129,6 +142,11 @@ def parse_ics(path: Path | str) -> list[Event]:
                     location=current.get("LOCATION", ""),
                     organizer=current.get("ORGANIZER", ""),
                     all_day=all_day,
+                    uid=current.get("UID", ""),
+                    status=current.get("STATUS", ""),
+                    rrule=current.get("RRULE", ""),
+                    attendees=list(current.get("__attendees__", [])),
+                    description=current.get("DESCRIPTION", ""),
                     raw=current,
                 ))
             in_event = False
@@ -138,7 +156,7 @@ def parse_ics(path: Path | str) -> list[Event]:
         name, params, value = _split_property(line)
         if name in ("DTSTART", "DTEND"):
             current[name] = _parse_dt(value, params)
-        elif name in ("SUMMARY", "LOCATION", "DESCRIPTION", "UID"):
+        elif name in ("SUMMARY", "LOCATION", "DESCRIPTION", "UID", "STATUS", "RRULE"):
             # Unescape ICS-encoded chars
             v = value.replace("\\,", ",").replace("\\;", ";")
             v = v.replace("\\n", "\n").replace("\\N", "\n")
@@ -147,6 +165,14 @@ def parse_ics(path: Path | str) -> list[Event]:
             # ORGANIZER values look like "MAILTO:foo@bar.com"
             v = value.split(":", 1)[-1]
             current[name] = v.strip()
+        elif name == "ATTENDEE":
+            # ATTENDEE;CN=Alice Chen;ROLE=REQ-PARTICIPANT:MAILTO:alice@example.com
+            # Prefer the CN (display name) when present, else the email.
+            cn = (params.get("CN") or "").strip().strip('"')
+            email = value.split(":", 1)[-1].strip()
+            display = cn or email
+            if display:
+                current.setdefault("__attendees__", []).append(display)
 
     return events
 
