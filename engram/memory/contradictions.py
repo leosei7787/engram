@@ -55,14 +55,14 @@ INCOMPATIBLE_PAIRS = [
 # ─── Source-quality filter ────────────────────────────────────────────────────
 # Org-structure relations should only be trusted from these source patterns.
 # Triples extracted from email signatures, airline notifications, marketing
-# copy, etc. were generating "Leo Sei reports_to LOT Upgrade" garbage.
+# copy, etc. were generating "Bob Smith reports_to Some Project" garbage.
 AUTHORITATIVE_ORG_SOURCES = (
     "/CLAUDE.md",
     "/context/people",
     "/context/org_",
     "/context/responsibility_",
-    "/context/leo_sei",
-    "/context/tomtom_product_org",
+    "/context/bob_smith",
+    "/context/acmecorp_product_org",
     "/decisions/",
 )
 

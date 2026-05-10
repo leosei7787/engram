@@ -98,7 +98,7 @@ def test_chat_handles_calendar_query():
 def test_no_attribute_errors():
     """Regression: cfg.curator was accessed without guard, killing the generator."""
     # If this raises AttributeError or KeyError, the generator died.
-    events, _ = _drive_generator("vw cariad status", timeout_s=3.0)
+    events, _ = _drive_generator("amx acmetech status", timeout_s=3.0)
     assert any((e.get("context") or {}).get("phase") == "ready" for e in events), \
         "generator died before reaching 'ready'"
     print("✓ no AttributeError in pipeline")

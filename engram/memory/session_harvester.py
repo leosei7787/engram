@@ -111,7 +111,7 @@ _HARVEST_PROMPT = """You are extracting durable signal from a chat exchange betw
 Categories:
   - "decision":   a choice that was made or referenced (e.g. "we'll go with option B")
   - "commitment": something {user_name} committed to do or deliver
-  - "fact":       a stable fact about people, projects, or accounts (e.g. "Manuela now leads X")
+  - "fact":       a stable fact about people, projects, or accounts (e.g. "Carol now leads X")
   - "question":   an open question raised that has no answer yet
 
 Avoid:
@@ -218,7 +218,7 @@ def extract_turn_signal(
 
 
 # ─── Canonical name resolution ────────────────────────────────────────────────
-# Haiku may emit "Reinier", "Reinier van Leuken", or even "reinier" for the
+# Haiku may emit "Dave", "Dave Johnson", or even "dave" for the
 # same person. Resolve through the entity graph so all proposals about that
 # person land at the same `context/people/<slug>.md` path.
 

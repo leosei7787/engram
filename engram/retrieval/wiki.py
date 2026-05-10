@@ -10,7 +10,7 @@ The wiki is organized as:
 
 _index.md format (Obsidian-compatible wikilinks):
   - [[wiki/competition/Waymo]] -- autonomous vehicle company, robotaxi, Alphabet
-  - [[wiki/people/Mike_Schoofs|Mike Schoofs]] -- CEO of TomTom
+  - [[wiki/people/Mike_Schoofs|Alice Chen]] -- CEO of AcmeCorp
 
 This module parses those indexes, scores each entry against query tokens
 (with a proper-noun boost), and returns the top-N page paths.
@@ -48,7 +48,7 @@ def _parse_index(index_file: Path) -> list[tuple[str, str]]:
 
     Accepts lines like:
       - [[wiki/competition/Waymo]] -- description text
-      - * [[wiki/people/Mike_Schoofs|Mike Schoofs]] -- CEO
+      - * [[wiki/people/Mike_Schoofs|Alice Chen]] -- CEO
       - [[Page Name]] - short description
     """
     entries: list[tuple[str, str]] = []
@@ -119,7 +119,7 @@ def _qmd_wiki_scan(
             file_uri = item.get("file", "")
             if not file_uri.startswith(prefix):
                 continue
-            rel = file_uri[len(prefix):]          # e.g. "competition/Stellantis.md"
+            rel = file_uri[len(prefix):]          # e.g. "competition/BetaMotors.md"
             abs_path = wiki_path / rel
             if abs_path.exists() and str(abs_path) not in paths:
                 paths.append(str(abs_path))
@@ -248,7 +248,7 @@ def wiki_scan(
                     score  += boost_f   # count as 1 occurrence at reduced weight
 
             # ── Layer 3: Fuzzy page-name match for proper nouns ────────────────
-            # Catches typos like "Wayom" -> "Waymo" or "Microsft" -> "Microsoft".
+            # Catches typos like "Wayom" -> "Waymo" or "Microsft" -> "MegaCorp".
             # Applied only against page-name tokens (not description) for precision.
             page_name_toks = set(re.split(r"[\W_]+", page_stem))
             for pn_tok in pn_long:

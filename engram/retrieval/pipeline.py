@@ -33,7 +33,7 @@ Usage:
     from engram.retrieval.config import load_config
 
     cfg = load_config()
-    result = memory_scan("What's the status of the VW counter-offer?", cfg)
+    result = memory_scan("What's the status of the AMX counter-offer?", cfg)
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ from .domain_bundles import match_domain_bundles, bundles_from_config
 
 
 # ─── Graph cache ──────────────────────────────────────────────────────────────
-# graph.json is read on every scan. For Leo's 224-contradiction store this
+# graph.json is read on every scan. For Bob's 224-contradiction store this
 # costs 100-300ms per call. Cache by mtime so multi-turn chats reuse it.
 _GRAPH_CACHE: dict = {"path": None, "mtime": 0.0, "graph": None}
 

@@ -1823,7 +1823,7 @@ def browse_backlinks():
 
 
 # Resolve a wikilink name to a concrete file path. Used when the user clicks
-# [[Reinier]] in the rendered markdown.
+# [[Dave]] in the rendered markdown.
 @app.route("/api/browse/resolve")
 def browse_resolve():
     cfg = get_cfg()
@@ -2205,7 +2205,7 @@ def health_detail():
 
 # ── Statement parsing for cascade resolution ──────────────────────────────────
 # Statements are of the form: "<Subject> <relation> <Object>"
-# e.g. "Benoit Joly reports_to Leo Sei" → (Benoit Joly, reports_to, Leo Sei)
+# e.g. "Karl Brown reports_to Bob Smith" → (Karl Brown, reports_to, Bob Smith)
 #
 # Single-valued relations: a subject can have AT MOST ONE object for these.
 # Once we know the truth, all conflicting claims for the same (subject, relation)
@@ -2688,7 +2688,7 @@ def _classify_event(e) -> tuple[float, list[str]]:
     if e.all_day:
         score += 0.5
         tags.append("all-day")
-    if e.location and "Microsoft Teams" not in e.location and "Skype" not in e.location:
+    if e.location and "MegaCorp Teams" not in e.location and "Skype" not in e.location:
         score += 0.3
         tags.append("in-person")
 
@@ -2758,7 +2758,7 @@ def top_of_mind():
                     "iso":       local.strftime("%Y-%m-%d"),
                     "time":      tline,
                     "summary":   (e.summary or "")[:140],
-                    "location":  "" if (e.location and ("Microsoft Teams" in e.location or "Skype" in e.location)) else (e.location or "")[:60],
+                    "location":  "" if (e.location and ("MegaCorp Teams" in e.location or "Skype" in e.location)) else (e.location or "")[:60],
                     "organizer": (e.organizer.split("@")[0] if e.organizer and "@" in e.organizer else ""),
                     "score":     score,
                     "tags":      tags,

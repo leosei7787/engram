@@ -3,23 +3,46 @@ Source credibility — classify a memory file path / source string into a
 credibility score from SOURCE_CREDIBILITY.
 
 Heuristic-based — no LLM call needed for routing.
+
+Marker strings that flag "this content is the user's own voice" (e.g.
+"user says:", "/user_") are user-agnostic by design. The list of partner /
+account name fragments used for the partner-doc boost is configurable —
+the caller passes a list (typically from cfg.retrieval.priority_accounts)
+or accepts the empty default and gets no boost.
 """
-import re
+import os
 from .schemas import SOURCE_CREDIBILITY
 
 
-def classify_source(source_path: str, content_hint: str = "") -> tuple[str, float]:
+def _partner_keys_override() -> list:
+    """Hook for callers / tests to inject a list of partner/account name
+    fragments. Default: empty (no partner-doc boost). Set the
+    ENGRAM_PARTNER_KEYS env var (comma-separated) for a quick override
+    without code changes; the dashboard / pipeline pass the same list
+    via classify_source's `partner_keys` arg if present.
     """
-    Returns (label, credibility_score). Label maps to SOURCE_CREDIBILITY keys.
-    """
+    raw = os.environ.get("ENGRAM_PARTNER_KEYS", "")
+    if not raw:
+        return []
+    return [k.strip().lower() for k in raw.split(",") if k.strip()]
+
+
+def classify_source(
+    source_path: str,
+    content_hint: str = "",
+    *,
+    partner_keys: list | None = None,
+) -> tuple[str, float]:
+    """Returns (label, credibility_score). Label maps to SOURCE_CREDIBILITY keys."""
     s = (source_path or "").lower()
     c = (content_hint or "")[:500].lower()
 
-    # Direct Leo signals
-    if "leo says:" in c or "leo:" in c[:200] or "/sessions/" in s:
-        return "leo_statement", SOURCE_CREDIBILITY["leo_statement"]
-    if "/leo_" in s or "leo_upload" in s:
-        return "leo_upload", SOURCE_CREDIBILITY["leo_upload"]
+    # Tier 1 — direct user-voice signals. Marker strings are generic so
+    # any deployment can use them.
+    if "user says:" in c or "user:" in c[:200] or "/sessions/" in s:
+        return "user_statement", SOURCE_CREDIBILITY["user_statement"]
+    if "/user_" in s or "user_upload" in s:
+        return "user_upload", SOURCE_CREDIBILITY["user_upload"]
 
     # Path-based heuristics
     if "/decisions/" in s:
@@ -47,8 +70,9 @@ def classify_source(source_path: str, content_hint: str = "") -> tuple[str, floa
     if s.endswith(".docx") or s.endswith(".pdf"):
         return "internal_doc", SOURCE_CREDIBILITY["internal_doc"]
 
-    # Partner doc detection from filename keywords
-    if any(k in s for k in ("toyota", "bmw", "honda", "vw", "cariad", "stellantis", "microsoft")):
+    # Partner doc detection — keys come from config / env, never hardcoded
+    keys = partner_keys if partner_keys is not None else _partner_keys_override()
+    if keys and any(k in s for k in keys):
         if "partner" in s or "_brief" in s or "_requirements" in s:
             return "partner_doc", SOURCE_CREDIBILITY["partner_doc"]
 
@@ -60,16 +84,16 @@ def classify_source(source_path: str, content_hint: str = "") -> tuple[str, floa
 
 
 def credibility_for_sources(sources: list, content_hint: str = "") -> float:
-    """Mean credibility across sources (max if a leo source is present)."""
+    """Mean credibility across sources; max if a direct user-voice source is present."""
     if not sources:
         return SOURCE_CREDIBILITY["unknown"]
     scores = []
-    has_leo = False
+    has_user_voice = False
     for s in sources:
         lbl, sc = classify_source(s, content_hint)
         scores.append(sc)
-        if lbl in ("leo_statement", "leo_upload"):
-            has_leo = True
-    if has_leo:
+        if lbl in ("user_statement", "user_upload"):
+            has_user_voice = True
+    if has_user_voice:
         return max(scores)
     return sum(scores) / len(scores)
