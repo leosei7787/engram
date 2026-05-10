@@ -122,9 +122,15 @@ def _safe_name(name: str, ext: str) -> str:
 def _resolve_output_path(output_dir: Path, filename: str, ext: str) -> Path:
     """Build output_dir/<safe_name>.<ext> and assert it lives under
     output_dir. Raises ValueError on traversal — callers should let this
-    propagate to the request handler."""
+    propagate to the request handler.
+
+    This function IS the sanitiser for `filename`; it is intended that user
+    input flows in here. _safe_name strips path separators and `..` from the
+    name, .resolve() collapses any remaining shenanigans, and .relative_to
+    enforces containment.
+    """
     out_dir = Path(output_dir).resolve()
-    out     = (out_dir / _safe_name(filename, ext)).resolve()
+    out     = (out_dir / _safe_name(filename, ext)).resolve()  # lgtm[py/path-injection] — sanitiser
     try:
         out.relative_to(out_dir)
     except ValueError as err:
@@ -136,7 +142,7 @@ def _resolve_output_path(output_dir: Path, filename: str, ext: str) -> Path:
 
 def to_md(text: str, filename: str, output_dir: Path) -> Path:
     out = _resolve_output_path(output_dir, filename, "md")
-    out.write_text(text, encoding="utf-8")
+    out.write_text(text, encoding="utf-8")  # lgtm[py/path-injection] — sanitised by _resolve_output_path
     return out
 
 
@@ -298,7 +304,7 @@ def to_html(text: str, title: str) -> str:
 def to_html_file(text: str, filename: str, output_dir: Path) -> Path:
     html  = to_html(text, filename)
     out   = _resolve_output_path(output_dir, filename, "html")
-    out.write_text(html, encoding="utf-8")
+    out.write_text(html, encoding="utf-8")  # lgtm[py/path-injection] — sanitised by _resolve_output_path
     return out
 
 

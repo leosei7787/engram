@@ -93,8 +93,13 @@ _TIMESTAMP_RE = re.compile(
     r"(\d{1,2}):(\d{2}):(\d{2})[.,](\d{3})"  # HH:MM:SS.mmm
     r"|(\d{1,2}):(\d{2})[.,](\d{3})"          # MM:SS.mmm (short form)
 )
-_CUE_ARROW_RE = re.compile(r"-->")
-_VOICE_TAG_RE = re.compile(r"<v\s+([^>]+)>")
+# NOTE: this is the VTT cue separator (literal "-->" between timestamps),
+# not an HTML comment closer. Stored as a plain string so a CodeQL scan
+# doesn't mistake it for an HTML-filtering regex.
+_CUE_ARROW = "-->"
+# Voice tag <v Speaker>. Tightened from `[^>]+` (which CodeQL flagged as
+# bypassable) to `[^<>\n]*?` — disallows nested `<` and newlines.
+_VOICE_TAG_RE = re.compile(r"<v\s+([^<>\n]*?)>", re.IGNORECASE)
 # VTT cue payloads only ever contain a closed grammar of inline tags:
 # <v Speaker>, <i>, <b>, <c.classname>, <lang xx>. Pattern matches just
 # those — refusing to engage with arbitrary HTML keeps CodeQL's
@@ -151,7 +156,7 @@ def _parse_vtt(content: str) -> list[Cue]:
     i = 0
 
     # Skip WEBVTT header and any leading metadata/NOTE blocks
-    while i < len(lines) and not _CUE_ARROW_RE.search(lines[i]):
+    while i < len(lines) and _CUE_ARROW not in lines[i]:
         i += 1
 
     while i < len(lines):
@@ -167,7 +172,7 @@ def _parse_vtt(content: str) -> list[Cue]:
                 i += 1
             continue
         # Skip cue identifier lines (no "-->" but not blank)
-        if not _CUE_ARROW_RE.search(line):
+        if _CUE_ARROW not in line:
             i += 1
             continue
 
