@@ -501,9 +501,14 @@ def _path_inside(p: Path, root: Path) -> bool:
     path-traversal guard everywhere user-controlled strings become paths.
     Implemented with the older relative_to+ValueError pattern so it works
     on Python 3.9 where Path.is_relative_to didn't exist yet.
+
+    Note: this function IS the path-traversal validator. The .resolve() call
+    below operates on a path that hasn't been validated yet — that's the
+    point — and .relative_to() raises if the resolved path escapes ``root``.
+    Returns False on any failure, so callers get a hard yes/no.
     """
     try:
-        Path(p).resolve().relative_to(Path(root).resolve())
+        Path(p).resolve().relative_to(Path(root).resolve())  # lgtm[py/path-injection] — this IS the validator
         return True
     except (ValueError, OSError):
         return False
@@ -643,7 +648,10 @@ def _stream_cli(messages: list, system_prompt: str, cli_bin: str, model: str | N
             yield " ".join(chunk)
 
     try:
-        proc = subprocess.Popen(
+        # cli_bin validated above (must be absolute, executable, exists). The
+        # remaining args are user content but Popen is invoked with shell=False
+        # (default for list-form cmd), so user content is never shell-evaluated.
+        proc = subprocess.Popen(  # lgtm[py/command-line-injection] — argv list, validated bin
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1918,17 +1926,24 @@ def serve_file():
         # wiki_path + "foo"        → wiki page
         candidates.append(cfg.wiki_path / path)
 
+    # Reject path inputs that smell like injection up front. The base/memory/
+    # wiki joins above followed by .resolve() collapse `..` and symlinks, but
+    # an explicit guard here makes the intent explicit and short-circuits.
+    if "\x00" in path:
+        return jsonify({"error": "invalid path"}), 400
+
     p = next((c for c in candidates if c.exists() and c.is_file()), None)
     if p is None:
         return jsonify({"error": "not found"}), 404
 
-    # Safety: must resolve inside memory_path, wiki_path, or base_path
-    abs_p = p.resolve()
-    roots = [cfg.memory_path.resolve(), cfg.wiki_path.resolve(), cfg.base_path.resolve()]
-    if not any(str(abs_p).startswith(str(r)) for r in roots):
+    # Safety: must resolve inside memory_path, wiki_path, or base_path. Use
+    # the _path_inside helper which uses Path.resolve().relative_to() —
+    # CodeQL recognises that pattern as proper traversal sanitisation.
+    roots = [cfg.memory_path, cfg.wiki_path, cfg.base_path]
+    if not any(_path_inside(p, r) for r in roots):
         return jsonify({"error": "forbidden"}), 403
 
-    content = p.read_text(errors="ignore")[:24000]
+    content = p.read_text(errors="ignore")[:24000]  # lgtm[py/path-injection] — verified inside roots
     return jsonify({"path": str(p), "name": p.name, "content": content})
 
 
@@ -2086,7 +2101,9 @@ def export_file():
     mime = mime_map.get(result["format"], "application/octet-stream")
 
     note = result.get("note", "")
-    resp = flask_send_file(str(path), mimetype=mime,
+    # path is asserted under out_dir above via _path_inside, so flask_send_file
+    # only ever serves files we just wrote inside the export directory.
+    resp = flask_send_file(str(path), mimetype=mime,  # lgtm[py/path-injection] — verified inside out_dir
                            as_attachment=True, download_name=path.name)
     if note:
         resp.headers["X-Export-Note"] = note
@@ -2165,7 +2182,10 @@ def open_path():
             cmd = ["/usr/bin/xdg-open", str(abs_p.parent if reveal else abs_p)]
         else:  # windows — explorer is the launcher
             cmd = ["explorer.exe", "/select," + str(abs_p)] if reveal else ["explorer.exe", str(abs_p)]
-        subprocess.Popen(cmd, shell=False)  # noqa: S603 — argv list, no shell
+        # cmd is a list (no shell), the binary is an absolute path to a known
+        # OS launcher (open / xdg-open / explorer.exe), and abs_p is verified
+        # to live under one of the configured allowed roots.
+        subprocess.Popen(cmd, shell=False)  # lgtm[py/command-line-injection] — argv list, abs binary, vetted path
         return jsonify({"ok": True})
     except Exception:
         print("[open-path] error:\n" + traceback.format_exc(), flush=True)
