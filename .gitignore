@@ -37,3 +37,9 @@ knowledge-base/**
 
 # Raw data files (only exist in user's local instance)
 *.jsonl
+
+# Tests — kept locally for development but never committed; their fixtures
+# tend to gather real names / accounts / emails from whatever the developer
+# is working on, and GitHub's code-search index surfaces every historical
+# blob. Easier rule: don't sync them.
+tests/
