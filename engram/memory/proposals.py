@@ -131,13 +131,25 @@ def compute_proposal_salience(item: dict) -> float:
     reason = (item.get("reason") or "").lower()
 
     base = 0.5
-    if "/decisions/" in p:
+    # Wiki = canonical entity records (consolidation target).
+    # Match wiki/<topic>/ first so they take precedence over the legacy
+    # MEMORY/<topic>/ checks below.
+    if "wiki/decisions/" in p:
+        base = 0.95
+    elif "wiki/projects/" in p:
+        base = 0.85
+    elif "wiki/people/" in p:
+        base = 0.60
+    elif "wiki/concepts/" in p or "wiki/systems/" in p:
+        base = 0.55
+    elif "/decisions/" in p:
         base = 0.95
     elif "/accounts/" in p:
-        # All accounts/ get a moderate base; a per-deployment list of
-        # high-priority account name fragments can boost specific deals.
-        # Read from ENGRAM_PARTNER_KEYS env var (comma-separated). Empty
-        # default = no boost; deployments inject their own list.
+        # Legacy MEMORY/accounts/ path. New writers target wiki/projects or
+        # wiki/people; this branch survives for back-compat with existing
+        # pending proposals. A per-deployment list of high-priority account
+        # name fragments can boost specific deals (ENGRAM_PARTNER_KEYS env
+        # var, comma-separated). Empty default = no boost.
         priority = [k.strip().lower() for k in
                     (os.environ.get("ENGRAM_PARTNER_KEYS", "") or "").split(",")
                     if k.strip()]

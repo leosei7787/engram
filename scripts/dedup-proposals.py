@@ -56,15 +56,33 @@ def _jaccard(a: set, b: set) -> float:
 # ─── Path canonicalisation ────────────────────────────────────────────────────
 
 def canonicalize_path(path: str, name_idx: dict[str, str]) -> str:
-    """Rewrite context/people/<slug>.md to the canonical-name slug."""
-    if not path or not path.startswith("context/people/"):
+    """Rewrite per-person paths to the canonical-name form.
+
+    Handles the two writers the codebase has used over time:
+      - wiki/people/<Title Case Name>.md  (current, wiki consolidation)
+      - context/people/<slug>.md          (legacy, before consolidation)
+    Each form is rewritten in its native shape (Title Case for wiki,
+    slug for legacy) so collapsing matches both old and new entries.
+    """
+    if not path:
         return path
-    stem = Path(path).stem.replace("_", " ")
-    canonical = _resolve_canonical_name(stem, name_idx)
-    if not canonical:
-        return path
-    new_slug = _slug(canonical)
-    return f"context/people/{new_slug}.md"
+
+    if path.startswith("wiki/people/"):
+        stem = Path(path).stem
+        canonical = _resolve_canonical_name(stem, name_idx)
+        if not canonical:
+            return path
+        return f"wiki/people/{canonical}.md"
+
+    if path.startswith("context/people/"):
+        stem = Path(path).stem.replace("_", " ")
+        canonical = _resolve_canonical_name(stem, name_idx)
+        if not canonical:
+            return path
+        new_slug = _slug(canonical)
+        return f"context/people/{new_slug}.md"
+
+    return path
 
 
 # ─── Main pass ────────────────────────────────────────────────────────────────
