@@ -148,7 +148,7 @@ The dashboard sidebar shows the current context set in real time with controls t
 - **Retrieval-Induced Strengthening (RIS)**: retrieval itself strengthens memory
 - **Forgetting curve**: exponential decay, slower for high-salience facts
 - **Contradiction engine**: detects and tracks conflicting claims
-- **Rejected-claims registry** (`MEMORY/.rejected_claims.json`): user resolutions persist as ground truths. Cascades across related contradictions (e.g. "Leo reports_to Mike" auto-dismisses every other "Leo reports_to *" claim). Future extractions check this registry before generating new contradictions.
+- **Rejected-claims registry** (`MEMORY/.rejected_claims.json`): user resolutions persist as ground truths. Cascades across related contradictions (e.g. "Bob reports_to Alice" auto-dismisses every other "Bob reports_to *" claim). Future extractions check this registry before generating new contradictions.
 - **Source-quality filter**: org-structure relations (`reports_to`, `manages`, `ceo_of`...) are only trusted from authoritative sources (`CLAUDE.md`, `context/people.md`, `decisions/*`). Random emails and transcripts can't fabricate reporting lines anymore.
 - **Open questions**: surfaces gaps; fed to the curator as priors
 - **Session priming**: `session_priming.json` hot-starts activation for recurring entities

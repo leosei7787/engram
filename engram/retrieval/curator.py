@@ -58,7 +58,7 @@ _STOP = frozenset({
 
 def _drift_tokens(text: str) -> frozenset[str]:
     """
-    Broad tokenizer for drift detection. Keeps 2-char tokens (e.g. 'vw', 'gm')
+    Broad tokenizer for drift detection. Keeps 2-char tokens (e.g. 'amx', 'gm')
     and strips only the most common stop words. More inclusive than query_tokens.
     """
     import re
@@ -121,7 +121,7 @@ def _load_session_priming(memory_path: Path, top_n: int = 6) -> str:
     """
     Load top-N primed entity names from session_priming.json.
 
-    Returns a short string like "Recent focus: VW, CARIAD, Mike Schoofs"
+    Returns a short string like "Recent focus: AMX, AcmeTech, Alice Chen"
     or empty string if not available.
     """
     candidates = [

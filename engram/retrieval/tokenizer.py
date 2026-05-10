@@ -97,7 +97,7 @@ def is_meeting_query(tokens: set) -> bool:
 
 def query_person_names(query: str, people_file: Optional[Path] = None) -> set:
     """
-    Extract first-name-looking tokens from the query (e.g. Mike, Sarah).
+    Extract first-name-looking tokens from the query (e.g. Alice, Carol).
 
     Cross-checks against a people reference file if provided — only known
     names count, to avoid matching arbitrary capitalised words.
@@ -212,12 +212,12 @@ def expand_with_synonyms(tokens: set, synonyms: dict) -> set:
         retrieval:
           synonyms:
             automotive: [car, vehicle, vehicles]
-            vw: [volkswagen, cariad]
+            amx: [acmemotors, acmetech]
             hire: [recruit, recruitment, recruiting]
 
     Logic:
       - If ANY member of a synonym group appears in tokens, ALL members are added.
-      - This means "vw" in query → adds "volkswagen"; "volkswagen" in query → adds "vw".
+      - This means "amx" in query → adds "acmemotors"; "acmemotors" in query → adds "amx".
 
     Args:
         tokens:   Set of query tokens (from query_tokens()).

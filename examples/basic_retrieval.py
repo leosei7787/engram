@@ -26,7 +26,7 @@ print(f"Wiki path:   {cfg.wiki_path}")
 print()
 
 # ── 2. Run a memory scan ──────────────────────────────────────────────────────
-query = "What's the status of the VW counter-offer?"
+query = "What's the status of the AMX counter-offer?"
 
 result = memory_scan(query, cfg)
 
