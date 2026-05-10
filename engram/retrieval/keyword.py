@@ -120,7 +120,8 @@ def fast_file_score(
 
     base = base_path or memory_path.parent
     _scan_exclude = scan_exclude or ["/sessions/", "/_raw/", "/_pre_compression_backups/",
-                                     "/proposals/", "/priming/", "/health/"]
+                                     "/proposals/", "/priming/", "/health/",
+                                     "/_archive/"]
     _path_boosts = path_boosts or {
         "/accounts/": 2.5, "/decisions/": 1.8, "/weekly/": 1.6,
         "/context/": 1.4, "/saved/": 1.4, "/research/": 1.3,

@@ -220,7 +220,7 @@ def extract_turn_signal(
 # ─── Canonical name resolution ────────────────────────────────────────────────
 # Haiku may emit "Dave", "Dave Johnson", or even "dave" for the
 # same person. Resolve through the entity graph so all proposals about that
-# person land at the same `context/people/<slug>.md` path.
+# person land at the same `wiki/people/<Canonical Name>.md` path.
 
 _name_idx_cache: dict = {"mtime": 0.0, "idx": {}}
 
@@ -288,16 +288,24 @@ def _slug(text: str) -> str:
 
 
 def _proposal_path_for(item: dict, name_idx: dict[str, str] | None = None) -> str:
-    """Map an extracted item to the canonical memory path it would update."""
+    """Map an extracted item to the canonical destination path.
+
+    Routing reflects the wiki/memory split:
+      - Entity records (people, decisions) → wiki/<topic>/<Canonical Name>.md
+        Wiki uses Title Case filenames matched by canonical name from the
+        entity graph (kept in sync by the wiki ingestion scripts).
+      - State files (open_questions.json) and raw input notes
+        (daily/notes/chat_harvest.md) stay in MEMORY/.
+    """
     kind     = item["kind"]
     subjects = item.get("subjects") or []
     if kind == "question":
         return "open_questions.json"
     if kind == "decision":
-        return "decisions/chat_harvest.md"
+        return "wiki/decisions/chat_harvest.md"
     if subjects:
         canonical = _resolve_canonical_name(subjects[0], name_idx or {})
-        return f"context/people/{_slug(canonical)}.md"
+        return f"wiki/people/{canonical}.md"
     return "daily/notes/chat_harvest.md"
 
 

@@ -165,6 +165,7 @@ class KeywordConfig:
         "/proposals/",
         "/priming/",
         "/health/",
+        "/_archive/",
     ])
 
 
