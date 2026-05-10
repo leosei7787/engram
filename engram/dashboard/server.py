@@ -1524,8 +1524,20 @@ def stats():
             ctd  = json.loads(ct_f.read_text())
             cs   = ctd if isinstance(ctd, list) else ctd.get("contradictions", [])
             contradictions_pending = len([c for c in cs if c.get("status") not in ("resolved_A", "resolved_B", "both_true", "both_false", "dismissed", "superseded")])
+        # Pending memory-write proposals (chat-session harvest, consolidation,
+        # reconsolidation, manual writes). Surfaced on this Health tab now
+        # that Top of Mind's middle column became Pinned.
+        prop_f = memory_path / "proposals" / "index.json"
+        proposals_pending = 0
+        if prop_f.exists():
+            try:
+                pidx = json.loads(prop_f.read_text())
+                proposals_pending = len([p for p in pidx if p.get("status") == "pending"])
+            except Exception:
+                pass
     except Exception as e:
         print(f"[stats] health: {e}", flush=True)
+        proposals_pending = 0
 
     graph_stats: dict = {}
     communities: list = []
@@ -1574,6 +1586,7 @@ def stats():
             "last_run": last_run, "sleep_history": sleep_history,
             "phase_details": phase_details, "open_questions": open_q,
             "contradictions_pending": contradictions_pending,
+            "proposals_pending":      proposals_pending,
             "health": health, "tier_distribution": tier_dist,
         },
         "retrieve": {
@@ -1908,6 +1921,34 @@ def health_detail():
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
+    elif what == "proposals":
+        # Pending memory-write proposals — surfaced in Engram Health since
+        # the Top of Mind tile got swapped out for Pinned. Newest first
+        # within salience tier.
+        p = mem / "proposals" / "index.json"
+        if not p.exists():
+            return jsonify({"items": [], "total": 0})
+        try:
+            idx = json.loads(p.read_text(errors="ignore"))
+            pending = [it for it in idx if it.get("status") == "pending"]
+            pending.sort(key=lambda x: x.get("ts", ""), reverse=True)
+            pending.sort(key=lambda x: x.get("salience") or 0, reverse=True)
+            out: list = []
+            for it in pending[:80]:
+                out.append({
+                    "uid":              it.get("uid", ""),
+                    "path":             it.get("path", ""),
+                    "operation":        it.get("operation", "update"),
+                    "reason":           (it.get("reason") or "")[:300],
+                    "salience":         round(it.get("salience") or 0, 2),
+                    "source":           it.get("source", ""),
+                    "harvest_filename": it.get("harvest_filename", ""),
+                    "ts":               (it.get("ts") or "")[:16].replace("T", " "),
+                })
+            return jsonify({"items": out, "total": len(pending)})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     return jsonify({"error": "unknown"}), 400
 
 
@@ -2138,6 +2179,33 @@ def cleanup_resolved():
         "registry_total_rejected":  len(registry.get("rejected", [])),
         "registry_total_truths":    len(registry.get("ground_truths", [])),
     })
+
+
+@app.route("/api/resolve-proposal", methods=["POST"])
+def resolve_proposal():
+    """Mark a pending proposal saved | skipped. Body: {uid, status}.
+
+    Uses the existing engram.memory.proposals.update_status() so the index's
+    *_at timestamps stay consistent with how consolidation writes them.
+    """
+    cfg  = get_cfg()
+    body = request.get_json(force=True, silent=True) or {}
+    uid    = (body.get("uid")    or body.get("id")         or "").strip()
+    status = (body.get("status") or body.get("resolution") or "").strip()
+    if status not in ("saved", "skipped"):
+        return jsonify({"error": "invalid status"}), 400
+    if not uid:
+        return jsonify({"error": "uid required"}), 400
+
+    try:
+        from engram.memory.proposals import update_status
+        ok = update_status(cfg.memory_path / "proposals" / "index.json", uid, status)
+        if not ok:
+            return jsonify({"error": "uid not found"}), 404
+        return jsonify({"ok": True, "uid": uid, "status": status})
+    except Exception:
+        print("[resolve-proposal] error:\n" + traceback.format_exc(), flush=True)
+        return jsonify({"error": "internal_error"}), 500
 
 
 @app.route("/api/resolve-question", methods=["POST"])
@@ -4323,9 +4391,10 @@ async function renderHealth(data) {{
 
   const alerts = [
     d.contradictions_pending>0?`<div class="alert-chip warn" onclick="openHealthDetail('contradictions')">&#9888; ${{d.contradictions_pending}} contradictions</div>`:'',
+    d.proposals_pending>0?`<div class="alert-chip info" onclick="openHealthDetail('proposals')">&#128221; ${{d.proposals_pending}} proposals</div>`:'',
     d.open_questions>0?`<div class="alert-chip info" onclick="openHealthDetail('open_questions')">&#10067; ${{d.open_questions}} open questions</div>`:'',
     watcherChip,
-    !d.contradictions_pending&&!d.open_questions?`<div class="alert-chip ok">&#10003; Clean</div>`:'',
+    !d.contradictions_pending&&!d.open_questions&&!d.proposals_pending?`<div class="alert-chip ok">&#10003; Clean</div>`:'',
   ].filter(Boolean).join('');
 
   // Retrieve pillar
@@ -4390,6 +4459,12 @@ async function renderHealth(data) {{
           <span>&#10067; Open questions</span>
           <span style="font-weight:700;color:${{d.open_questions>0?'#4285F4':'#aaa'}}">${{d.open_questions||0}} pending →</span>
         </button>
+        <button onclick="openHealthDetail('proposals')"
+                style="display:flex;align-items:center;justify-content:space-between;background:${{d.proposals_pending>0?'#fff5ed':'#f5f5f5'}};border:1px solid ${{d.proposals_pending>0?'#D97757':'#e8e8e8'}};border-radius:8px;padding:9px 12px;cursor:pointer;font-size:12px;color:#1a1a1a;text-align:left;width:100%"
+                title="Memory-write proposals from chat-session harvesting + consolidation. Save / skip via the modal.">
+          <span>&#128221; Pending proposals</span>
+          <span style="font-weight:700;color:${{d.proposals_pending>0?'#c06040':'#aaa'}}">${{d.proposals_pending||0}} pending →</span>
+        </button>
         <button onclick="cleanupResolved(this)" id="cleanup-btn"
                 style="display:flex;align-items:center;justify-content:space-between;background:#f5f5f5;border:1px solid #e8e8e8;border-radius:8px;padding:9px 12px;cursor:pointer;font-size:12px;color:#1a1a1a;text-align:left;width:100%"
                 title="Persist all resolved contradictions to the rejection registry and purge bad edges from the graph">
@@ -4433,7 +4508,12 @@ async function openHealthDetail(what) {{
   const titleEl  = document.getElementById('health-detail-title');
   const bodyEl   = document.getElementById('health-detail-body');
 
-  titleEl.textContent = what === 'contradictions' ? 'Contradictions' : 'Open Questions';
+  const titles = {{
+    contradictions: 'Contradictions',
+    open_questions: 'Open Questions',
+    proposals:      'Pending memory proposals',
+  }};
+  titleEl.textContent = titles[what] || 'Detail';
   bodyEl.innerHTML    = '<div class="fp-loading">Loading…</div>';
   overlay.classList.add('open');
 
@@ -4492,7 +4572,7 @@ async function _renderHealthDetail(what, bodyEl) {{
           </div>
         </div>`;
       }}).join('');
-    }} else {{
+    }} else if (what === 'open_questions') {{
       const priColor = {{ high: '#e53e3e', medium: '#dd6b20', low: '#718096' }};
       html += items.map((q, i) => {{
         const pri = q.priority || 'medium';
@@ -4507,6 +4587,34 @@ async function _renderHealthDetail(what, bodyEl) {{
           <div class="hd-actions">
             <button class="hd-btn hd-btn-resolve" onclick="resolveItem('open_questions','${{q.id}}','answered',this)">✓ Mark resolved</button>
             <button class="hd-btn hd-btn-dismiss" onclick="resolveItem('open_questions','${{q.id}}','dismissed',this)">✕ Dismiss</button>
+          </div>
+        </div>`;
+      }}).join('');
+    }} else if (what === 'proposals') {{
+      // Pending memory writes from chat-session harvest + consolidation. Each
+      // card lets the user save (apply to the canonical path), skip, or open
+      // the source session for context.
+      html += items.map(p => {{
+        const op = p.operation || 'update';
+        const opColor = op === 'create' ? '#34A853' : op === 'delete' ? '#c06040' : '#4285F4';
+        const sal = (p.salience||0).toFixed(2);
+        const safePath = (p.path || '').replace(/'/g, "\\\\'");
+        const harvest  = (p.harvest_filename || '').replace(/'/g, "\\\\'");
+        return `
+        <div class="hd-card" data-uid="${{p.uid}}" data-what="proposals">
+          <div style="display:flex;align-items:flex-start;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+            <span style="font-size:10px;font-weight:700;color:${{opColor}};background:${{opColor}}18;padding:2px 8px;border-radius:10px;text-transform:uppercase;white-space:nowrap">${{op}}</span>
+            <span style="font-size:11px;color:#666;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;flex:1;word-break:break-all;cursor:pointer" onclick="openFilePreview('${{safePath}}')">${{p.path || '—'}}</span>
+            <span style="font-size:10px;color:#aaa">salience ${{sal}}</span>
+          </div>
+          <div style="font-size:13px;color:#1a1a1a;line-height:1.5;margin-bottom:8px">${{p.reason || '—'}}</div>
+          <div style="font-size:10px;color:#aaa;margin-bottom:10px">
+            ${{p.source || ''}}${{p.ts ? ' · ' + p.ts : ''}}
+            ${{harvest ? ` · <a href="#" onclick="event.preventDefault();openFilePreview('${{harvest}}')" style="color:#4285F4;text-decoration:underline">source session</a>` : ''}}
+          </div>
+          <div class="hd-actions">
+            <button class="hd-btn hd-btn-a" onclick="resolveItem('proposals','${{p.uid}}','saved',this)">✓ Save</button>
+            <button class="hd-btn hd-btn-dismiss" onclick="resolveItem('proposals','${{p.uid}}','skipped',this)">✕ Skip</button>
           </div>
         </div>`;
       }}).join('');
@@ -4554,14 +4662,17 @@ function _showToast(msg) {{
 }}
 
 async function resolveItem(what, id, resolution, btn) {{
-  const endpoint = what === 'contradictions' ? '/api/resolve-contradiction' : '/api/resolve-question';
+  const endpoint =
+        what === 'contradictions' ? '/api/resolve-contradiction'
+      : what === 'proposals'      ? '/api/resolve-proposal'
+      : '/api/resolve-question';
   btn.disabled = true;
   btn.textContent = '…';
   try {{
     const res  = await fetch(endpoint, {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ id, resolution }})
+      body: JSON.stringify({{ id, uid: id, resolution, status: resolution }})
     }});
     const data = await res.json();
     if (data.ok) {{
