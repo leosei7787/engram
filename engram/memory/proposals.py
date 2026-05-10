@@ -15,6 +15,7 @@ Lives at MEMORY/proposals/index.json. Append-friendly JSON list (small enough
 to load whole; thousands of proposals = ~1 MB).
 """
 import json
+import os
 import time
 import uuid
 from pathlib import Path
@@ -133,8 +134,14 @@ def compute_proposal_salience(item: dict) -> float:
     if "/decisions/" in p:
         base = 0.95
     elif "/accounts/" in p:
-        # Active deals get a bump
-        if any(k in p for k in ("vw", "acmetech", "betamotors", "honda", "microsoft", "bmw", "toyota")):
+        # All accounts/ get a moderate base; a per-deployment list of
+        # high-priority account name fragments can boost specific deals.
+        # Read from ENGRAM_PARTNER_KEYS env var (comma-separated). Empty
+        # default = no boost; deployments inject their own list.
+        priority = [k.strip().lower() for k in
+                    (os.environ.get("ENGRAM_PARTNER_KEYS", "") or "").split(",")
+                    if k.strip()]
+        if priority and any(k in p for k in priority):
             base = 0.85
         else:
             base = 0.70

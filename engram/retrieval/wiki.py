@@ -248,7 +248,7 @@ def wiki_scan(
                     score  += boost_f   # count as 1 occurrence at reduced weight
 
             # ── Layer 3: Fuzzy page-name match for proper nouns ────────────────
-            # Catches typos like "Wayom" -> "Waymo" or "Microsft" -> "Microsoft".
+            # Catches typos like "Wayom" -> "Waymo" or "Microsft" -> "MegaCorp".
             # Applied only against page-name tokens (not description) for precision.
             page_name_toks = set(re.split(r"[\W_]+", page_stem))
             for pn_tok in pn_long:

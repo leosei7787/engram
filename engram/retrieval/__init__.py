@@ -6,7 +6,7 @@ Public API:
     from engram.retrieval import memory_scan, load_config
 
     cfg    = load_config()                          # reads ~/.engram/config.yaml
-    result = memory_scan("VW counter-offer status", cfg)
+    result = memory_scan("AMX counter-offer status", cfg)
 
     result["direct"]        # list of memory file paths (keyword + bundle scan)
     result["graph"]         # list of additional paths from graph activation

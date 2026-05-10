@@ -203,7 +203,7 @@ class RetrievalConfig:
     context_budget: ContextBudgetConfig  = field(default_factory=ContextBudgetConfig)
     # Synonym groups for query expansion (bidirectional).
     # Any member of a group in the query pulls in all other members.
-    # Example:  {"automotive": ["car", "vehicle"], "vw": ["acmemotors", "acmetech"]}
+    # Example:  {"automotive": ["car", "vehicle"], "amx": ["acmemotors", "acmetech"]}
     synonyms:       dict                 = field(default_factory=dict)
 
 

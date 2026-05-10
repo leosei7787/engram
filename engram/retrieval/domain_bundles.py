@@ -6,7 +6,7 @@ Domain bundles map query trigger words to file path patterns that should
 always be loaded when those triggers appear — regardless of keyword score.
 
 This is the "breadcrumb" mechanism: if the user asks about "budget" or
-"VW", we force-load the relevant canonical files (financials.md,
+"AMX", we force-load the relevant canonical files (financials.md,
 accounts/) even if they don't score highly on token overlap alone.
 
 Bundles are configured in engram_config.yaml under `domain_bundles:`.

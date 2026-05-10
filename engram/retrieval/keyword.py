@@ -14,7 +14,7 @@ Key design choices:
 
 Resilience features (v0.2):
 - Stemming:          morphological variants match (meetings/meeting, hired/hiring)
-- Synonym expansion: config-driven equivalent terms (vw/acmemotors, car/automotive)
+- Synonym expansion: config-driven equivalent terms (amx/acmemotors, car/automotive)
 - Fuzzy PN match:    difflib catches typos in proper nouns (BetaMotorss->BetaMotors)
 """
 
@@ -142,7 +142,7 @@ def fast_file_score(
     recency  = any(w in q_lower for w in ("latest", "recent", "update", "current", "now", "today"))
     q_toks   = query_tokens(query)
 
-    # Synonym expansion: bidirectional -- "vw" pulls in "acmemotors" and vice-versa
+    # Synonym expansion: bidirectional -- "amx" pulls in "acmemotors" and vice-versa
     if synonyms:
         q_toks = expand_with_synonyms(q_toks, synonyms)
 

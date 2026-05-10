@@ -205,12 +205,12 @@ retrieval:
   # Use this to bridge: abbreviations, domain jargon, spelling variants, acronyms.
   # Example queries that benefit:
   #   "car company deal"    → also matches files with "automotive", "vehicle"
-  #   "vw counter-offer"    → also matches files with "acmemotors", "acmetech"
+  #   "amx counter-offer"    → also matches files with "acmemotors", "acmetech"
   #   "hiring status"       → also matches files with "recruit", "recruitment"
   synonyms:
     # Abbreviations / aliases
-    # vw: [acmemotors, acmetech]
-    # msft: [microsoft]
+    # amx: [acmemotors, acmetech]
+    # msft: [megacorp]
     # gm: [general motors]
     # Jargon / domain equivalents
     # automotive: [car, vehicle, vehicles]

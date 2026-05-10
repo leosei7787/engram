@@ -2688,7 +2688,7 @@ def _classify_event(e) -> tuple[float, list[str]]:
     if e.all_day:
         score += 0.5
         tags.append("all-day")
-    if e.location and "Microsoft Teams" not in e.location and "Skype" not in e.location:
+    if e.location and "MegaCorp Teams" not in e.location and "Skype" not in e.location:
         score += 0.3
         tags.append("in-person")
 
@@ -2758,7 +2758,7 @@ def top_of_mind():
                     "iso":       local.strftime("%Y-%m-%d"),
                     "time":      tline,
                     "summary":   (e.summary or "")[:140],
-                    "location":  "" if (e.location and ("Microsoft Teams" in e.location or "Skype" in e.location)) else (e.location or "")[:60],
+                    "location":  "" if (e.location and ("MegaCorp Teams" in e.location or "Skype" in e.location)) else (e.location or "")[:60],
                     "organizer": (e.organizer.split("@")[0] if e.organizer and "@" in e.organizer else ""),
                     "score":     score,
                     "tags":      tags,
