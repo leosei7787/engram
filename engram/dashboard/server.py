@@ -2679,36 +2679,90 @@ def watcher_rescan():
     except Exception as e:
         print("[server] handler error:\n" + traceback.format_exc(), flush=True)
         return jsonify({"error": "internal error — check server log"}), 500
+_RECENT_INBOX_EXTS = {".md", ".txt", ".eml", ".pdf", ".docx", ".pptx", ".vtt",
+                      ".csv", ".ics", ".json"}
+
+
 @app.route("/api/recent-activity")
 def recent_activity():
     """
-    Real-time feed of recently modified memory files (last 7 days).
-    Replaces the stale wiki/log.jsonl-based 'Recent activity' panel.
+    Real-time feed of recently modified files across the user's two
+    durable surfaces: MEMORY/ (cleaned + indexed content) and the inbox
+    (raw arrivals awaiting processing — calendar.ics, freshly-dropped
+    docs, etc.). 14-day window. Sessions and pre-compression backups
+    are excluded; the inbox's _processed/ archive folder is excluded
+    (those files have already shown up via MEMORY).
+
+    Empty files are skipped — usually they're a half-written sync from
+    OneDrive that resolves a moment later.
     """
     cfg = get_cfg()
-    mem = cfg.memory_path
-    cutoff = time.time() - 14 * 86400  # 14 days
+    mem    = cfg.memory_path
+    cutoff = time.time() - 14 * 86400
     items: list = []
+
+    def _emit(f: Path, *, root: Path, label_prefix: str = "") -> None:
+        try:
+            sz = f.stat().st_size
+            if sz <= 0:
+                return                              # skip half-synced / empty files
+            m = f.stat().st_mtime
+            if m < cutoff:
+                return
+            try:
+                rel = str(f.relative_to(root))
+                folder = f.parent.relative_to(root).as_posix() or "/"
+            except ValueError:
+                rel    = f.name
+                folder = "/"
+            items.append({
+                "name":     f.name,
+                "rel":      (label_prefix + rel) if label_prefix else rel,
+                "folder":   (label_prefix + folder) if label_prefix and folder != "/" else (label_prefix.rstrip("/") or folder),
+                "modified": m,
+                "size":     sz,
+            })
+        except Exception:
+            return
+
+    # 1) MEMORY/ — only .md, since the rest is binary state files.
     try:
         for f in mem.rglob("*.md"):
-            try:
-                if "/sessions/" in str(f) or "/_pre_compression_backups/" in str(f):
-                    continue
-                m = f.stat().st_mtime
-                if m < cutoff:
-                    continue
-                items.append({
-                    "name":     f.name,
-                    "rel":      str(f.relative_to(mem)),
-                    "folder":   f.parent.relative_to(mem).as_posix() or "/",
-                    "modified": m,
-                    "size":     f.stat().st_size,
-                })
-            except Exception:
+            sf = str(f)
+            if "/sessions/" in sf or "/_pre_compression_backups/" in sf:
                 continue
-    except Exception as e:
-        print("[server] handler error:\n" + traceback.format_exc(), flush=True)
-        return jsonify({"items": [], "error": "internal error"})
+            _emit(f, root=mem)
+    except Exception:
+        print("[recent-activity] memory scan error:\n" + traceback.format_exc(), flush=True)
+
+    # 2) Inbox — surface raw arrivals so calendar.ics and fresh uploads
+    # show up *before* the cleaner has had a chance to process them.
+    # Limited to the file types we know how to handle downstream.
+    try:
+        inbox_raw = getattr(getattr(cfg, "paths", None), "inbox_src", None)
+        if inbox_raw:
+            inbox = Path(inbox_raw).expanduser()
+            if inbox.exists():
+                for f in inbox.rglob("*"):
+                    if not f.is_file():
+                        continue
+                    sf = str(f)
+                    if "/_processed/" in sf:
+                        continue
+                    # Skip dotfiles and anything under a dot-prefixed dir
+                    # (.claude/, .DS_Store, .git/, etc.)
+                    try:
+                        rel_parts = f.relative_to(inbox).parts
+                    except ValueError:
+                        rel_parts = (f.name,)
+                    if any(part.startswith(".") for part in rel_parts):
+                        continue
+                    if f.suffix.lower() not in _RECENT_INBOX_EXTS:
+                        continue
+                    _emit(f, root=inbox, label_prefix="inbox/")
+    except Exception:
+        print("[recent-activity] inbox scan error:\n" + traceback.format_exc(), flush=True)
+
     # Sort by mtime (desc); break ties by name so same-second files have
     # a stable, predictable order (otherwise large bulk-rewrites bury new files).
     items.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
