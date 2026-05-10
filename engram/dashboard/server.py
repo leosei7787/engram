@@ -30,7 +30,7 @@ import sys
 import threading
 import traceback
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -270,6 +270,184 @@ def _start_watcher(cfg: EngramConfig):
     _watcher_thread = threading.Thread(target=_run, daemon=True, name="engram-watcher")
     _watcher_thread.start()
     print(f"[watcher] started — watching {inbox_path}", flush=True)
+
+
+# ─── Sleep-cycle scheduler ────────────────────────────────────────────────────
+# Background thread that watches the wall clock and fires run_sleep_cycle()
+# once a day at the time configured in cfg.sleep_cycle.schedule (default
+# "02:00"). State persists across server restarts via a small JSON file so
+# the cycle doesn't double-fire if you bounce the dashboard.
+_sleep_thread:    threading.Thread | None = None
+_sleep_lock = threading.Lock()
+_sleep_state: dict = {
+    "running":         False,    # actively executing right now
+    "last_run_date":   None,     # YYYY-MM-DD of last completed run
+    "last_run_at":     None,     # ISO timestamp
+    "last_result":     None,     # summary dict from run_sleep_cycle
+    "next_due":        None,     # ISO timestamp of next scheduled fire
+    "schedule":        "02:00",
+    "manual_pending":  False,    # operator triggered via /api/sleep-cycle/trigger
+}
+
+
+def _sleep_state_path(memory_path: Path) -> Path:
+    return memory_path / ".sleep_scheduler_state.json"
+
+
+def _load_sleep_state(memory_path: Path) -> None:
+    p = _sleep_state_path(memory_path)
+    if not p.exists():
+        return
+    try:
+        data = json.loads(p.read_text())
+        for k in ("last_run_date", "last_run_at", "last_result"):
+            if k in data:
+                _sleep_state[k] = data[k]
+    except Exception:
+        pass
+
+
+def _save_sleep_state(memory_path: Path) -> None:
+    p = _sleep_state_path(memory_path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        snapshot = {k: _sleep_state.get(k) for k in ("last_run_date", "last_run_at", "last_result")}
+        p.write_text(json.dumps(snapshot, indent=2))
+    except Exception:
+        pass
+
+
+def _parse_schedule(s: str) -> tuple[int, int]:
+    """Parse 'HH:MM' (24h). Falls back to 02:00 on bad input."""
+    try:
+        h, m = s.split(":")
+        return max(0, min(23, int(h))), max(0, min(59, int(m)))
+    except Exception:
+        return (2, 0)
+
+
+def _next_due(schedule_str: str, last_run_date: str | None, now: datetime | None = None) -> datetime:
+    """When should the cycle fire next?"""
+    now = now or datetime.now()
+    h, m = _parse_schedule(schedule_str)
+    today_at = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    today = now.strftime("%Y-%m-%d")
+    # If we haven't run today and we're past today's scheduled time → due now
+    if last_run_date != today and now >= today_at:
+        return now
+    # Otherwise: today's slot if not yet reached, else tomorrow's
+    if now < today_at:
+        return today_at
+    return today_at + timedelta(days=1)
+
+
+def _run_sleep_cycle_now(cfg: "EngramConfig", *, manual: bool = False) -> None:
+    """Run the cycle synchronously in the calling thread; persist state."""
+    from engram.memory.sleep_cycle      import run_sleep_cycle
+    from engram.memory.session_harvester import make_session_consolidation_runner
+
+    with _sleep_lock:
+        if _sleep_state["running"]:
+            print("[sleep] skipping — already running", flush=True)
+            return
+        _sleep_state["running"] = True
+
+    try:
+        runner = make_session_consolidation_runner(
+            memory_path   = cfg.memory_path,
+            user_name     = cfg.identity.user_name or "",
+            cfg           = cfg,
+            max_age_hours = 48,
+        )
+        print(f"[sleep] cycle starting (manual={manual}, "
+              f"schedule={_sleep_state['schedule']})", flush=True)
+        t0 = time.time()
+        summary = run_sleep_cycle(
+            cfg.memory_path,
+            consolidation_runner = runner,
+            skip_compression     = True,
+        )
+        elapsed = time.time() - t0
+        print(f"[sleep] cycle done in {elapsed:.1f}s", flush=True)
+
+        # Capture a compact summary for the status endpoint
+        cons = (summary.get("consolidation") or {})
+        result = {
+            "duration_s":    round(elapsed, 1),
+            "phases_run":    len(summary.get("phases") or []),
+            "files_scanned": cons.get("files_scanned", 0),
+            "proposals":     cons.get("proposals", 0),
+        }
+
+        with _sleep_lock:
+            _sleep_state["last_run_date"] = datetime.now().strftime("%Y-%m-%d")
+            _sleep_state["last_run_at"]   = datetime.now().isoformat(timespec="seconds")
+            _sleep_state["last_result"]   = result
+        _save_sleep_state(cfg.memory_path)
+    except Exception:
+        print("[sleep] cycle error:\n" + traceback.format_exc(), flush=True)
+    finally:
+        with _sleep_lock:
+            _sleep_state["running"] = False
+
+
+def _start_sleep_scheduler(cfg: "EngramConfig") -> None:
+    """Start the background scheduler thread. Idempotent."""
+    global _sleep_thread
+
+    sleep_cfg = getattr(cfg, "sleep_cycle", None)
+    if sleep_cfg and not getattr(sleep_cfg, "enabled", True):
+        print("[sleep] scheduler disabled in config — skipping", flush=True)
+        return
+
+    schedule_str = getattr(sleep_cfg, "schedule", "02:00") if sleep_cfg else "02:00"
+    _sleep_state["schedule"] = schedule_str
+    _load_sleep_state(cfg.memory_path)
+
+    if _sleep_thread and _sleep_thread.is_alive():
+        return
+
+    def _loop() -> None:
+        # Sleep-then-check pattern. Wake every 60s; cheap.
+        while True:
+            try:
+                with _sleep_lock:
+                    last_date = _sleep_state["last_run_date"]
+                    manual    = _sleep_state.get("manual_pending", False)
+                    if manual:
+                        _sleep_state["manual_pending"] = False
+                due = _next_due(_sleep_state["schedule"], last_date)
+                now = datetime.now()
+                with _sleep_lock:
+                    _sleep_state["next_due"] = due.isoformat(timespec="seconds")
+                if manual or now >= due:
+                    _run_sleep_cycle_now(cfg, manual=manual)
+            except Exception:
+                print("[sleep] scheduler loop error:\n" + traceback.format_exc(), flush=True)
+            time.sleep(60)
+
+    _sleep_thread = threading.Thread(target=_loop, daemon=True, name="engram-sleep-scheduler")
+    _sleep_thread.start()
+    print(f"[sleep] scheduler started — fires daily at {schedule_str}", flush=True)
+
+
+@app.route("/api/sleep-cycle/status")
+def sleep_cycle_status():
+    with _sleep_lock:
+        snapshot = dict(_sleep_state)
+    return jsonify(snapshot)
+
+
+@app.route("/api/sleep-cycle/trigger", methods=["POST"])
+def sleep_cycle_trigger():
+    """Run the cycle now (manual override). Returns immediately; the work
+    happens in the scheduler thread on its next 60s tick.
+    """
+    with _sleep_lock:
+        if _sleep_state["running"]:
+            return jsonify({"status": "already_running"})
+        _sleep_state["manual_pending"] = True
+    return jsonify({"status": "queued"})
 
 
 # ─── Inbox save (chat uploads also enter the long-term pipeline) ──────────────
@@ -4495,5 +4673,11 @@ if __name__ == "__main__":
         _start_watcher(cfg)
     except Exception as e:
         print(f"[watcher] failed to start: {e}", flush=True)
+
+    # Auto-start the nightly dream-cycle scheduler
+    try:
+        _start_sleep_scheduler(cfg)
+    except Exception as e:
+        print(f"[sleep] scheduler failed to start: {e}", flush=True)
 
     app.run(host="0.0.0.0", port=port, debug=False)
