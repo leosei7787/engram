@@ -343,9 +343,6 @@ def _next_due(schedule_str: str, last_run_date: str | None, now: datetime | None
 
 def _run_sleep_cycle_now(cfg: "EngramConfig", *, manual: bool = False) -> None:
     """Run the cycle synchronously in the calling thread; persist state."""
-    from engram.memory.sleep_cycle      import run_sleep_cycle
-    from engram.memory.session_harvester import make_session_consolidation_runner
-
     with _sleep_lock:
         if _sleep_state["running"]:
             print("[sleep] skipping — already running", flush=True)
@@ -353,6 +350,11 @@ def _run_sleep_cycle_now(cfg: "EngramConfig", *, manual: bool = False) -> None:
         _sleep_state["running"] = True
 
     try:
+        # Imports inside the try block — if a downstream module fails to load,
+        # we log + clear `running` rather than crashing the scheduler thread.
+        from engram.memory.sleep_cycle      import run_sleep_cycle
+        from engram.memory.session_harvester import make_session_consolidation_runner
+
         runner = make_session_consolidation_runner(
             memory_path   = cfg.memory_path,
             user_name     = cfg.identity.user_name or "",
