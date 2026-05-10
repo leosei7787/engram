@@ -210,6 +210,11 @@ class InboxWatcher:
                 continue
 
             if not self._registry.is_new(p, content):
+                # Already-processed file is still sitting in the live inbox —
+                # likely processed before the auto-archive feature landed.
+                # Catch it up by moving to _processed/ now. Idempotent: the
+                # archive step's own check skips files already under there.
+                self._archive_processed(p)
                 continue
 
             # Apply redaction if configured
