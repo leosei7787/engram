@@ -1597,6 +1597,197 @@ def stats():
     })
 
 
+# ─── Browse tab: tree, save, backlinks ───────────────────────────────────────
+# Obsidian-style file browser over wiki/ + memory/. Read paths through the
+# existing /api/file endpoint; tree + save + backlinks are new.
+
+def _walk_browse_tree(root: Path, *, max_depth: int = 8, _depth: int = 0) -> dict:
+    """Recursive .md-only tree. Skips dotfiles, _raw / .bak / processed dirs."""
+    if not root.exists():
+        return {"name": root.name, "type": "dir", "children": [], "rel": ""}
+    children: list = []
+    try:
+        for p in sorted(root.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+            n = p.name
+            if n.startswith(".") or n.startswith("_") or n.endswith(".bak"):
+                continue
+            if p.is_dir():
+                if _depth >= max_depth:
+                    continue
+                child = _walk_browse_tree(p, max_depth=max_depth, _depth=_depth + 1)
+                if child.get("children"):
+                    children.append(child)
+            elif p.suffix.lower() == ".md":
+                children.append({"name": n, "type": "file", "rel": str(p)})
+    except Exception:
+        pass
+    return {"name": root.name, "type": "dir", "children": children, "rel": str(root)}
+
+
+@app.route("/api/browse/tree")
+def browse_tree():
+    """Combined tree of wiki + memory. Cheap enough at small/medium repos;
+    if it ever gets sluggish we can move to lazy per-folder fetches."""
+    cfg = get_cfg()
+    return jsonify({
+        "wiki":   _walk_browse_tree(cfg.wiki_path),
+        "memory": _walk_browse_tree(cfg.memory_path),
+    })
+
+
+def _resolve_browse_path(cfg, path_in: str) -> Path | None:
+    """Accept absolute or relative-to-base paths; reject anything outside
+    wiki_path / memory_path / base_path."""
+    if not path_in:
+        return None
+    candidates: list[Path] = []
+    p_in = Path(path_in)
+    if p_in.is_absolute():
+        candidates.append(p_in)
+    else:
+        candidates.append(cfg.base_path / path_in)
+        candidates.append(cfg.memory_path / path_in)
+        candidates.append(cfg.wiki_path / path_in)
+    p = next((c for c in candidates if c.exists() and c.is_file()), None)
+    if p is None:
+        return None
+    abs_p = p.resolve()
+    roots = [cfg.memory_path.resolve(), cfg.wiki_path.resolve(), cfg.base_path.resolve()]
+    if not any(str(abs_p).startswith(str(r)) for r in roots):
+        return None
+    return abs_p
+
+
+@app.route("/api/browse/save", methods=["POST"])
+def browse_save():
+    cfg = get_cfg()
+    body = request.get_json(force=True, silent=True) or {}
+    path_in = (body.get("path", "") or "").strip()
+    content = body.get("content", "")
+    if not path_in:
+        return jsonify({"error": "path required"}), 400
+    if not isinstance(content, str):
+        return jsonify({"error": "content must be a string"}), 400
+    if len(content) > 1_000_000:
+        return jsonify({"error": "content too large (>1 MB)"}), 413
+
+    p = _resolve_browse_path(cfg, path_in)
+    if p is None:
+        return jsonify({"error": "path not found or outside allowed roots"}), 403
+    if p.suffix.lower() != ".md":
+        return jsonify({"error": "only .md files are editable here"}), 400
+
+    try:
+        # Backup the prior version with epoch suffix so accidental saves are
+        # recoverable. Single-shot — older backups stay in place.
+        try:
+            backup = p.with_suffix(p.suffix + f".bak.{int(time.time())}")
+            if not backup.exists():
+                backup.write_text(p.read_text(errors="ignore"), encoding="utf-8")
+        except Exception:
+            pass
+        p.write_text(content, encoding="utf-8")
+        return jsonify({"ok": True, "path": str(p), "bytes": len(content.encode("utf-8"))})
+    except Exception:
+        print("[browse/save] error:\n" + traceback.format_exc(), flush=True)
+        return jsonify({"error": "save failed — check server log"}), 500
+
+
+_WIKILINK_RX = re.compile(r"\[\[([^\[\]\|#]+?)(?:#[^\[\]\|]+)?(?:\|[^\[\]]+)?\]\]")
+
+
+@app.route("/api/browse/backlinks")
+def browse_backlinks():
+    """Return files that link TO this one (via [[wikilink]]) + this file's
+    outgoing links. Walks wiki + memory looking for the file's stem in
+    [[...]] syntax. Cheap for ≤10k files; if larger, move to a precomputed
+    index in the dream cycle.
+    """
+    cfg = get_cfg()
+    path_in = (request.args.get("path", "") or "").strip()
+    p = _resolve_browse_path(cfg, path_in)
+    if p is None:
+        return jsonify({"error": "path not found"}), 404
+
+    target_stem = p.stem.strip()
+    target_lc   = target_stem.lower()
+
+    backlinks: list = []
+    outgoing:  list = []
+
+    # Outgoing — read this file's own [[wikilinks]]
+    try:
+        text = p.read_text(errors="ignore")
+        seen: set = set()
+        for m in _WIKILINK_RX.finditer(text):
+            name = m.group(1).strip()
+            key = name.lower()
+            if key in seen or key == target_lc:
+                continue
+            seen.add(key)
+            outgoing.append({"name": name})
+    except Exception:
+        pass
+
+    # Backlinks — scan ALL .md files for [[<target_stem>]] (case-insensitive)
+    roots = [cfg.wiki_path, cfg.memory_path]
+    bl_target = re.compile(r"\[\[\s*" + re.escape(target_stem) + r"(?:#|\||\])", re.IGNORECASE)
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            for f in root.rglob("*.md"):
+                if f.resolve() == p:
+                    continue
+                if any(part.startswith(("_", ".")) or part.endswith(".bak")
+                       for part in f.relative_to(root).parts):
+                    continue
+                try:
+                    if bl_target.search(f.read_text(errors="ignore")[:30000]):
+                        backlinks.append({
+                            "name": f.stem,
+                            "rel":  str(f),
+                        })
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    backlinks.sort(key=lambda x: x["name"].lower())
+    return jsonify({
+        "path":      str(p),
+        "stem":      target_stem,
+        "backlinks": backlinks[:200],
+        "outgoing":  outgoing[:200],
+    })
+
+
+# Resolve a wikilink name to a concrete file path. Used when the user clicks
+# [[Dave]] in the rendered markdown.
+@app.route("/api/browse/resolve")
+def browse_resolve():
+    cfg = get_cfg()
+    name = (request.args.get("name", "") or "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    name_lc = name.lower()
+    # Search wiki first (canonical knowledge), then memory
+    for root in (cfg.wiki_path, cfg.memory_path):
+        if not root.exists():
+            continue
+        for f in root.rglob("*.md"):
+            if f.stem.lower() == name_lc:
+                return jsonify({"path": str(f), "name": f.stem})
+    # Fuzzy-match: substring of stem
+    for root in (cfg.wiki_path, cfg.memory_path):
+        if not root.exists():
+            continue
+        for f in root.rglob("*.md"):
+            if name_lc in f.stem.lower():
+                return jsonify({"path": str(f), "name": f.stem, "fuzzy": True})
+    return jsonify({"error": "not found", "name": name}), 404
+
+
 @app.route("/api/file")
 def serve_file():
     """Return raw text content of a memory or wiki file for preview.
@@ -2669,12 +2860,15 @@ def signals_refresh():
 @app.route("/")
 @app.route("/health")
 @app.route("/top-of-mind")
+@app.route("/browse")
 def index():
     cfg          = get_cfg()
     if request.path == "/health":
         active_tab = "health"
     elif request.path == "/top-of-mind":
         active_tab = "top-of-mind"
+    elif request.path == "/browse":
+        active_tab = "browse"
     else:
         active_tab = "chat"
     return _build_html(cfg, active_tab), 200, {"Content-Type": "text/html; charset=utf-8"}
@@ -3084,6 +3278,110 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .loading {{ color: #ccc; font-size: 12px; padding: 16px 0; text-align: center; }}
 
 /* ═══════════════════════════════════════════
+   BROWSE PANEL  (Obsidian-style wiki/memory navigator)
+═══════════════════════════════════════════ */
+.browse-layout {{ display: flex; width: 100%; height: 100%; overflow: hidden;
+                  background: #fff; }}
+
+/* Left: tree */
+.browse-tree {{ width: 280px; flex-shrink: 0; border-right: 1px solid #e8e8e8;
+                background: #fafafa; display: flex; flex-direction: column;
+                overflow: hidden; }}
+.browse-tree-header {{ padding: 10px 12px; border-bottom: 1px solid #efefef; }}
+.browse-search {{ width: 100%; border: 1px solid #ddd; border-radius: 6px;
+                  padding: 6px 10px; font-size: 12px; outline: none;
+                  transition: border-color .15s; }}
+.browse-search:focus {{ border-color: #D97757; }}
+.browse-tree-body {{ flex: 1; overflow-y: auto; padding: 8px 0 30px;
+                     font-size: 12px; }}
+.browse-loading {{ color: #ccc; padding: 16px; text-align: center; }}
+
+.browse-row {{ padding: 3px 8px 3px 12px; cursor: pointer;
+               white-space: nowrap; overflow: hidden;
+               text-overflow: ellipsis; user-select: none; }}
+.browse-row:hover {{ background: rgba(217,119,87,.06); }}
+.browse-row.dir {{ font-weight: 600; color: #1a1a1a; }}
+.browse-row.file {{ color: #555; }}
+.browse-row.file.active {{ background: #fff;
+                            border-left: 2px solid #D97757; padding-left: 10px;
+                            color: #D97757; }}
+.browse-row.collapsed + .browse-children {{ display: none; }}
+.browse-row.dir::before {{ content: '▸'; display: inline-block;
+                            width: 10px; margin-right: 4px;
+                            transition: transform .15s; color: #aaa; }}
+.browse-row.dir.expanded::before {{ transform: rotate(90deg); }}
+.browse-children {{ }}
+.browse-row.hidden {{ display: none; }}
+
+/* Center: viewer / editor */
+.browse-main {{ flex: 1; display: flex; flex-direction: column;
+                overflow: hidden; min-width: 0; }}
+.browse-main-header {{ display: flex; align-items: center; justify-content: space-between;
+                       padding: 12px 22px; border-bottom: 1px solid #e8e8e8;
+                       gap: 12px; flex-shrink: 0; }}
+.browse-breadcrumb {{ font-size: 12px; color: #666; flex: 1;
+                      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+.browse-actions {{ display: flex; gap: 6px; flex-shrink: 0; }}
+.browse-btn {{ padding: 5px 12px; border-radius: 6px; border: 1px solid #ddd;
+               background: #fff; font-size: 11px; color: #555;
+               cursor: pointer; transition: all .15s; }}
+.browse-btn:hover {{ border-color: #999; color: #1a1a1a; }}
+.browse-btn.primary {{ background: #D97757; color: #fff; border-color: #D97757; }}
+.browse-btn.primary:hover {{ background: #c06040; border-color: #c06040; color: #fff; }}
+.browse-btn:disabled {{ opacity: .5; cursor: wait; }}
+.browse-main-body {{ flex: 1; overflow-y: auto; padding: 24px 32px;
+                     font-size: 14px; line-height: 1.7; color: #1a1a1a; }}
+.browse-empty {{ color: #ccc; text-align: center; padding: 60px 20px;
+                 font-style: italic; }}
+/* Markdown rendering */
+.browse-md h1 {{ font-size: 22px; margin: 0 0 16px; font-weight: 700; }}
+.browse-md h2 {{ font-size: 18px; margin: 22px 0 10px; font-weight: 700;
+                 padding-bottom: 4px; border-bottom: 1px solid #f0f0f0; }}
+.browse-md h3 {{ font-size: 15px; margin: 18px 0 8px; font-weight: 700; }}
+.browse-md p  {{ margin: 0 0 10px; }}
+.browse-md ul, .browse-md ol {{ margin: 0 0 10px 24px; }}
+.browse-md li {{ margin: 3px 0; }}
+.browse-md code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                   font-size: 12.5px; background: #f5f5f5;
+                   padding: 1px 6px; border-radius: 4px; color: #c06040; }}
+.browse-md pre {{ background: #f5f5f5; padding: 10px 14px; border-radius: 6px;
+                  overflow-x: auto; font-size: 12.5px; margin: 10px 0;
+                  border: 1px solid #efefef; }}
+.browse-md pre code {{ background: none; padding: 0; color: #1a1a1a; }}
+.browse-md a {{ color: #4285F4; text-decoration: none; }}
+.browse-md a:hover {{ text-decoration: underline; }}
+.browse-md a.wikilink {{ color: #D97757; padding: 1px 4px; border-radius: 3px;
+                         background: rgba(217,119,87,.06); }}
+.browse-md a.wikilink:hover {{ background: rgba(217,119,87,.14); }}
+.browse-md a.wikilink.unresolved {{ color: #c00; background: rgba(204,0,0,.06);
+                                    text-decoration: line-through dotted; }}
+.browse-md blockquote {{ border-left: 3px solid #e0e0e0; margin: 8px 0;
+                          padding: 4px 12px; color: #666; }}
+.browse-md hr {{ border: 0; border-top: 1px solid #efefef; margin: 18px 0; }}
+.browse-md table {{ border-collapse: collapse; margin: 10px 0; }}
+.browse-md th, .browse-md td {{ border: 1px solid #e8e8e8; padding: 4px 10px; }}
+
+.browse-editor {{ width: 100%; height: 100%; border: 1px solid #e8e8e8;
+                  border-radius: 6px; padding: 14px 16px;
+                  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                  font-size: 13px; line-height: 1.6;
+                  outline: none; resize: none; }}
+.browse-editor:focus {{ border-color: #D97757; }}
+
+/* Right: backlinks / outgoing */
+.browse-side {{ width: 220px; flex-shrink: 0; border-left: 1px solid #e8e8e8;
+                background: #fafafa; padding: 12px 14px; overflow-y: auto;
+                font-size: 11.5px; }}
+.browse-side-section {{ margin-bottom: 18px; }}
+.browse-side-label {{ font-size: 9.5px; font-weight: 700; letter-spacing: 1.5px;
+                      text-transform: uppercase; color: #aaa; margin-bottom: 8px; }}
+.browse-side-item {{ padding: 4px 8px; border-radius: 4px; cursor: pointer;
+                     color: #555; word-break: break-word; }}
+.browse-side-item:hover {{ background: rgba(217,119,87,.08); color: #D97757; }}
+.browse-empty-side {{ color: #ccc; font-style: italic; font-size: 11px; }}
+
+/* ═══════════════════════════════════════════
    TOP OF MIND PANEL
 ═══════════════════════════════════════════ */
 .tom-layout {{ width: 100%; height: 100%; overflow-y: auto; background: #fafafa; }}
@@ -3163,6 +3461,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
   <nav class="tabs">
     <a class="tab {'active' if active_tab == 'chat' else ''}" href="/" data-tab="chat" id="tab-chat" onclick="return switchTab(event, 'chat')">Chat</a>
     <a class="tab {'active' if active_tab == 'top-of-mind' else ''}" href="/top-of-mind" data-tab="top-of-mind" id="tab-top-of-mind" onclick="return switchTab(event, 'top-of-mind')">Top of Mind</a>
+    <a class="tab {'active' if active_tab == 'browse' else ''}" href="/browse" data-tab="browse" id="tab-browse" onclick="return switchTab(event, 'browse')">Browse</a>
     <a class="tab {'active' if active_tab == 'health' else ''}" href="/health" data-tab="health" id="tab-health" onclick="return switchTab(event, 'health')">Engram Health</a>
   </nav>
   <div class="topbar-right">
@@ -3237,6 +3536,49 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
       <div class="tom-title">Top of Mind</div>
       <div class="tom-sub">Upcoming events, pending decisions, open questions · refreshes every 60s</div>
       <div class="tom-cols" id="tom-cols"><div class="loading">Loading…</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════ BROWSE PANEL ══════════════════════ -->
+<div class="tab-panel {'active' if active_tab == 'browse' else ''}" id="panel-browse">
+  <div class="browse-layout">
+    <!-- Left: file tree -->
+    <div class="browse-tree" id="browse-tree">
+      <div class="browse-tree-header">
+        <input class="browse-search" id="browse-search" placeholder="Filter files…" oninput="filterBrowseTree(this.value)" />
+      </div>
+      <div class="browse-tree-body" id="browse-tree-body">
+        <div class="browse-loading">Loading…</div>
+      </div>
+    </div>
+
+    <!-- Center: file viewer / editor -->
+    <div class="browse-main">
+      <div class="browse-main-header" id="browse-main-header">
+        <div class="browse-breadcrumb" id="browse-breadcrumb">Select a file from the tree</div>
+        <div class="browse-actions" id="browse-actions">
+          <button class="browse-btn" id="browse-edit-btn" onclick="toggleBrowseEdit()" style="display:none">✎ Edit</button>
+          <button class="browse-btn primary" id="browse-save-btn" onclick="saveBrowseFile()" style="display:none">Save</button>
+          <button class="browse-btn" id="browse-cancel-btn" onclick="cancelBrowseEdit()" style="display:none">Cancel</button>
+          <button class="browse-btn" id="browse-chat-btn" onclick="chatAboutCurrentFile()" style="display:none">💬 Chat about this</button>
+        </div>
+      </div>
+      <div class="browse-main-body" id="browse-main-body">
+        <div class="browse-empty">Pick a file from the tree on the left.</div>
+      </div>
+    </div>
+
+    <!-- Right: backlinks / outgoing links -->
+    <div class="browse-side" id="browse-side">
+      <div class="browse-side-section">
+        <div class="browse-side-label">Linked from</div>
+        <div id="browse-backlinks"><div class="browse-empty-side">—</div></div>
+      </div>
+      <div class="browse-side-section">
+        <div class="browse-side-label">Outgoing links</div>
+        <div id="browse-outgoing"><div class="browse-empty-side">—</div></div>
+      </div>
     </div>
   </div>
 </div>
@@ -4230,6 +4572,299 @@ function applyContextUpdate(upd) {{
   countEl.textContent = activeContext.length + ' of ' + total + ' candidate' + (total > 1 ? 's' : '');
 }}
 
+// ── Browse tab ─────────────────────────────────────────────────────────────
+let _browseTreeData    = null;
+let _browseCurrentPath = null;
+let _browseCurrentText = null;
+let _browseEditing     = false;
+let _browseDirty       = false;
+
+function loadBrowseTree() {{
+  const panel = document.getElementById('panel-browse');
+  if (!panel || !panel.classList.contains('active')) return;
+  // Avoid re-fetching every tab switch — reuse cached tree.
+  if (_browseTreeData) {{ return; }}
+  fetch('/api/browse/tree').then(r => r.json()).then(data => {{
+    _browseTreeData = data;
+    renderBrowseTree();
+  }}).catch(() => {{
+    document.getElementById('browse-tree-body').innerHTML =
+      '<div class="browse-empty">Could not load tree.</div>';
+  }});
+}}
+
+function renderBrowseTree() {{
+  const body = document.getElementById('browse-tree-body');
+  if (!body || !_browseTreeData) return;
+  const html = [];
+  if (_browseTreeData.wiki && (_browseTreeData.wiki.children || []).length) {{
+    html.push(_renderBrowseNode(_browseTreeData.wiki, 0, 'wiki'));
+  }}
+  if (_browseTreeData.memory && (_browseTreeData.memory.children || []).length) {{
+    html.push(_renderBrowseNode(_browseTreeData.memory, 0, 'memory'));
+  }}
+  body.innerHTML = html.join('') || '<div class="browse-empty">No files found.</div>';
+}}
+
+function _renderBrowseNode(node, depth, rootLabel) {{
+  if (!node) return '';
+  if (node.type === 'file') {{
+    const indent = (depth * 14) + 'px';
+    return `<div class="browse-row file" data-rel="${{escHtml(node.rel)}}"
+                 style="padding-left:${{indent}}"
+                 onclick="openBrowseFile('${{escHtml(node.rel).replace(/'/g, "\\\\'")}}')">${{escHtml(node.name.replace(/\\.md$/i, ''))}}</div>`;
+  }}
+  // Directory
+  const childrenHtml = (node.children || []).map(c => _renderBrowseNode(c, depth + 1, rootLabel)).join('');
+  // Top-level dirs are auto-expanded; deeper dirs start collapsed.
+  const startExpanded = depth < 1;
+  const indent = (depth * 14) + 'px';
+  const label = depth === 0 ? rootLabel : node.name;
+  return `<div class="browse-row dir ${{startExpanded ? 'expanded' : 'collapsed'}}"
+               style="padding-left:${{indent}}"
+               onclick="this.classList.toggle('expanded');this.classList.toggle('collapsed');">${{escHtml(label)}}</div>
+          <div class="browse-children">${{childrenHtml}}</div>`;
+}}
+
+function filterBrowseTree(q) {{
+  q = (q || '').trim().toLowerCase();
+  const rows = document.querySelectorAll('#browse-tree-body .browse-row');
+  if (!q) {{ rows.forEach(r => r.classList.remove('hidden')); return; }}
+  rows.forEach(r => {{
+    if (r.classList.contains('dir')) {{ r.classList.remove('hidden'); return; }}
+    const txt = r.textContent.toLowerCase();
+    r.classList.toggle('hidden', !txt.includes(q));
+  }});
+}}
+
+async function openBrowseFile(rel) {{
+  if (_browseDirty && _browseEditing) {{
+    if (!confirm('Discard unsaved changes?')) return;
+  }}
+  _browseEditing = false;
+  _browseDirty   = false;
+  _browseCurrentPath = rel;
+
+  const headerEl = document.getElementById('browse-breadcrumb');
+  const bodyEl   = document.getElementById('browse-main-body');
+  bodyEl.innerHTML = '<div class="browse-empty">Loading…</div>';
+  headerEl.textContent = rel;
+
+  // Highlight active row in tree
+  document.querySelectorAll('#browse-tree-body .browse-row.file').forEach(el => {{
+    el.classList.toggle('active', el.dataset.rel === rel);
+  }});
+
+  try {{
+    const r = await fetch('/api/file?path=' + encodeURIComponent(rel));
+    const d = await r.json();
+    if (d.error) {{
+      bodyEl.innerHTML = '<div class="browse-empty">⚠ ' + escHtml(d.error) + '</div>';
+      _browseCurrentText = null;
+      return;
+    }}
+    _browseCurrentText = d.content || '';
+    _renderMarkdown(bodyEl, _browseCurrentText);
+    document.getElementById('browse-edit-btn').style.display = '';
+    document.getElementById('browse-chat-btn').style.display = '';
+    document.getElementById('browse-save-btn').style.display = 'none';
+    document.getElementById('browse-cancel-btn').style.display = 'none';
+    loadBrowseBacklinks(rel);
+  }} catch (e) {{
+    bodyEl.innerHTML = '<div class="browse-empty">⚠ ' + escHtml(e.message) + '</div>';
+  }}
+}}
+
+async function loadBrowseBacklinks(rel) {{
+  const bl  = document.getElementById('browse-backlinks');
+  const og  = document.getElementById('browse-outgoing');
+  bl.innerHTML = '<div class="browse-empty-side">Loading…</div>';
+  og.innerHTML = '<div class="browse-empty-side">Loading…</div>';
+  try {{
+    const r = await fetch('/api/browse/backlinks?path=' + encodeURIComponent(rel));
+    const d = await r.json();
+    if (d.error) {{
+      bl.innerHTML = '<div class="browse-empty-side">—</div>';
+      og.innerHTML = '<div class="browse-empty-side">—</div>';
+      return;
+    }}
+    bl.innerHTML = (d.backlinks || []).length
+      ? d.backlinks.map(b => `<div class="browse-side-item" onclick="openBrowseFile('${{escHtml(b.rel).replace(/'/g, "\\\\'")}}')">${{escHtml(b.name)}}</div>`).join('')
+      : '<div class="browse-empty-side">No incoming links.</div>';
+    og.innerHTML = (d.outgoing || []).length
+      ? d.outgoing.map(o => `<div class="browse-side-item" onclick="resolveAndOpenWikilink('${{escHtml(o.name).replace(/'/g, "\\\\'")}}')">${{escHtml(o.name)}}</div>`).join('')
+      : '<div class="browse-empty-side">No outgoing links.</div>';
+  }} catch (e) {{
+    bl.innerHTML = '<div class="browse-empty-side">—</div>';
+    og.innerHTML = '<div class="browse-empty-side">—</div>';
+  }}
+}}
+
+async function resolveAndOpenWikilink(name) {{
+  try {{
+    const r = await fetch('/api/browse/resolve?name=' + encodeURIComponent(name));
+    const d = await r.json();
+    if (d.path) {{
+      openBrowseFile(d.path);
+    }} else {{
+      _showToast('No file found for [[' + name + ']]');
+    }}
+  }} catch (e) {{}}
+}}
+
+// Minimal markdown renderer — covers the cases we actually have in
+// engram-data: headings, paragraphs, lists, fenced code, inline code,
+// bold, italic, links, [[wikilinks]], blockquotes, hr.
+function _renderMarkdown(el, src) {{
+  if (!src) {{ el.innerHTML = '<div class="browse-empty">(empty file)</div>'; return; }}
+  const lines = src.split(/\\r?\\n/);
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {{
+    let line = lines[i];
+    // Fenced code
+    if (/^```/.test(line)) {{
+      const fence = line.match(/^```(.*)/);
+      const lang  = (fence && fence[1] || '').trim();
+      const buf   = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i])) {{ buf.push(lines[i]); i++; }}
+      i++;
+      out.push('<pre><code' + (lang ? ' class="lang-' + escHtml(lang) + '"' : '') + '>' + escHtml(buf.join('\\n')) + '</code></pre>');
+      continue;
+    }}
+    // Headings
+    let m = line.match(/^(#{{1,6}})\\s+(.*)$/);
+    if (m) {{ const lvl = m[1].length; out.push(`<h${{lvl}}>${{_inlineMd(m[2])}}</h${{lvl}}>`); i++; continue; }}
+    // Horizontal rule
+    if (/^---+\\s*$/.test(line)) {{ out.push('<hr/>'); i++; continue; }}
+    // Blockquote
+    if (/^>\\s?/.test(line)) {{
+      const buf = [];
+      while (i < lines.length && /^>\\s?/.test(lines[i])) {{ buf.push(lines[i].replace(/^>\\s?/, '')); i++; }}
+      out.push('<blockquote>' + _inlineMd(buf.join('\\n')) + '</blockquote>');
+      continue;
+    }}
+    // Lists
+    if (/^[\\-*+]\\s+/.test(line) || /^\\d+\\.\\s+/.test(line)) {{
+      const ordered = /^\\d+\\.\\s+/.test(line);
+      const tag = ordered ? 'ol' : 'ul';
+      const items = [];
+      while (i < lines.length && (/^[\\-*+]\\s+/.test(lines[i]) || /^\\d+\\.\\s+/.test(lines[i]))) {{
+        items.push('<li>' + _inlineMd(lines[i].replace(/^([\\-*+]|\\d+\\.)\\s+/, '')) + '</li>');
+        i++;
+      }}
+      out.push('<' + tag + '>' + items.join('') + '</' + tag + '>');
+      continue;
+    }}
+    // Blank line ends paragraph; otherwise gather paragraph
+    if (/^\\s*$/.test(line)) {{ i++; continue; }}
+    const paraBuf = [];
+    while (i < lines.length && !/^\\s*$/.test(lines[i]) && !/^#{{1,6}}\\s/.test(lines[i])
+           && !/^```/.test(lines[i]) && !/^>\\s?/.test(lines[i])
+           && !/^[\\-*+]\\s+/.test(lines[i]) && !/^\\d+\\.\\s+/.test(lines[i])
+           && !/^---+\\s*$/.test(lines[i])) {{
+      paraBuf.push(lines[i]);
+      i++;
+    }}
+    if (paraBuf.length) {{ out.push('<p>' + _inlineMd(paraBuf.join(' ')) + '</p>'); }}
+  }}
+  el.innerHTML = '<div class="browse-md">' + out.join('') + '</div>';
+}}
+
+function _inlineMd(s) {{
+  if (!s) return '';
+  let html = escHtml(s);
+  // Inline code (do first so it isn't affected by other replacements)
+  html = html.replace(/`([^`\\n]+)`/g, '<code>$1</code>');
+  // [[wikilink|alias]] or [[wikilink]]
+  html = html.replace(/\\[\\[([^\\[\\]\\|#]+?)(?:#[^\\[\\]\\|]+)?(?:\\|([^\\[\\]]+))?\\]\\]/g, (m, name, alias) => {{
+    const display = alias || name;
+    const safe    = name.replace(/'/g, "\\\\'");
+    return `<a href="#" class="wikilink" onclick="event.preventDefault();resolveAndOpenWikilink('${{safe}}')">${{display}}</a>`;
+  }});
+  // Markdown links [text](url)
+  html = html.replace(/\\[([^\\[\\]]+?)\\]\\(([^()\\s]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // Bold + italic
+  html = html.replace(/\\*\\*([^*\\n]+?)\\*\\*/g, '<strong>$1</strong>');
+  html = html.replace(/(^|[^*])\\*([^*\\n]+?)\\*(?=[^*]|$)/g, '$1<em>$2</em>');
+  return html;
+}}
+
+function toggleBrowseEdit() {{
+  if (!_browseCurrentPath || _browseCurrentText == null) return;
+  _browseEditing = true;
+  _browseDirty   = false;
+  const bodyEl = document.getElementById('browse-main-body');
+  bodyEl.innerHTML = '<textarea class="browse-editor" id="browse-editor"></textarea>';
+  const ta = document.getElementById('browse-editor');
+  ta.value = _browseCurrentText;
+  ta.style.minHeight = '100%';
+  ta.addEventListener('input', () => {{ _browseDirty = true; }});
+  ta.focus();
+  document.getElementById('browse-edit-btn').style.display = 'none';
+  document.getElementById('browse-save-btn').style.display = '';
+  document.getElementById('browse-cancel-btn').style.display = '';
+}}
+
+function cancelBrowseEdit() {{
+  if (_browseDirty && !confirm('Discard changes?')) return;
+  _browseEditing = false;
+  _browseDirty   = false;
+  const bodyEl = document.getElementById('browse-main-body');
+  _renderMarkdown(bodyEl, _browseCurrentText);
+  document.getElementById('browse-edit-btn').style.display = '';
+  document.getElementById('browse-save-btn').style.display = 'none';
+  document.getElementById('browse-cancel-btn').style.display = 'none';
+}}
+
+async function saveBrowseFile() {{
+  if (!_browseCurrentPath) return;
+  const ta = document.getElementById('browse-editor');
+  if (!ta) return;
+  const content = ta.value;
+  const saveBtn = document.getElementById('browse-save-btn');
+  saveBtn.disabled = true;
+  saveBtn.textContent = 'Saving…';
+  try {{
+    const r = await fetch('/api/browse/save', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body:    JSON.stringify({{ path: _browseCurrentPath, content }}),
+    }});
+    const d = await r.json();
+    if (d.error) {{
+      _showToast('⚠ ' + d.error);
+    }} else {{
+      _browseCurrentText = content;
+      _browseEditing     = false;
+      _browseDirty       = false;
+      _renderMarkdown(document.getElementById('browse-main-body'), content);
+      document.getElementById('browse-edit-btn').style.display = '';
+      document.getElementById('browse-save-btn').style.display = 'none';
+      document.getElementById('browse-cancel-btn').style.display = 'none';
+      _showToast('✓ Saved (' + d.bytes + ' bytes)');
+      // Backlinks may have changed — refresh.
+      loadBrowseBacklinks(_browseCurrentPath);
+    }}
+  }} catch (e) {{
+    _showToast('⚠ ' + e.message);
+  }} finally {{
+    saveBtn.disabled = false;
+    saveBtn.textContent = 'Save';
+  }}
+}}
+
+function chatAboutCurrentFile() {{
+  if (!_browseCurrentPath) return;
+  const stem = _browseCurrentPath.split('/').pop().replace(/\\.md$/i, '');
+  startChatWithContext({{
+    question:    'Tell me about ' + stem + '.',
+    contextPaths: [_browseCurrentPath],
+  }});
+}}
+
+
 // ── Top of Mind tab ────────────────────────────────────────────────────────
 function loadTopOfMind() {{
   const panel = document.getElementById('panel-top-of-mind');
@@ -4814,7 +5449,7 @@ function closeHealthDetail(e) {{
 // Anchors keep their hrefs (so right-click → open in new tab still works)
 // but normal clicks toggle panels in place — chat state, in-flight stream,
 // rawDocs, pinned context all survive navigation between tabs.
-const TAB_PATHS = {{ chat: '/', 'top-of-mind': '/top-of-mind', health: '/health' }};
+const TAB_PATHS = {{ chat: '/', 'top-of-mind': '/top-of-mind', browse: '/browse', health: '/health' }};
 
 function switchTab(ev, name) {{
   if (ev) {{
@@ -4835,6 +5470,7 @@ function _applyTab(name) {{
   // Trigger per-tab data load (each handler self-skips when not active).
   if (name === 'health')      loadHealth();
   if (name === 'top-of-mind') loadTopOfMind();
+  if (name === 'browse')      loadBrowseTree();
 }}
 
 window.addEventListener('popstate', (e) => {{
@@ -4845,6 +5481,7 @@ window.addEventListener('popstate', (e) => {{
 function _tabFromPath(p) {{
   if (p === '/health')       return 'health';
   if (p === '/top-of-mind')  return 'top-of-mind';
+  if (p === '/browse')       return 'browse';
   return 'chat';
 }}
 
@@ -4856,6 +5493,7 @@ setInterval(loadTopOfMind,  60000);
 // Initial load for whichever tab is active at page-load time.
 loadHealth();
 loadTopOfMind();
+loadBrowseTree();
 
 // Drag-and-drop on the upload zone
 document.addEventListener('DOMContentLoaded', () => {{
