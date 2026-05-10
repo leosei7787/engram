@@ -1730,12 +1730,22 @@ def _walk_browse_tree(root: Path, *, max_depth: int = 8, _depth: int = 0) -> dic
 
 @app.route("/api/browse/tree")
 def browse_tree():
-    """Combined tree of wiki + memory. Cheap enough at small/medium repos;
-    if it ever gets sluggish we can move to lazy per-folder fetches."""
+    """Tree of curated wiki content — the entity records the user actually
+    browses and edits. Anchored at ``wiki_path/wiki`` (Obsidian vault root)
+    when present, falling back to ``wiki_path`` for installs that don't
+    nest. MEMORY/ is intentionally excluded: it holds inputs (emails,
+    sessions) and runtime state (signals, proposals, graph), not human-
+    facing knowledge. Sibling folders (raw/, inbox/, converted/, notes/,
+    templates/, config/) are skipped because they're ingestion scaffolding,
+    not curated content. Save/backlinks endpoints still resolve memory and
+    scaffolding paths when something else (graph hop, link click) leads
+    there."""
     cfg = get_cfg()
+    wiki_root = cfg.wiki_path / "wiki"
+    if not wiki_root.exists():
+        wiki_root = cfg.wiki_path
     return jsonify({
-        "wiki":   _walk_browse_tree(cfg.wiki_path),
-        "memory": _walk_browse_tree(cfg.memory_path),
+        "wiki": _walk_browse_tree(wiki_root),
     })
 
 
@@ -4817,9 +4827,6 @@ function renderBrowseTree() {{
   const html = [];
   if (_browseTreeData.wiki && (_browseTreeData.wiki.children || []).length) {{
     html.push(_renderBrowseNode(_browseTreeData.wiki, 0, 'wiki'));
-  }}
-  if (_browseTreeData.memory && (_browseTreeData.memory.children || []).length) {{
-    html.push(_renderBrowseNode(_browseTreeData.memory, 0, 'memory'));
   }}
   body.innerHTML = html.join('') || '<div class="browse-empty">No files found.</div>';
 }}
