@@ -3139,6 +3139,16 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .tom-tag  {{ font-size: 9.5px; font-weight: 600; padding: 1px 7px;
              border-radius: 8px; background: rgba(66,133,244,.10);
              color: #4285F4; text-transform: lowercase; letter-spacing: 0.2px; }}
+
+/* "💬 chat about this" button on Top of Mind tiles. Hover-reveals on the
+   parent .tom-item so the list stays clean at rest. */
+.tom-chat-btn {{ display: inline-flex; align-items: center; gap: 4px;
+                 margin-top: 6px; padding: 3px 10px; border-radius: 12px;
+                 border: 1px solid #e0e0e0; background: #fff;
+                 font-size: 10.5px; color: #777; cursor: pointer;
+                 opacity: 0; transition: opacity .15s, color .15s, border-color .15s; }}
+.tom-item:hover .tom-chat-btn {{ opacity: 1; }}
+.tom-chat-btn:hover {{ color: #D97757; border-color: #D97757; background: #fff8f5; }}
 </style>
 </head>
 <body>
@@ -3312,15 +3322,17 @@ let rawDocs       = [];      // [{{name, content}}, ...] injected by user
 // One stable id per browser tab. Sent with every /api/chat request so the
 // server can append turns to MEMORY/sessions/<YYYY-MM>/chat_<id>.md, making
 // past conversations retrievable by future sessions via the curator's scan.
-// `let` (not const) so restoring a pinned conversation can swap it.
-let SESSION_ID = (function() {{
+// `let` (not const) so restoring a pinned conversation can swap it, and so
+// "Chat about this" actions on Top of Mind can mint a fresh session.
+function _newSessionId() {{
   try {{
     return (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
       : 'sess_' + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
   }} catch (e) {{
     return 'sess_' + Date.now();
   }}
-}})();
+}}
+let SESSION_ID = _newSessionId();
 
 // Tracks how many (user, assistant) pairs have been completed in this
 // session — used as the turn_index when pinning an answer.
@@ -3719,6 +3731,73 @@ function addPinButton(msgEl, turnIndex) {{
   }};
   msgEl.appendChild(btn);
   return btn;
+}}
+
+// Open the chat tab as a fresh session, pre-filled with a question and
+// (optionally) some files pinned in the curator's view. Used by the "💬"
+// buttons on Top of Mind tiles. Doesn't auto-send — user can edit the
+// question first.
+function startChatWithContext(opts) {{
+  const question     = (opts && opts.question)     || '';
+  const contextPaths = (opts && opts.contextPaths) || [];
+
+  // Switch tab in-place (preserves URL via pushState).
+  switchTab(null, 'chat');
+
+  // Fresh session — new SESSION_ID, blank message log, sidebar context
+  // populated only with whatever the caller pinned.
+  SESSION_ID    = _newSessionId();
+  messages      = [];
+  rawDocs       = [];
+  activeContext = [];
+  pinnedPaths   = new Set(contextPaths);
+  TURN_INDEX    = 0;
+  pendingFollowup = null;
+
+  const msgsEl = document.getElementById('messages');
+  if (msgsEl) msgsEl.innerHTML = '';
+  document.getElementById('empty-state')?.remove();
+
+  // Render pinned paths in the sidebar so the user sees what's loaded.
+  const list = document.getElementById('ctx-list');
+  if (list) list.innerHTML = '';
+  contextPaths.forEach(p => {{
+    activeContext.push({{path: p, type: 'memory'}});
+    const el = makeCtxItem(p, 'memory');
+    el.dataset.path = p;
+    if (list) list.appendChild(el);
+  }});
+  const countEl  = document.getElementById('ctx-count');
+  const reasonEl = document.getElementById('ctx-reasoning');
+  if (countEl) {{
+    countEl.textContent = contextPaths.length
+      ? `${{contextPaths.length}} pinned for this question`
+      : 'Scanning memory…';
+  }}
+  if (reasonEl) reasonEl.textContent = '';
+
+  // Pre-fill the input + focus. Auto-resize the textarea like sendMessage does.
+  const inputEl = document.getElementById('input');
+  if (inputEl) {{
+    inputEl.value = question;
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + 'px';
+    inputEl.focus();
+    // Move cursor to end so user can append / edit naturally
+    try {{ inputEl.setSelectionRange(question.length, question.length); }} catch (e) {{}}
+  }}
+}}
+
+// Delegated handler for the "💬 chat about this" buttons on Top of Mind
+// tiles. We avoid stuffing a JSON payload into onclick="" because user
+// content (apostrophes, quotes, em-dashes) can break attribute parsing.
+// Instead the relevant fields ride on data-chat-q and data-chat-paths.
+function startChatFromTile(btn) {{
+  if (!btn) return;
+  const question = btn.dataset.chatQ || '';
+  const pathsRaw = btn.dataset.chatPaths || '';
+  const paths    = pathsRaw ? pathsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+  startChatWithContext({{question, contextPaths: paths}});
 }}
 
 async function restorePinnedConversation(pinId) {{
@@ -4185,6 +4264,10 @@ function renderTopOfMind(data) {{
       ).join('');
       const loc = e.location ? `<div class="tom-item-aux">${{escHtml(e.location)}}</div>` : '';
       const org = e.organizer ? `<span style="color:#aaa;font-size:11px"> · ${{escHtml(e.organizer)}}</span>` : '';
+      // "💬 chat" → opens chat tab with a pre-prep question for this meeting.
+      // No paths pinned — the calendar agenda is already injected into the
+      // system prompt for any chat turn, so the model has full event context.
+      const eventQuestion = `Help me prep for "${{e.summary}}" on ${{e.date}} at ${{e.time}}. What should I know going in, and what is at stake?`;
       return header + `
         <div class="tom-item">
           <div class="tom-item-row">
@@ -4193,6 +4276,7 @@ function renderTopOfMind(data) {{
           </div>
           ${{tags ? `<div class="tom-tags">${{tags}}</div>` : ''}}
           ${{loc}}
+          <button class="tom-chat-btn" data-chat-q="${{escHtml(eventQuestion)}}" onclick="startChatFromTile(this)">💬 chat about this</button>
         </div>`;
     }}).join('') + '</div>';
   }}
@@ -4235,9 +4319,13 @@ function renderTopOfMind(data) {{
       const urgColor = urg === 'high' ? '#c06040' : urg === 'low' ? '#888' : '#4285F4';
       const dateStr = d.deadline || '—';
       const conf = d.confidence ? ` · ${{Math.round(d.confidence*100)}}%` : '';
+      // "💬 chat" → fresh chat with the source email pinned in context.
+      const srcRel = d.source_rel || '';
+      const dlQuestion = `What is the action and context for: "${{d.subject}}"? Deadline ${{dateStr}}.`;
+      const previewPath = escHtml(srcRel).replace(/'/g, "\\\\'");
       return `
-        <div class="tom-item" onclick="openFilePreview('${{escHtml(d.source_rel).replace(/'/g, "\\\\'")}}')" style="cursor:pointer">
-          <div class="tom-item-main">
+        <div class="tom-item">
+          <div class="tom-item-main" onclick="openFilePreview('${{previewPath}}')" style="cursor:pointer">
             <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:3px">
               <span style="font-weight:700;font-size:12px;color:${{urgColor}}">${{escHtml(dateStr)}}</span>
               <span style="font-size:9.5px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;padding:1px 6px;border-radius:8px;background:rgba(0,0,0,.05);color:${{urgColor}}">${{escHtml(urg)}}</span>
@@ -4245,6 +4333,10 @@ function renderTopOfMind(data) {{
             <div style="font-weight:600;font-size:12px">${{escHtml(d.action)}}</div>
             <div class="tom-item-aux" style="margin-top:3px">${{escHtml(d.subject)}}${{conf}}</div>
           </div>
+          <button class="tom-chat-btn"
+                  data-chat-q="${{escHtml(dlQuestion)}}"
+                  data-chat-paths="${{escHtml(srcRel)}}"
+                  onclick="startChatFromTile(this)">💬 chat about this</button>
         </div>`;
     }}).join('') + '</div>';
   }}
