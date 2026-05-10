@@ -3105,6 +3105,8 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .export-btn:hover {{ border-color: #D97757; color: #D97757; background: #fff8f5; }}
 .export-btn.loading {{ opacity: .5; pointer-events: none; }}
 .export-btn.done {{ border-color: #34A853; color: #34A853; }}
+.export-btn.copy-btn {{ font-weight: 600; }}
+.export-btn.copy-btn:hover {{ border-color: #4285F4; color: #4285F4; background: #f0f7ff; }}
 
 /* Pin button — appears below assistant bubbles, lets user pin to Top of Mind */
 .pin-btn {{ display: inline-flex; align-items: center; gap: 4px; margin-top: 8px;
@@ -4288,6 +4290,17 @@ function addExportBar(msgEl, content) {{
   const bar = document.createElement('div');
   bar.className = 'export-bar';
 
+  // Copy with formatting button — front-of-bar so it's the obvious one-click
+  // path. Writes both text/html and text/plain to the clipboard so paste
+  // into Gmail / Word / Docs renders bold + lists, while paste into a
+  // plain-text editor falls back to the raw markdown.
+  const copyBtn = document.createElement('button');
+  copyBtn.className   = 'export-btn copy-btn';
+  copyBtn.textContent = '📋 Copy';
+  copyBtn.title       = 'Copy with formatting (paste into email / doc preserves bold, lists, etc.)';
+  copyBtn.addEventListener('click', () => copyRichResponse(content, copyBtn));
+  bar.appendChild(copyBtn);
+
   const label = document.createElement('span');
   label.className   = 'export-label';
   label.textContent = 'Export as';
@@ -4309,6 +4322,44 @@ function addExportBar(msgEl, content) {{
   }});
 
   msgEl.appendChild(bar);
+}}
+
+async function copyRichResponse(content, btn) {{
+  if (!content) return;
+  const original = btn ? btn.textContent : null;
+  try {{
+    const html  = _mdToHtml(content, {{plain: true}});
+    // Wrap in a body so paste targets like Word treat it as a complete
+    // fragment. Inline minimal style; Gmail / Docs pick up tag defaults.
+    const wrapped = `<div style="font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.55">${{html}}</div>`;
+    if (navigator.clipboard && window.ClipboardItem) {{
+      const item = new ClipboardItem({{
+        'text/html':  new Blob([wrapped], {{type: 'text/html'}}),
+        'text/plain': new Blob([content], {{type: 'text/plain'}}),
+      }});
+      await navigator.clipboard.write([item]);
+    }} else if (navigator.clipboard && navigator.clipboard.writeText) {{
+      // Older browsers — plain text only
+      await navigator.clipboard.writeText(content);
+    }} else {{
+      throw new Error('Clipboard API unavailable');
+    }}
+    if (btn) {{
+      btn.textContent = '✓ Copied';
+      btn.classList.add('done');
+      setTimeout(() => {{
+        btn.textContent = original;
+        btn.classList.remove('done');
+      }}, 1800);
+    }}
+  }} catch (err) {{
+    if (btn) {{
+      // Keep the label compact — full error goes to console.
+      console.warn('[copy] clipboard write failed:', err);
+      btn.textContent = '⚠ Copy failed';
+      setTimeout(() => {{ btn.textContent = original; }}, 2400);
+    }}
+  }}
 }}
 
 async function exportAs(fmt, content, filename, btn) {{
@@ -4775,8 +4826,18 @@ async function resolveAndOpenWikilink(name) {{
 // Minimal markdown renderer — covers the cases we actually have in
 // engram-data: headings, paragraphs, lists, fenced code, inline code,
 // bold, italic, links, [[wikilinks]], blockquotes, hr.
-function _renderMarkdown(el, src) {{
-  if (!src) {{ el.innerHTML = '<div class="browse-empty">(empty file)</div>'; return; }}
+//
+// _mdToHtml(src, opts?) returns just the body HTML (no wrapper) so callers
+// can inline it into emails / clipboard / textareas. _renderMarkdown(el,
+// src) is the existing wrapper that paints into a DOM element with the
+// browse-md class for the Browse tab's styling.
+
+function _mdToHtml(src, opts) {{
+  opts = opts || {{}};
+  // When `plain` is true, [[wikilinks]] become plain text (no clickable
+  // anchors) — useful for clipboard payloads where the JS-href onclick
+  // would be meaningless in the destination app.
+  if (!src) return '';
   const lines = src.split(/\\r?\\n/);
   const out = [];
   let i = 0;
@@ -4795,14 +4856,14 @@ function _renderMarkdown(el, src) {{
     }}
     // Headings
     let m = line.match(/^(#{{1,6}})\\s+(.*)$/);
-    if (m) {{ const lvl = m[1].length; out.push(`<h${{lvl}}>${{_inlineMd(m[2])}}</h${{lvl}}>`); i++; continue; }}
+    if (m) {{ const lvl = m[1].length; out.push(`<h${{lvl}}>${{_inlineMd(m[2], opts)}}</h${{lvl}}>`); i++; continue; }}
     // Horizontal rule
     if (/^---+\\s*$/.test(line)) {{ out.push('<hr/>'); i++; continue; }}
     // Blockquote
     if (/^>\\s?/.test(line)) {{
       const buf = [];
       while (i < lines.length && /^>\\s?/.test(lines[i])) {{ buf.push(lines[i].replace(/^>\\s?/, '')); i++; }}
-      out.push('<blockquote>' + _inlineMd(buf.join('\\n')) + '</blockquote>');
+      out.push('<blockquote>' + _inlineMd(buf.join('\\n'), opts) + '</blockquote>');
       continue;
     }}
     // Lists
@@ -4811,7 +4872,7 @@ function _renderMarkdown(el, src) {{
       const tag = ordered ? 'ol' : 'ul';
       const items = [];
       while (i < lines.length && (/^[\\-*+]\\s+/.test(lines[i]) || /^\\d+\\.\\s+/.test(lines[i]))) {{
-        items.push('<li>' + _inlineMd(lines[i].replace(/^([\\-*+]|\\d+\\.)\\s+/, '')) + '</li>');
+        items.push('<li>' + _inlineMd(lines[i].replace(/^([\\-*+]|\\d+\\.)\\s+/, ''), opts) + '</li>');
         i++;
       }}
       out.push('<' + tag + '>' + items.join('') + '</' + tag + '>');
@@ -4827,12 +4888,18 @@ function _renderMarkdown(el, src) {{
       paraBuf.push(lines[i]);
       i++;
     }}
-    if (paraBuf.length) {{ out.push('<p>' + _inlineMd(paraBuf.join(' ')) + '</p>'); }}
+    if (paraBuf.length) {{ out.push('<p>' + _inlineMd(paraBuf.join(' '), opts) + '</p>'); }}
   }}
-  el.innerHTML = '<div class="browse-md">' + out.join('') + '</div>';
+  return out.join('');
 }}
 
-function _inlineMd(s) {{
+function _renderMarkdown(el, src) {{
+  if (!src) {{ el.innerHTML = '<div class="browse-empty">(empty file)</div>'; return; }}
+  el.innerHTML = '<div class="browse-md">' + _mdToHtml(src) + '</div>';
+}}
+
+function _inlineMd(s, opts) {{
+  opts = opts || {{}};
   if (!s) return '';
   let html = escHtml(s);
   // Inline code (do first so it isn't affected by other replacements)
@@ -4840,6 +4907,11 @@ function _inlineMd(s) {{
   // [[wikilink|alias]] or [[wikilink]]
   html = html.replace(/\\[\\[([^\\[\\]\\|#]+?)(?:#[^\\[\\]\\|]+)?(?:\\|([^\\[\\]]+))?\\]\\]/g, (m, name, alias) => {{
     const display = alias || name;
+    if (opts.plain) {{
+      // Clipboard / external destinations: drop the in-app onclick handler
+      // and just emit the display text (paste targets can't follow it anyway).
+      return display;
+    }}
     const safe    = name.replace(/'/g, "\\\\'");
     return `<a href="#" class="wikilink" onclick="event.preventDefault();resolveAndOpenWikilink('${{safe}}')">${{display}}</a>`;
   }});
