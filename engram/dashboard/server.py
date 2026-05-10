@@ -2710,82 +2710,16 @@ def recent_activity():
 # meetings, decisions awaiting save, and deadlines extracted from recent
 # emails. Filtered, not exhaustive — the calendar tab is for everything.
 
-# Words that suggest an event is decision-grade or executive.
-# Matched as whole words (\b…\b) — so "coo" won't fire on "Watercooler".
-_EXEC_KEYWORD_WEIGHTS: dict = {
-    # Decisions & approvals
-    "qbr": 1.6, "go/no-go": 1.6, "go-no-go": 1.6, "approval": 1.2, "approve": 1.0,
-    "decision": 1.2, "sign-off": 1.2, "milestone": 0.9,
-    # Forums
-    "board":     1.5, "steering":  1.4, "committee": 1.0, "council":   1.0,
-    "executive": 1.1, "exec":      0.9, "leadership":1.0, "c-level":   1.4,
-    # Senior individuals
-    "ceo":       1.3, "cfo": 1.2, "cto": 1.2, "cmo": 1.2, "coo": 1.2,
-    "svp":       1.0, "evp": 1.0, "vp": 0.7,
-    # High-stakes commercial
-    "negotiation":   1.0, "contract": 0.9, "rfp": 1.1, "rfq": 0.9, "tender": 0.9,
-    "kickoff":  0.7, "go-live": 1.0, "launch":  0.7,
-    # Strategy / planning
-    "roadmap": 0.7, "okr": 0.7,
-}
-_EXEC_KEYWORD_RX = {
-    kw: re.compile(r"(?<!\w)" + re.escape(kw) + r"(?!\w)", re.IGNORECASE)
-    for kw in _EXEC_KEYWORD_WEIGHTS
-}
-
-# Words that demote an event regardless of other signals.
-_PERSONAL_SKIP_RX = re.compile(
-    r"\b(kids|drop[- ]off|pickup|pick up|school|dentist|doctor|"
-    r"vacation|holiday|ooo|out of office|dns|do not schedule|"
-    r"focus time|lunch|gym|workout|haircut|commute)\b",
-    re.IGNORECASE,
-)
-
-# 1:1s — bilateral meetings; can be high-stakes but usually aren't.
-_ONE_ON_ONE_RX = re.compile(r"\b(1[:\-]?1|one[- ]on[- ]one)\b", re.IGNORECASE)
-
-
-def _classify_event(e) -> tuple[float, list[str]]:
-    """Return (score, tags) for an event. Score >= 0; tags explain the why."""
-    text = " ".join(filter(None, [e.summary or "", e.location or "", e.organizer or ""])).lower()
-
-    if _PERSONAL_SKIP_RX.search(text):
-        return (0.0, ["personal"])
-
-    score = 0.0
-    tags: list[str] = []
-    for kw, w in _EXEC_KEYWORD_WEIGHTS.items():
-        if _EXEC_KEYWORD_RX[kw].search(text):
-            score += w
-            tags.append(kw)
-
-    # Structural signals
-    try:
-        duration_min = (e.end - e.start).total_seconds() / 60
-    except Exception:
-        duration_min = 60
-    if duration_min >= 90 and not e.all_day:
-        score += 0.4
-        tags.append("long")
-    if e.all_day:
-        score += 0.5
-        tags.append("all-day")
-    if e.location and "MegaCorp Teams" not in e.location and "Skype" not in e.location:
-        score += 0.3
-        tags.append("in-person")
-
-    # 1:1 demotion (only if no exec keyword fired)
-    if _ONE_ON_ONE_RX.search(text) and score < 1.0:
-        score *= 0.4
-        tags.append("1:1")
-
-    return (round(score, 2), tags[:5])
-
-
-# Deadline extraction now lives in engram/memory/signal_extractor.py — an
-# AI-driven pass that resolves relative dates, filters past + already-replied
-# threads, and persists to MEMORY/signals/deadlines.json. The dashboard reads
-# the JSON; trigger refresh via /api/signals/refresh or scripts/extract-deadlines.py.
+# Calendar event classification now lives in
+# engram/memory/calendar_extractor.py — an AI-driven pass that scores each
+# event with Haiku, resolves attendees + account refs, detects recurrence,
+# and persists to MEMORY/signals/calendar.json. The dashboard reads JSON;
+# trigger refresh via /api/calendar/refresh or wait for the watcher's
+# 60s ICS-mtime check (server.py main loop).
+#
+# Deadline extraction lives in engram/memory/signal_extractor.py — same
+# pattern, persisted to MEMORY/signals/deadlines.json. Refresh via
+# /api/signals/refresh or scripts/extract-deadlines.py.
 
 
 @app.route("/api/top-of-mind")
@@ -2794,61 +2728,41 @@ def top_of_mind():
     mem = cfg.memory_path
     days_ahead = int(request.args.get("days", 14))
 
-    # 1) Curated calendar events — only executive-grade
+    # 1) Curated calendar events — read from the AI-extracted signal store.
+    # Source of truth: MEMORY/signals/calendar.json, refreshed by the
+    # calendar_extractor module (Haiku-driven, runs in background when ICS
+    # mtime changes). Top of Mind never re-scores or re-parses on the
+    # request path; just reads JSON and renders.
     events_out: list = []
-    ics_search_dirs: list[Path] = []
+    cal_extracted_at = None
+    cal_age_s = None
     try:
-        inbox = getattr(cfg.paths, "inbox_src", None) if hasattr(cfg, "paths") else None
-        if inbox and Path(inbox).exists():
-            ics_search_dirs.append(Path(inbox))
-    except Exception:
-        pass
-    ics_search_dirs.append(mem)
-
-    ics_hits: list[Path] = []
-    for d in ics_search_dirs:
-        try:
-            # Skip files under _processed/ — those are archived after watcher
-            # ingest and would otherwise shadow the live calendar if their
-            # mtime got touched.
-            ics_hits.extend(p for p in d.rglob("*.ics") if "_processed" not in p.parts)
-        except Exception:
-            continue
-
-    if ics_hits:
-        try:
-            ics_file = max(ics_hits, key=lambda f: f.stat().st_mtime)
-            evs = parse_ics(ics_file)
-            scored: list = []
-            for e in ics_upcoming(evs, days_ahead=days_ahead):
-                score, tags = _classify_event(e)
-                if score < 0.6:
+        from engram.memory.calendar_extractor import (
+            load_signals as _load_cal,
+            signals_age_seconds as _cal_age,
+        )
+        cal = _load_cal(mem)
+        if cal:
+            cal_extracted_at = cal.get("extracted_at")
+            cal_age_s        = _cal_age(mem)
+            # Surface only items that fall inside the user's window AND are
+            # high-stakes — the full event list is too noisy for Top of Mind.
+            today_iso = datetime.now().strftime("%Y-%m-%d")
+            window_end = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+            for ev in (cal.get("events") or []):
+                if ev.get("is_cancelled"):
                     continue
-                scored.append((score, tags, e))
-            # Sort: by date asc within score-tier; cap at 12.
-            scored.sort(key=lambda x: x[2].start)
-            scored.sort(key=lambda x: x[0], reverse=True)
-            for score, tags, e in scored[:12]:
-                local = e.start.astimezone()
-                local_end = e.end.astimezone()
-                if e.all_day:
-                    tline = "all-day"
-                else:
-                    tline = local.strftime("%H:%M") + "–" + local_end.strftime("%H:%M")
-                events_out.append({
-                    "date":      local.strftime("%a %d %b"),
-                    "iso":       local.strftime("%Y-%m-%d"),
-                    "time":      tline,
-                    "summary":   (e.summary or "")[:140],
-                    "location":  "" if (e.location and ("MegaCorp Teams" in e.location or "Skype" in e.location)) else (e.location or "")[:60],
-                    "organizer": (e.organizer.split("@")[0] if e.organizer and "@" in e.organizer else ""),
-                    "score":     score,
-                    "tags":      tags,
-                })
-            # Re-sort for display by date asc so the timeline reads naturally.
-            events_out.sort(key=lambda x: x["iso"])
-        except Exception:
-            pass
+                if not ev.get("is_high_stakes"):
+                    continue
+                iso = ev.get("iso") or ""
+                if iso and (iso < today_iso or iso > window_end):
+                    continue
+                events_out.append(ev)
+            # Already sorted by extractor; re-sort by date for display.
+            events_out.sort(key=lambda x: x.get("iso") or "")
+            events_out = events_out[:12]
+    except Exception as e:
+        print(f"[top-of-mind] calendar load error: {e}", flush=True)
 
     # 2) Pinned chat answers — user pinned them while chatting; clicking
     # restores the conversation with full context so they can keep going.
@@ -2893,6 +2807,10 @@ def top_of_mind():
         "events":    events_out,
         "pinned":    pinned_out,
         "deadlines": deadlines_out,
+        "events_meta": {
+            "extracted_at": cal_extracted_at,
+            "age_seconds":  cal_age_s,
+        },
         "deadlines_meta": {
             "extracted_at": extracted_at,
             "age_seconds":  extracted_age_s,
@@ -2904,6 +2822,79 @@ def top_of_mind():
         },
         "days_ahead": days_ahead,
     })
+
+
+# ─── Calendar refresh endpoint + debounced watcher hook ───────────────────────
+_calendar_debounce_lock  = threading.Lock()
+_calendar_debounce_timer: threading.Timer | None = None
+_calendar_last_ics_mtime = {"value": 0.0}
+
+
+def _run_calendar_refresh(cfg) -> None:
+    """Synchronous calendar extraction → save. Used by the manual endpoint
+    and the debouncer. Single-flight enforced inside refresh_in_background."""
+    try:
+        from engram.memory.calendar_extractor import find_latest_ics, extract_calendar_signals, save_signals
+        inbox = getattr(getattr(cfg, "paths", None), "inbox_src", None)
+        ics = find_latest_ics(inbox_src=Path(inbox) if inbox else None, memory_path=cfg.memory_path)
+        if not ics:
+            print("[calendar] refresh skipped — no ICS found", flush=True)
+            return
+        sigs = extract_calendar_signals(
+            ics_path  = ics,
+            user_name = cfg.identity.user_name or "",
+            cfg       = cfg,
+        )
+        save_signals(sigs, cfg.memory_path)
+        print(f"[calendar] refresh done: {sigs['scanned']} scanned · "
+              f"{sigs['high_stakes']} high-stakes · "
+              f"filtered {sigs['skipped']}", flush=True)
+    except Exception:
+        print("[calendar] refresh error:\n" + traceback.format_exc(), flush=True)
+
+
+def _schedule_calendar_refresh(cfg, *, delay_s: int = 30) -> None:
+    """Reschedule a debounced background refresh. Multiple ICS updates within
+    ``delay_s`` collapse to a single Haiku run."""
+    global _calendar_debounce_timer
+    with _calendar_debounce_lock:
+        if _calendar_debounce_timer is not None:
+            try: _calendar_debounce_timer.cancel()
+            except Exception: pass
+        t = threading.Timer(delay_s, _run_calendar_refresh, args=(cfg,))
+        t.daemon = True
+        t.name   = "engram-calendar-debounced"
+        _calendar_debounce_timer = t
+        t.start()
+
+
+def _check_ics_changed_and_schedule(cfg) -> None:
+    """Called from the watcher cycle. If the latest ICS file's mtime has
+    advanced since the last calendar extraction, schedule a refresh."""
+    try:
+        from engram.memory.calendar_extractor import find_latest_ics
+        inbox = getattr(getattr(cfg, "paths", None), "inbox_src", None)
+        ics = find_latest_ics(inbox_src=Path(inbox) if inbox else None, memory_path=cfg.memory_path)
+        if not ics:
+            return
+        mt = ics.stat().st_mtime
+        if mt > _calendar_last_ics_mtime["value"]:
+            _calendar_last_ics_mtime["value"] = mt
+            _schedule_calendar_refresh(cfg)
+    except Exception:
+        pass
+
+
+@app.route("/api/calendar/refresh", methods=["POST"])
+def calendar_refresh():
+    """Force a calendar-signal extraction pass. Returns immediately; pass
+    runs in a background thread."""
+    cfg = get_cfg()
+    threading.Thread(
+        target=_run_calendar_refresh, args=(cfg,),
+        daemon=True, name="engram-calendar-manual",
+    ).start()
+    return jsonify({"status": "started"})
 
 
 # ─── Signal refresh endpoint (manual or button-triggered) ─────────────────────
@@ -5096,10 +5087,21 @@ function renderTopOfMind(data) {{
   const pinned    = data.pinned    || [];
   const deadlines = data.deadlines || [];
 
-  // High-stakes events grouped by day, tagged with why-they-surface
+  // High-stakes events grouped by day. Source: AI-extracted signal at
+  // MEMORY/signals/calendar.json (no keyword scoring at request time).
+  const evMeta   = data.events_meta || {{}};
+  const evAgeMin = evMeta.age_seconds != null ? Math.round(evMeta.age_seconds / 60) : null;
+  let evMetaLine = '';
+  if (!evMeta.extracted_at) {{
+    evMetaLine = `<span style="color:#aaa">never extracted — <a href="#" onclick="refreshCalendar(event)" style="color:#4285F4;text-decoration:underline">run now →</a></span>`;
+  }} else {{
+    const ageStr = evAgeMin == null ? '?' : (evAgeMin < 60 ? `${{evAgeMin}}m ago` : `${{Math.round(evAgeMin/60)}}h ago`);
+    evMetaLine = `<span style="color:#aaa">extracted ${{ageStr}}</span> · <a href="#" onclick="refreshCalendar(event)" style="color:#4285F4;text-decoration:underline">refresh →</a>`;
+  }}
+
   let evHtml = '';
   if (events.length === 0) {{
-    evHtml = '<div class="tom-empty">Nothing executive-grade scheduled in the next ' + (data.days_ahead || 14) + ' days.</div>';
+    evHtml = '<div class="tom-empty">Nothing high-stakes scheduled in the next ' + (data.days_ahead || 14) + ' days.</div>';
   }} else {{
     let lastDay = '';
     evHtml = '<div class="tom-list">' + events.map(e => {{
@@ -5108,14 +5110,23 @@ function renderTopOfMind(data) {{
         header = `<div class="tom-day-header">${{escHtml(e.date)}}</div>`;
         lastDay = e.date;
       }}
-      const tags = (e.tags || []).slice(0,3).map(t =>
+      const why = (e.why || []).slice(0,3).map(t =>
         `<span class="tom-tag">${{escHtml(t)}}</span>`
       ).join('');
+      // Recurrence + kind chips
+      const chips = [];
+      if (e.kind && e.kind !== 'ad_hoc') {{
+        chips.push(`<span class="tom-tag" style="background:rgba(217,119,87,.10);color:#D97757">${{escHtml(e.kind)}}</span>`);
+      }}
+      if (e.is_recurring && e.recurrence) {{
+        chips.push(`<span class="tom-tag" style="background:rgba(52,168,83,.08);color:#34A853">↻ ${{escHtml(e.recurrence)}}</span>`);
+      }}
+      const chipsHtml = chips.length ? `<div class="tom-tags">${{chips.join('')}}</div>` : '';
       const loc = e.location ? `<div class="tom-item-aux">${{escHtml(e.location)}}</div>` : '';
       const org = e.organizer ? `<span style="color:#aaa;font-size:11px"> · ${{escHtml(e.organizer)}}</span>` : '';
-      // "💬 chat" → opens chat tab with a pre-prep question for this meeting.
-      // No paths pinned — the calendar agenda is already injected into the
-      // system prompt for any chat turn, so the model has full event context.
+      const action = e.action_required
+        ? `<div class="tom-item-aux" style="font-style:italic;margin-top:4px;color:#666">→ ${{escHtml(e.action_required)}}</div>`
+        : '';
       const eventQuestion = `Help me prep for "${{e.summary}}" on ${{e.date}} at ${{e.time}}. What should I know going in, and what is at stake?`;
       return header + `
         <div class="tom-item">
@@ -5123,7 +5134,9 @@ function renderTopOfMind(data) {{
             <div class="tom-item-meta">${{escHtml(e.time)}}</div>
             <div class="tom-item-main">${{escHtml(e.summary)}}${{org}}</div>
           </div>
-          ${{tags ? `<div class="tom-tags">${{tags}}</div>` : ''}}
+          ${{chipsHtml}}
+          ${{why ? `<div class="tom-tags">${{why}}</div>` : ''}}
+          ${{action}}
           ${{loc}}
           <button class="tom-chat-btn" data-chat-q="${{escHtml(eventQuestion)}}" onclick="startChatFromTile(this)">💬 chat about this</button>
         </div>`;
@@ -5195,8 +5208,8 @@ function renderTopOfMind(data) {{
       <div class="tom-col-stripe"></div>
       <div class="tom-col-num">Executive Calendar</div>
       <div class="tom-col-title">High-stakes events</div>
-      <div class="tom-col-sub">Decisions, reviews, exec forums · next ${{data.days_ahead || 14}} days</div>
-      <div class="tom-col-count">${{events.length}} surfaced</div>
+      <div class="tom-col-sub">AI-classified · attendees + accounts resolved · next ${{data.days_ahead || 14}} days</div>
+      <div class="tom-col-count">${{events.length}} surfaced · <span style="font-weight:400">${{evMetaLine}}</span></div>
       <div style="margin-top:14px">${{evHtml}}</div>
     </div>
     <div class="tom-col proposals">
@@ -5215,6 +5228,28 @@ function renderTopOfMind(data) {{
       <div class="tom-col-count">${{deadlines.length}} active · <span style="font-weight:400">${{metaLine}}</span></div>
       <div style="margin-top:14px">${{dHtml}}</div>
     </div>`;
+}}
+
+function refreshCalendar(ev) {{
+  if (ev) ev.preventDefault();
+  const tile = document.querySelector('.tom-col.events .tom-col-count');
+  if (tile) tile.innerHTML = tile.innerHTML.split(' · ')[0] + ' · <span style="color:#888">refreshing…</span>';
+  fetch('/api/calendar/refresh', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body:    JSON.stringify({{}}),
+  }}).then(r => r.json()).then(j => {{
+    if (j.status === 'started') {{
+      let tries = 0;
+      const poll = () => {{
+        if (++tries > 40) return;
+        loadTopOfMind();
+        const t = document.querySelector('.tom-col.events .tom-col-count');
+        if (t && t.innerHTML.includes('refreshing')) setTimeout(poll, 4000);
+      }};
+      setTimeout(poll, 5000);
+    }}
+  }}).catch(() => {{}});
 }}
 
 function refreshSignals(ev) {{
@@ -5762,5 +5797,18 @@ if __name__ == "__main__":
         ensure_tone_file(cfg.memory_path)
     except Exception as e:
         print(f"[tone] ensure_tone_file failed: {e}", flush=True)
+
+    # Calendar-watch thread: every 60s check whether the latest ICS file has
+    # changed; if yes, schedule a debounced background extraction. The
+    # debounced timer collapses bursts to a single Haiku run.
+    def _calendar_watch_loop():
+        while True:
+            try:
+                _check_ics_changed_and_schedule(cfg)
+            except Exception:
+                pass
+            time.sleep(60)
+    threading.Thread(target=_calendar_watch_loop, daemon=True, name="engram-calendar-watch").start()
+    print(f"[calendar] watch thread started — checks ICS mtime every 60s", flush=True)
 
     app.run(host="0.0.0.0", port=port, debug=False)
