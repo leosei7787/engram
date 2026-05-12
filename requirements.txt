@@ -8,6 +8,7 @@ networkx>=3.0
 python-louvain>=0.16
 flask>=3.0
 watchdog>=4.0          # folder watching (engram/ingest/watcher.py)
+pypdf>=4.0             # PDF text extraction (engram/ingest/watcher.py)
 
 # Export skills (DOCX / PPTX / PDF generation)
 python-docx>=1.1       # Word documents  (engram/export/converters.py)

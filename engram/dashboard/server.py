@@ -174,12 +174,16 @@ def _start_watcher(cfg: EngramConfig):
             return True  # placeholder
 
         cleaned_md: str = content
-        is_marketing  = False
-        skip_reason   = ""
-        original_size = len(content)
+        copy_original  = True   # copy source file as-is; set False when content is transformed
+        is_marketing   = False
+        skip_reason    = ""
+        original_size  = len(content)
+
+        ext = path.suffix.lower()
+        if ext == ".pdf":
+            copy_original = False   # source is binary; content is pypdf-extracted text
 
         # Apply cleaner for email-shaped formats
-        ext = path.suffix.lower()
         if ext in (".eml", ".html", ".htm", ".md") and "<html" in content.lower()[:8000] \
            or ext == ".eml" or "From:" in content[:2000]:
             res = cleaner.clean(content, filename=path.name)
@@ -199,19 +203,19 @@ def _start_watcher(cfg: EngramConfig):
                 return True
             if res.cleaned_chars > 50:
                 cleaned_md = res.to_markdown()
+                copy_original = False
 
         dest_dir = cfg.memory_path / "daily" / "emails"
         dest_dir.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^\w.\-]", "_", path.name)[:120]
-        # If we cleaned the content, save as .md (not the original .eml/.html)
-        if cleaned_md is not content:
-            safe_name = re.sub(r"\.(eml|html?|txt)$", ".md", safe_name, flags=re.IGNORECASE)
+        if not copy_original:
+            safe_name = re.sub(r"\.(eml|html?|txt|pdf)$", ".md", safe_name, flags=re.IGNORECASE)
             if not safe_name.endswith(".md"):
                 safe_name += ".md"
         dest = dest_dir / safe_name
 
         try:
-            if cleaned_md is content:
+            if copy_original:
                 import shutil as _shutil
                 _shutil.copy2(str(path), str(dest))
             else:
@@ -274,7 +278,7 @@ def _start_watcher(cfg: EngramConfig):
         claude_bin       = str(cfg.paths.claude_bin) if cfg.paths.claude_bin else None,
         model            = cfg.models.haiku,
         interval_seconds = 60,
-        extensions       = {".md", ".txt", ".eml", ".vtt", ".html"},
+        extensions       = {".md", ".txt", ".eml", ".vtt", ".html", ".pdf"},
         on_new_file      = _ingest,
     )
 
@@ -1004,11 +1008,12 @@ def chat():
         else:
             api_key = os.environ.get("ANTHROPIC_API_KEY", "")
             if not api_key:
-                yield (
-                    f"data: {json.dumps({'token': '⚠ No ANTHROPIC_API_KEY set. '
+                _no_key_msg = json.dumps({'token': (
+                    '⚠ No ANTHROPIC_API_KEY set. '
                     'Either set the env var, or switch to the CLI backend: '
-                    'add  chat:\\n  backend: cli  to ~/.engram/config.yaml'})}\n\n"
-                )
+                    'add  chat:\\n  backend: cli  to ~/.engram/config.yaml'
+                )})
+                yield f"data: {_no_key_msg}\n\n"
                 yield "data: [DONE]\n\n"
                 _end_chat()
                 return

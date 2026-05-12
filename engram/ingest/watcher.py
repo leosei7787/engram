@@ -26,7 +26,7 @@ Configuration via engram_config.yaml:
       enabled:          true
       inbox_path:       /path/to/inbox        # overrides paths.inbox_src
       interval_seconds: 60
-      extensions:       [.md, .txt, .eml, .vtt]
+      extensions:       [.md, .txt, .eml, .vtt, .pdf]
       model:            claude-haiku-4-5
       on_new_file:      compile               # compile | wiki | both
       redaction:
@@ -102,7 +102,7 @@ class InboxWatcher:
     on the same inbox directory.
     """
 
-    SUPPORTED_EXTENSIONS = {".md", ".txt", ".eml", ".vtt"}
+    SUPPORTED_EXTENSIONS = {".md", ".txt", ".eml", ".vtt", ".pdf"}
 
     def __init__(
         self,
@@ -177,6 +177,24 @@ class InboxWatcher:
             self._log(f"  ✗ error ingesting {path.name}: {e}")
             return False
 
+    # ── File reading ──────────────────────────────────────────────────────────
+
+    def _read_file(self, path: Path) -> str:
+        """Return the text content of a file. PDFs are extracted via pypdf."""
+        if path.suffix.lower() != ".pdf":
+            return path.read_text(errors="ignore")
+        try:
+            import pypdf  # lazy import — only needed for PDFs
+            reader = pypdf.PdfReader(str(path))
+            pages = [page.extract_text() or "" for page in reader.pages]
+            text = "\n\n".join(pages).strip()
+            if not text:
+                self._log(f"  ⚠ no text extracted from PDF (scanned image?): {path.name}")
+            return text
+        except Exception as e:
+            self._log(f"  ⚠ PDF read error for {path.name}: {e}")
+            return ""
+
     # ── Scan ─────────────────────────────────────────────────────────────────
 
     def _scan_once(self) -> int:
@@ -205,7 +223,7 @@ class InboxWatcher:
                 pass
 
             try:
-                content = p.read_text(errors="ignore")
+                content = self._read_file(p)
             except Exception:
                 continue
 
@@ -328,7 +346,7 @@ def watcher_from_config(cfg) -> Optional[InboxWatcher]:
         claude_bin       = getattr(cfg.paths if hasattr(cfg, "paths") else cfg, "claude_bin", None),
         model            = getattr(ingest_cfg, "model", "claude-haiku-4-5"),
         interval_seconds = getattr(ingest_cfg, "interval_seconds", 60),
-        extensions       = set(getattr(ingest_cfg, "extensions", [".md", ".txt", ".eml", ".vtt"])),
+        extensions       = set(getattr(ingest_cfg, "extensions", [".md", ".txt", ".eml", ".vtt", ".pdf"])),
         redactor         = redactor,
         log_path         = cfg.memory_path / "logs" / "watcher.log" if hasattr(cfg, "memory_path") else None,
     )
