@@ -947,8 +947,13 @@ def chat():
             "  - 20 files selected by relevance score for this query\n"
             "  - Active graph entities and recent decisions\n"
             "\n"
-            "Do NOT use REQUEST_CONTEXT for: calendar/agenda questions, general status, "
-            "org structure questions, or anything answerable from the loaded files.\n"
+            "Do NOT use REQUEST_CONTEXT for:\n"
+            "  - calendar / agenda / 'what's on this week' questions\n"
+            "  - general status, org structure, recurring-meeting questions\n"
+            "  - 'latest / today / recent / this morning' emails, slack, or messages — "
+            "answer with whatever's loaded and explicitly say what date range you see; "
+            "if today isn't there yet, say that plainly\n"
+            "  - anything answerable from the loaded files\n"
             "\n"
             "ONLY output REQUEST_CONTEXT when the answer requires a specific concrete fact "
             "(a number, a quote, a date) that is clearly missing from everything loaded. "
@@ -1033,22 +1038,32 @@ def chat():
         # ── Phase 5b: Handle REQUEST_CONTEXT sentinel ────────────────────────
         # If model said REQUEST_CONTEXT: <query>, re-run retrieval on that
         # focused query and inject the new files, then stream a fresh response.
-        rc_match = re.search(r"REQUEST_CONTEXT:\s*(.+)", assistant_text)
+        # The retry is one-shot — if the second response also emits the
+        # sentinel (or finds no new files), we surface a graceful fallback
+        # instead of letting raw "REQUEST_CONTEXT: …" text leak into the UI.
+        _RC_RE = re.compile(r"\s*REQUEST_CONTEXT:\s*(.+?)\s*$", re.MULTILINE)
+        rc_match = _RC_RE.search(assistant_text)
         if rc_match and not getattr(generate, "_in_context_retry", False):
             focused_q = rc_match.group(1).strip()
             print(f"[chat] REQUEST_CONTEXT: {focused_q!r}", flush=True)
             # Tell client to clear the RC text and show a search pill instead
             yield f"data: {json.dumps({'clear_response': True})}\n\n"
             yield f"data: {json.dumps({'request_context': {'query': focused_q[:120]}})}\n\n"
+
+            retry_succeeded = False
             try:
                 extra_scan = memory_scan(focused_q, cfg, max_files=8)
                 extra_cands = build_candidates(extra_scan, cfg, snippet_chars=200)
                 extra_sel, extra_reason = curate_context(
                     focused_q, extra_cands, cfg, max_files=5
                 )
-                if extra_sel:
+
+                already_loaded = {c["path"] for c in selected}
+                new_files = [c for c in extra_sel if c["path"] not in already_loaded]
+
+                if new_files:
                     # Inject new files into system prompt
-                    for c in extra_sel:
+                    for c in new_files:
                         p = Path(c["path"])
                         if not p.is_absolute():
                             p = base / c["path"]
@@ -1057,7 +1072,17 @@ def chat():
                             system_prompt += f"\n\n---\n# Additional context: {c['path']}\n\n{content}"
                             used += len(content)
 
-                    add_pl = [{"path": c["path"], "type": c["type"]} for c in extra_sel]
+                    # Hard prompt for the retry: no further sentinel, just answer.
+                    system_prompt += (
+                        "\n\n---\n# Retry instruction (mandatory)\n"
+                        "You already used REQUEST_CONTEXT once. Additional files have been "
+                        "loaded above. Answer the user's question NOW using whatever is "
+                        "available — do NOT emit REQUEST_CONTEXT again. If specific details "
+                        "are still missing, say so plainly and suggest what the user could "
+                        "upload.\n"
+                    )
+
+                    add_pl = [{"path": c["path"], "type": c["type"]} for c in new_files]
                     yield f"data: {json.dumps({'context_update': {'add': add_pl, 'remove': [], 'reason': f'request_more_context: {focused_q[:60]}'}})}\n\n"
 
                     # Clear the REQUEST_CONTEXT text and stream a fresh response
@@ -1080,11 +1105,28 @@ def chat():
                                 assistant_text += text
                                 _append_partial(text)
                                 yield f"data: {json.dumps({'token': text})}\n\n"
+                    retry_succeeded = True
             except Exception as e:
                 print(f"[chat] REQUEST_CONTEXT retry error: {e}", flush=True)
             finally:
                 if hasattr(generate, "_in_context_retry"):
                     del generate._in_context_retry
+
+            # Strip any lingering REQUEST_CONTEXT sentinel from the retry's
+            # response — the model occasionally re-emits it despite the
+            # explicit retry instruction. Tokens have already been streamed,
+            # so push a clear_response and a graceful fallback instead.
+            still_has_rc = bool(_RC_RE.search(assistant_text))
+            if still_has_rc or not retry_succeeded:
+                yield f"data: {json.dumps({'clear_response': True})}\n\n"
+                fallback = (
+                    "I don't have specific details for that in the loaded context. "
+                    "If you can drop the relevant file via **+ Add document** (e.g. "
+                    "today's email export, the meeting notes you're looking at) I'll "
+                    "answer with it directly."
+                )
+                assistant_text = fallback
+                yield f"data: {json.dumps({'token': fallback})}\n\n"
 
         # ── Phase 6: Haiku monitor — update context for next turn ─────────────
         if assistant_text and all_candidates:
