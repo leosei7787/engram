@@ -166,6 +166,8 @@ class KeywordConfig:
         "/priming/",
         "/health/",
         "/_archive/",
+        ".bak_",
+        ".bak/",
     ])
 
 

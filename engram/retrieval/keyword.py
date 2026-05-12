@@ -121,7 +121,7 @@ def fast_file_score(
     base = base_path or memory_path.parent
     _scan_exclude = scan_exclude or ["/sessions/", "/_raw/", "/_pre_compression_backups/",
                                      "/proposals/", "/priming/", "/health/",
-                                     "/_archive/"]
+                                     "/_archive/", ".bak_", ".bak/"]
     _path_boosts = path_boosts or {
         "/accounts/": 2.5, "/decisions/": 1.8, "/weekly/": 1.6,
         "/context/": 1.4, "/saved/": 1.4, "/research/": 1.3,
@@ -140,7 +140,11 @@ def fast_file_score(
 
     # ── Tokenize + expand ─────────────────────────────────────────────────────
     q_lower  = query.lower()
-    recency  = any(w in q_lower for w in ("latest", "recent", "update", "current", "now", "today"))
+    recency  = any(w in q_lower for w in (
+        "latest", "recent", "update", "current", "now", "today",
+        "this morning", "this afternoon", "this evening", "tonight",
+        "yesterday", "just", "fresh",
+    ))
     q_toks   = query_tokens(query)
 
     # Synonym expansion: bidirectional -- "amx" pulls in "acmemotors" and vice-versa
@@ -258,8 +262,21 @@ def fast_file_score(
         if rel in _claim_boosts:
             boost *= _claim_boosts[rel]
 
-        if recency and "/weekly/" in rel:
-            boost *= 1.5
+        # When the query has a recency flavour ("latest", "today",
+        # "this morning", …), give recently-modified files a strong boost
+        # so today's inbox content outranks older daily digests that just
+        # happen to share keyword tokens.
+        if recency:
+            try:
+                age_h = (time.time() - f.stat().st_mtime) / 3600
+                if   age_h <  6: boost *= 5.0   # within last 6h
+                elif age_h < 24: boost *= 3.0   # within last day
+                elif age_h < 72: boost *= 1.8   # within last 3 days
+                elif age_h < 24 * 7: boost *= 1.3
+            except Exception:
+                pass
+            if "/weekly/" in rel:
+                boost *= 1.5
 
         score = (
             float(_sc.get("overlap_log_factor", 1.0)) * effective_overlap * boost * math.log(1 + effective_overlap)
