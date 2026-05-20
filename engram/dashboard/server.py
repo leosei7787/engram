@@ -1316,7 +1316,11 @@ def chat_interject():
 # Top of Mind tab and clicking restores the chat with that conversation's
 # context so the user can keep going from that point.
 
-_pinned_lock = threading.Lock()
+# RLock so add/remove can wrap the entire read-modify-write under the lock
+# (the save helper also takes the lock — without reentry it would deadlock).
+# Without RMW under lock, two near-simultaneous pin clicks both see the same
+# baseline list and the second write silently overwrites the first → lost pin.
+_pinned_lock = threading.RLock()
 
 
 def _pinned_index_path(memory_path: Path) -> Path:
@@ -1337,7 +1341,166 @@ def _save_pinned_index(memory_path: Path, items: list) -> None:
     p = _pinned_index_path(memory_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     with _pinned_lock:
-        p.write_text(json.dumps(items, indent=2))
+        # Atomic write: temp + replace so a concurrent reader never sees a
+        # truncated/half-written file (which _load_pinned_index would treat
+        # as empty and quietly drop every pin on the next write).
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(items, indent=2))
+        tmp.replace(p)
+
+
+# ─── Deep-think / council endpoint ────────────────────────────────────────────
+# /api/deep-think runs a multi-persona council over the user's query.
+# Reuses the chat-tab memory scan + selected files to give the council the same
+# context an ordinary chat answer would have. Streams progress events via SSE
+# (selecting → personas thinking → cross-reading → synthesizing → conclusion)
+# so the side-panel UI can show per-persona dots without exposing their drafts.
+
+@app.route("/api/deep-think", methods=["POST"])
+def deep_think():
+    from engram.memory import council as _council
+
+    data        = request.get_json(force=True) or {}
+    query       = (data.get("query", "") or "").strip()
+    session_id  = (data.get("session_id", "") or "").strip()
+    if not query:
+        return jsonify({"error": "empty query"}), 400
+
+    def generate():
+        import queue as _q
+        cfg = get_cfg()
+
+        # Daily cap — keeps cost predictable. Soft refusal with a hint;
+        # the client can still send the same query via /api/chat.
+        if cfg.deep_work.max_per_day > 0:
+            used = _council.count_today(cfg.memory_path)
+            if used >= cfg.deep_work.max_per_day:
+                yield f"data: {json.dumps({'council_error': f'daily cap reached ({used}/{cfg.deep_work.max_per_day}) — use /api/chat instead'})}\n\n"
+                return
+
+        # ── Phase 0: scan + assemble context exactly like /api/chat does ─
+        try:
+            scan = memory_scan(query, cfg, max_files=40)
+        except Exception as e:
+            scan = {"direct": [], "graph": [], "wiki": [], "graph_context": "", "suggestions": []}
+            print(f"[council] memory_scan error: {e}", flush=True)
+        try:
+            all_candidates = build_candidates(scan, cfg, snippet_chars=400)
+        except Exception as e:
+            all_candidates = []
+            print(f"[council] build_candidates error: {e}", flush=True)
+        curator_cfg = getattr(cfg, 'curator', None)
+        max_ctx = getattr(curator_cfg, 'max_context_files', 20) if curator_cfg else 20
+        selected  = all_candidates[:max_ctx]
+        sel_payload = [{"path": c["path"], "type": c["type"]} for c in selected]
+        yield f"data: {json.dumps({'context': {'phase': 'ready', 'candidates_total': len(all_candidates), 'selected': sel_payload}})}\n\n"
+
+        # Build a single flat context_text block to pass to each persona.
+        # Same budget as the normal chat path so personas don't run blind.
+        # Order: user-uploaded raw docs FIRST (the user just dragged these in,
+        # they're almost certainly the focus of the question), then the
+        # memory-scan candidates.
+        budget = cfg.retrieval.context_budget.max_total_chars
+        used_chars, parts = 0, []
+        base = cfg.base_path
+
+        # 1) Raw docs uploaded via the sidebar "Add document" affordance —
+        # mirrors how /api/chat injects them into the system prompt.
+        raw_docs = data.get("raw_docs", []) or []
+        n_raw = 0
+        for rd in raw_docs[:5]:   # cap matches /api/chat
+            name    = (rd.get("name") or "raw_document").strip()
+            content = (rd.get("content") or "")[:6000]
+            if not content:
+                continue
+            block = f"\n\n---\n# Uploaded document: {name}\n\n{content}"
+            if used_chars + len(block) > budget:
+                break
+            parts.append(block); used_chars += len(block); n_raw += 1
+        if n_raw:
+            yield f"data: {json.dumps({'uploads_loaded': n_raw})}\n\n"
+
+        # 2) Memory-scan selection
+        for c in selected:
+            try:
+                p = Path(c["path"]) if Path(c["path"]).is_absolute() else base / c["path"]
+                txt = p.read_text(errors="ignore")[:6000]
+            except Exception:
+                continue
+            block = f"\n\n---\n# {p.name}\n\n{txt}"
+            if used_chars + len(block) > budget:
+                break
+            parts.append(block); used_chars += len(block)
+        context_text = "".join(parts)
+
+        # ── Phase 1+: run council in a worker thread, forward events via queue ─
+        q: "_q.Queue[dict]" = _q.Queue()
+        SENTINEL = {"__end__": True}
+
+        def _worker():
+            try:
+                _council.run_council(
+                    query        = query,
+                    context_text = context_text,
+                    cfg          = cfg,
+                    on_event     = lambda evt: q.put(evt),
+                )
+            except Exception:
+                print("[council] worker crash:\n" + traceback.format_exc(), flush=True)
+                q.put({"council_error": "internal error — see server log"})
+            finally:
+                q.put(SENTINEL)
+
+        worker = threading.Thread(target=_worker, name="council-runner", daemon=True)
+        worker.start()
+
+        transcript_seen: dict = {}
+        while True:
+            try:
+                evt = q.get(timeout=300)
+            except Exception:
+                yield f"data: {json.dumps({'council_error': 'timed out waiting for council'})}\n\n"
+                break
+            if evt is SENTINEL:
+                break
+            # Keep a reference to the final transcript so the post-run log
+            # gets written even though the SSE is closing.
+            if "council_done" in evt:
+                transcript_seen = evt["council_done"]
+            yield f"data: {json.dumps(evt)}\n\n"
+            if "council_error" in evt:
+                break
+
+        # Record this run for the daily cap counter (only if it actually ran).
+        if transcript_seen:
+            try:
+                _council.append_log(cfg.memory_path, transcript_seen)
+            except Exception:
+                print("[council] append_log failed:\n" + traceback.format_exc(), flush=True)
+
+        # Also log the council transcript into the session's chat .md so
+        # the curator's keyword scan can pull past councils into future
+        # retrieval — same logic as ordinary chat turns.
+        if transcript_seen and session_id:
+            try:
+                from engram.memory.session_harvester import log_turn as _log_turn
+                _log_turn(
+                    memory_path     = cfg.memory_path,
+                    session_id      = session_id,
+                    user_msg        = "/think " + query,
+                    assistant_text  = transcript_seen.get("conclusion", ""),
+                    selected        = selected,
+                    raw_docs        = [],
+                    was_interruption= False,
+                )
+            except Exception:
+                print("[council] log_turn failed:\n" + traceback.format_exc(), flush=True)
+
+        yield "data: [DONE]\n\n"
+
+    return Response(stream_with_context(generate()),
+                    mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.route("/api/pinned/list")
@@ -1363,6 +1526,10 @@ def pinned_add():
     session_id = (body.get("session_id", "") or "").strip()
     turn_index = body.get("turn_index")
     title      = (body.get("title", "") or "").strip()[:160]
+    # Optional council transcript — sent when pinning a 🧠 Council answer so
+    # restoring the pin can rehydrate the full deliberation (personas, takes,
+    # disagreement notes, decision options) and not just the conclusion.
+    council_transcript = body.get("council_transcript") or None
     if not session_id or turn_index is None:
         return jsonify({"error": "session_id and turn_index required"}), 400
 
@@ -1396,20 +1563,37 @@ def pinned_add():
         "active_context":    turn.get("active_context", []),
         "pinned_at":         datetime.now().isoformat(timespec="seconds"),
     }
+    # Store the council transcript when present — only validated lightly so a
+    # malformed client payload can't break the pin. Untrusted fields are
+    # filtered to the ones we'll actually render on restore.
+    if isinstance(council_transcript, dict):
+        ct = council_transcript
+        pin["council_transcript"] = {
+            "personas":           list(ct.get("personas") or [])[:6],
+            "routing_rationale":  str(ct.get("routing_rationale") or "")[:400],
+            "phase1":             {k: str(v)[:6000] for k, v in (ct.get("phase1") or {}).items()},
+            "revised":            {k: str(v)[:6000] for k, v in (ct.get("revised") or {}).items()},
+            "conclusion":         str(ct.get("conclusion") or "")[:8000],
+            "why_this_conclusion":str(ct.get("why_this_conclusion") or "")[:2000],
+            "decision_required":  bool(ct.get("decision_required")),
+            "options":            list(ct.get("options") or [])[:3],
+            "disagreement_notes": str(ct.get("disagreement_notes") or "")[:2000],
+            "elapsed_seconds":    ct.get("elapsed_seconds"),
+        }
 
-    items = _load_pinned_index(cfg.memory_path)
-    # If this exact (session, turn_index) is already pinned, return that record
-    # rather than creating a duplicate.
-    existing = next(
-        (it for it in items
-         if it.get("session_id") == session_id and it.get("turn_index") == ti),
-        None,
-    )
-    if existing:
-        return jsonify(existing)
-
-    items.append(pin)
-    _save_pinned_index(cfg.memory_path, items)
+    # Hold the lock across read-modify-write so concurrent pins can't both
+    # baseline off the same on-disk state and stomp each other.
+    with _pinned_lock:
+        items = _load_pinned_index(cfg.memory_path)
+        existing = next(
+            (it for it in items
+             if it.get("session_id") == session_id and it.get("turn_index") == ti),
+            None,
+        )
+        if existing:
+            return jsonify(existing)
+        items.append(pin)
+        _save_pinned_index(cfg.memory_path, items)
     return jsonify(pin)
 
 
@@ -1422,23 +1606,26 @@ def pinned_remove():
     session_id = (body.get("session_id", "") or "").strip()
     turn_index = body.get("turn_index")
 
-    items = _load_pinned_index(cfg.memory_path)
-    before = len(items)
-    if pin_id:
-        items = [it for it in items if it.get("pin_id") != pin_id]
-    elif session_id and turn_index is not None:
-        try:
-            ti = int(turn_index)
-        except Exception:
-            return jsonify({"error": "turn_index invalid"}), 400
-        items = [it for it in items
-                 if not (it.get("session_id") == session_id and it.get("turn_index") == ti)]
-    else:
-        return jsonify({"error": "pin_id or (session_id, turn_index) required"}), 400
+    # Same RMW-under-lock rule as pinned_add: keep the read and write atomic
+    # so a concurrent add/remove can't lose updates.
+    with _pinned_lock:
+        items = _load_pinned_index(cfg.memory_path)
+        before = len(items)
+        if pin_id:
+            items = [it for it in items if it.get("pin_id") != pin_id]
+        elif session_id and turn_index is not None:
+            try:
+                ti = int(turn_index)
+            except Exception:
+                return jsonify({"error": "turn_index invalid"}), 400
+            items = [it for it in items
+                     if not (it.get("session_id") == session_id and it.get("turn_index") == ti)]
+        else:
+            return jsonify({"error": "pin_id or (session_id, turn_index) required"}), 400
 
-    if len(items) == before:
-        return jsonify({"removed": 0})
-    _save_pinned_index(cfg.memory_path, items)
+        if len(items) == before:
+            return jsonify({"removed": 0})
+        _save_pinned_index(cfg.memory_path, items)
     return jsonify({"removed": before - len(items)})
 
 
@@ -2913,6 +3100,7 @@ def top_of_mind():
         items = _load_pinned_index(mem)
         items.sort(key=lambda p: p.get("pinned_at", ""), reverse=True)
         for p in items[:30]:
+            ct = p.get("council_transcript") or {}
             pinned_out.append({
                 "pin_id":            p.get("pin_id", ""),
                 "title":             p.get("title", "")[:160],
@@ -2921,6 +3109,11 @@ def top_of_mind():
                 "session_id":        p.get("session_id", ""),
                 "turn_index":        p.get("turn_index", 0),
                 "pinned_at":         p.get("pinned_at", ""),
+                # 🧠 badge on the Top of Mind tile when this pin captured a
+                # council deliberation. Just metadata for the tile — the full
+                # transcript ships with /api/pinned/restore.
+                "is_council":        bool(ct),
+                "council_personas":  [pp.get("icon", "·") for pp in (ct.get("personas") or [])][:5],
             })
     except Exception:
         pass
@@ -3347,6 +3540,8 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
 .pin-btn:hover {{ border-color: #D97757; color: #D97757; }}
 .pin-btn.pinned {{ border-color: #D97757; color: #D97757; background: #fff8f5; font-weight: 600; }}
 .pin-btn:disabled {{ opacity: .5; cursor: wait; }}
+.pin-btn.pin-failed {{ opacity: 1 !important; border-color: #c0392b; color: #c0392b;
+                       background: #fff5f3; font-weight: 600; }}
 
 /* Outputs panel in sidebar */
 .outputs-section {{ border-top: 1px solid #efefef; padding: 8px 0; }}
@@ -3463,6 +3658,102 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
              transition: background .15s, opacity .15s; }}
 .send-btn:hover {{ background: #c06040; }}
 .send-btn:disabled {{ background: #ddd; cursor: not-allowed; }}
+/* Deep-think trigger — same footprint as Send, secondary tint. Hover bumps to
+   the council accent (purple) so it reads as a distinct action. */
+.think-btn {{ width: 38px; height: 38px; border-radius: 8px; border: 1px solid #ddd;
+              cursor: pointer; background: #fff; color: #555; display: flex;
+              align-items: center; justify-content: center; font-size: 16px;
+              flex-shrink: 0; transition: all .15s; }}
+.think-btn:hover {{ border-color: #8b5cf6; color: #8b5cf6; background: #f6f3ff; }}
+.think-btn:disabled {{ opacity: .5; cursor: not-allowed; }}
+.think-btn.active {{ border-color: #8b5cf6; background: #8b5cf6; color: #fff; }}
+
+/* ═══════════════════════════════════════════
+   COUNCIL DRAWER — side panel that shows while a /think run is in flight.
+   Per-persona dots, current phase label, optional "show drafts" disclosure.
+   Drawer auto-closes when the conclusion lands in the main chat as a 🧠 bubble.
+   ═══════════════════════════════════════════ */
+.council-drawer {{ position: fixed; top: 0; right: -440px; width: 420px;
+                   height: 100vh; background: #fff; box-shadow: -4px 0 20px rgba(0,0,0,.08);
+                   border-left: 1px solid #ececec; z-index: 9999; padding: 22px 24px;
+                   transition: right .35s ease; overflow-y: auto;
+                   display: flex; flex-direction: column; gap: 14px; }}
+.council-drawer.open {{ right: 0; }}
+.council-head {{ display: flex; align-items: center; justify-content: space-between; }}
+.council-title {{ font-size: 14px; font-weight: 700; color: #333;
+                  display: flex; align-items: center; gap: 8px; }}
+.council-title-badge {{ background: #f3eeff; color: #8b5cf6; padding: 2px 8px;
+                        border-radius: 10px; font-size: 10px; font-weight: 600;
+                        letter-spacing: .5px; text-transform: uppercase; }}
+.council-close {{ width: 26px; height: 26px; border: none; background: transparent;
+                  color: #aaa; cursor: pointer; font-size: 18px; line-height: 1; }}
+.council-close:hover {{ color: #555; }}
+.council-q {{ font-size: 12px; color: #888; line-height: 1.5; padding: 8px 10px;
+              background: #fafafa; border-left: 3px solid #8b5cf6; border-radius: 0 6px 6px 0; }}
+.council-phase {{ font-size: 11px; color: #777; text-transform: uppercase;
+                  letter-spacing: 1.2px; font-weight: 600; }}
+.council-phase .dot {{ display: inline-block; width: 6px; height: 6px;
+                       border-radius: 50%; background: #8b5cf6; margin-right: 6px;
+                       animation: pulse 1.4s ease-in-out infinite; }}
+@keyframes pulse {{ 0%, 100% {{ opacity: 1 }} 50% {{ opacity: .35 }} }}
+.council-rationale {{ font-size: 11.5px; color: #888; font-style: italic; line-height: 1.45; }}
+.council-personas {{ display: flex; flex-direction: column; gap: 10px; }}
+.council-persona {{ display: grid; grid-template-columns: 24px 1fr auto;
+                    align-items: center; gap: 12px; padding: 10px 0;
+                    border-bottom: 1px solid #f3f3f3; }}
+.council-persona:last-child {{ border-bottom: none; }}
+.council-persona-icon {{ font-size: 18px; line-height: 1; }}
+.council-persona-body {{ display: flex; flex-direction: column; gap: 2px; }}
+.council-persona-label {{ font-size: 13px; color: #333; font-weight: 600; }}
+.council-persona-lens {{ font-size: 11px; color: #888; }}
+.council-persona-status {{ font-size: 10.5px; color: #aaa; text-transform: uppercase;
+                            letter-spacing: 1px; font-weight: 600; }}
+.council-persona-status.thinking {{ color: #8b5cf6; }}
+.council-persona-status.done     {{ color: #34A853; }}
+.council-foot {{ margin-top: auto; padding-top: 10px; border-top: 1px solid #f0f0f0; }}
+.council-toggle {{ font-size: 11px; color: #888; text-decoration: none; cursor: pointer; }}
+.council-toggle:hover {{ color: #8b5cf6; }}
+.council-drafts {{ font-size: 12px; color: #555; line-height: 1.55;
+                   max-height: 260px; overflow-y: auto; padding: 8px 10px;
+                   background: #fafafa; border-radius: 6px; }}
+.council-drafts h4 {{ margin: 12px 0 4px; font-size: 11px; color: #777;
+                       text-transform: uppercase; letter-spacing: .8px; }}
+.council-drafts h4:first-child {{ margin-top: 0; }}
+
+/* The 🧠 Council bubble itself, posted into the main chat once the council
+   finishes. Looks like a normal assistant bubble but with a purple accent
+   strip + the council header. */
+.message.assistant.council .bubble {{ border-left: 3px solid #8b5cf6; padding-left: 14px; }}
+.council-badge {{ display: inline-flex; align-items: center; gap: 6px;
+                  background: #f3eeff; color: #8b5cf6; padding: 3px 10px;
+                  border-radius: 10px; font-size: 10.5px; font-weight: 700;
+                  text-transform: uppercase; letter-spacing: .8px; margin-bottom: 8px; }}
+.council-why {{ margin-top: 12px; padding: 10px 12px; background: #fafafa;
+                border-radius: 6px; font-size: 12.5px; color: #555;
+                font-style: italic; line-height: 1.55; border-left: 2px solid #ddd; }}
+.council-why-label {{ font-style: normal; font-weight: 700; color: #8b5cf6;
+                      font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+                      display: block; margin-bottom: 4px; }}
+.council-options {{ margin-top: 14px; display: flex; flex-wrap: wrap; gap: 8px; }}
+.council-option {{ flex: 1 1 240px; border: 1px solid #ddd; background: #fff;
+                   padding: 10px 12px; border-radius: 8px; cursor: pointer;
+                   transition: all .15s; text-align: left; }}
+.council-option:hover {{ border-color: #8b5cf6; background: #faf7ff; }}
+.council-option-label {{ font-size: 12.5px; font-weight: 700; color: #333; margin-bottom: 3px; }}
+.council-option-summary {{ font-size: 11.5px; color: #777; line-height: 1.4; }}
+.council-notes-toggle {{ display: inline-block; margin-top: 14px; font-size: 11.5px;
+                          color: #888; cursor: pointer; user-select: none; }}
+.council-notes-toggle:hover {{ color: #8b5cf6; }}
+.council-notes {{ margin-top: 10px; padding: 10px 12px; background: #fafafa;
+                  border-radius: 6px; font-size: 12px; line-height: 1.5; color: #555;
+                  display: none; }}
+.council-notes.open {{ display: block; }}
+.council-notes h5 {{ margin: 10px 0 4px; font-size: 11.5px; color: #333;
+                     font-weight: 700; }}
+.council-notes h5:first-child {{ margin-top: 0; }}
+.council-disagreement {{ margin-top: 8px; font-size: 11.5px; color: #888;
+                          font-style: italic; line-height: 1.45;
+                          border-left: 2px solid #ffc107; padding-left: 8px; }}
 
 /* ═══════════════════════════════════════════
    HEALTH PANEL
@@ -3811,13 +4102,30 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica N
       </div>
       <div class="input-bar">
         <div class="input-wrap">
-          <textarea class="input-box" id="input" placeholder="Ask anything…" rows="1"></textarea>
+          <textarea class="input-box" id="input" placeholder="Ask anything — prefix /think for council mode" rows="1"></textarea>
+          <button class="think-btn" id="think-btn" title="Deep think — convene a council of advisors" onclick="sendMessage({{deep: true}})">💭</button>
           <button class="send-btn" id="send-btn" onclick="sendMessage()">↑</button>
         </div>
       </div>
     </div>
 
   </div>
+</div>
+
+<!-- Council drawer — overlays from the right while /think runs. Hidden by default. -->
+<div class="council-drawer" id="council-drawer">
+  <div class="council-head">
+    <div class="council-title">🧠 Council <span class="council-title-badge" id="council-mode-badge">cli</span></div>
+    <button class="council-close" onclick="closeCouncilDrawer()" title="Close">×</button>
+  </div>
+  <div class="council-q" id="council-q"></div>
+  <div class="council-phase" id="council-phase"><span class="dot"></span>Selecting the panel…</div>
+  <div class="council-rationale" id="council-rationale"></div>
+  <div class="council-personas" id="council-personas"></div>
+  <div class="council-foot">
+    <a class="council-toggle" id="council-show-drafts" onclick="toggleCouncilDrafts(event)">▸ show drafts (debug)</a>
+  </div>
+  <div class="council-drafts" id="council-drafts" style="display:none"></div>
 </div>
 
 <!-- ══════════════════════ TOP OF MIND PANEL ══════════════════════ -->
@@ -3995,14 +4303,32 @@ let currentAssistantEl = null;
 let pendingFollowup    = null;     // {{text, was_interruption, reason, userBubble}}
 let interjectInFlight  = false;
 
-function sendMessage() {{
-  const text = input.value.trim();
+function sendMessage(opts) {{
+  opts = opts || {{}};
+  let text = input.value.trim();
   if (!text) return;
+
+  // Deep-think routing: either the 💭 button (opts.deep) or the /think prefix
+  // peels the message off into the council pipeline. Strip the prefix so the
+  // user bubble shows the natural question, not the trigger token.
+  let deepThink = !!opts.deep;
+  if (text.startsWith('/think ')) {{ deepThink = true; text = text.slice(7).trim(); }}
+  else if (text === '/think')      {{ return; }}   // prefix only, no question
+  if (deepThink && !text) return;
+
   input.value = ''; input.style.height = 'auto';
   document.getElementById('empty-state')?.remove();
 
   // Render the user bubble immediately — feels like speaking up.
-  const userEl = appendBubble('user', text);
+  const userEl = appendBubble('user', deepThink ? ('💭 ' + text) : text);
+
+  if (deepThink) {{
+    // Council mode bypasses the interrupt classifier entirely — it's a slow,
+    // expensive turn the user opted into; don't second-guess them mid-stream.
+    messages.push({{role: 'user', content: '/think ' + text}});
+    _doDeepThink(text);
+    return;
+  }}
 
   if (!streaming) {{
     messages.push({{role: 'user', content: text}});
@@ -4188,6 +4514,265 @@ function _doSend(text, opts) {{
   }});
 }}
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COUNCIL MODE — /think and the 💭 button feed into here.
+// Opens the side drawer, streams SSE progress from /api/deep-think, then
+// posts the conclusion as a 🧠 Council bubble in the main chat.
+// Per-persona drafts stay hidden behind the "show drafts" toggle — the user
+// asked for low-visibility reasoning during the run.
+// ═══════════════════════════════════════════════════════════════════════════
+
+let _councilState = null;   // {{personas: [...], drafts: {{phase1:{{}}, revised:{{}}}}, transcript: {{}}}}
+
+function _openCouncilDrawer(query) {{
+  const dr = document.getElementById('council-drawer');
+  document.getElementById('council-q').textContent       = query;
+  document.getElementById('council-phase').innerHTML     = '<span class="dot"></span>Selecting the panel…';
+  document.getElementById('council-rationale').textContent = '';
+  document.getElementById('council-personas').innerHTML  = '';
+  document.getElementById('council-drafts').innerHTML    = '';
+  document.getElementById('council-drafts').style.display = 'none';
+  document.getElementById('council-show-drafts').textContent = '▸ show drafts (debug)';
+  dr.classList.add('open');
+}}
+function closeCouncilDrawer() {{
+  document.getElementById('council-drawer').classList.remove('open');
+}}
+function toggleCouncilDrafts(ev) {{
+  if (ev) ev.preventDefault();
+  const d = document.getElementById('council-drafts');
+  const t = document.getElementById('council-show-drafts');
+  if (d.style.display === 'none') {{ d.style.display = 'block'; t.textContent = '▾ hide drafts'; }}
+  else                            {{ d.style.display = 'none';  t.textContent = '▸ show drafts (debug)'; }}
+}}
+
+function _renderCouncilPersonas(personas) {{
+  const host = document.getElementById('council-personas');
+  host.innerHTML = '';
+  personas.forEach(p => {{
+    const row = document.createElement('div');
+    row.className = 'council-persona';
+    row.dataset.key = p.key;
+    row.innerHTML = `
+      <div class="council-persona-icon" style="color:${{p.color}}">${{p.icon}}</div>
+      <div class="council-persona-body">
+        <div class="council-persona-label">${{escHtml(p.label)}}</div>
+        <div class="council-persona-lens">${{escHtml(p.lens || '')}}</div>
+      </div>
+      <div class="council-persona-status" data-status>waiting</div>`;
+    host.appendChild(row);
+  }});
+}}
+function _setPersonaStatus(key, label, klass) {{
+  const row = document.querySelector(`.council-persona[data-key="${{key}}"]`);
+  if (!row) return;
+  const s = row.querySelector('[data-status]');
+  s.textContent = label;
+  s.classList.remove('thinking', 'done');
+  if (klass) s.classList.add(klass);
+}}
+
+function _renderCouncilDrafts(state) {{
+  // Renders the optional drafts section — collapsed by default, expanded by
+  // the "show drafts" toggle. Shows both phase-1 and revised takes so the
+  // user can audit how each persona evolved.
+  const host = document.getElementById('council-drafts');
+  if (!state || !state.personas) {{ host.innerHTML = ''; return; }}
+  let html = '';
+  state.personas.forEach(p => {{
+    const p1 = (state.drafts.phase1[p.key]   || '').trim();
+    const rv = (state.drafts.revised[p.key]  || '').trim();
+    html += `<h4>${{p.icon}} ${{escHtml(p.label)}}</h4>`;
+    if (p1) html += `<div style="margin-bottom:8px"><strong>Initial:</strong><br>${{_mdToHtml(p1, {{plain:true}})}}</div>`;
+    if (rv && rv !== p1) html += `<div><strong>After cross-read:</strong><br>${{_mdToHtml(rv, {{plain:true}})}}</div>`;
+  }});
+  host.innerHTML = html || '<em>No drafts captured.</em>';
+}}
+
+function _doDeepThink(query) {{
+  _openCouncilDrawer(query);
+  _councilState = {{personas: [], drafts: {{phase1: {{}}, revised: {{}}}}, transcript: null}};
+
+  fetch('/api/deep-think', {{
+    method:  'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    // Forward user-uploaded docs and explicitly pinned context paths the same
+    // way /api/chat does — without these the council reasons against the
+    // memory scan only and never sees files the user just dragged in.
+    body:    JSON.stringify({{
+      query,
+      session_id: SESSION_ID,
+      raw_docs:   rawDocs,
+      pinned:     [...pinnedPaths],
+    }}),
+  }}).then(res => {{
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    function pump() {{
+      reader.read().then(({{done, value}}) => {{
+        if (done) return;
+        buf += decoder.decode(value, {{stream: true}});
+        const parts = buf.split('\\n\\n'); buf = parts.pop();
+        for (const part of parts) {{
+          if (!part.startsWith('data: ')) continue;
+          const raw = part.slice(6).trim();
+          if (raw === '[DONE]') return;
+          try {{ _handleCouncilEvent(JSON.parse(raw)); }} catch(e) {{}}
+        }}
+        pump();
+      }});
+    }}
+    pump();
+  }}).catch(err => {{
+    document.getElementById('council-phase').innerHTML = '⚠ Connection error: ' + escHtml(err.message);
+  }});
+}}
+
+function _handleCouncilEvent(evt) {{
+  if (evt.council_error) {{
+    document.getElementById('council-phase').innerHTML = '⚠ ' + escHtml(evt.council_error);
+    // Auto-close after a few seconds so the user isn't stuck staring at it.
+    setTimeout(closeCouncilDrawer, 4500);
+    return;
+  }}
+  if (evt.uploads_loaded) {{
+    // Surface a small confirmation so the user can tell the dragged-in docs
+    // actually reached the council (the previous version silently dropped them).
+    const r = document.getElementById('council-rationale');
+    const n = evt.uploads_loaded;
+    r.textContent = `📎 ${{n}} uploaded document${{n === 1 ? '' : 's'}} included in context`;
+    return;
+  }}
+  if (evt.phase === 'selecting') {{
+    document.getElementById('council-phase').innerHTML = '<span class="dot"></span>Selecting the panel…';
+    return;
+  }}
+  if (evt.phase === 'selected') {{
+    _councilState.personas = evt.personas || [];
+    _renderCouncilPersonas(_councilState.personas);
+    // Preserve the "uploads loaded" line if it was set by an earlier event,
+    // and append the orchestrator's panel rationale below it.
+    const r = document.getElementById('council-rationale');
+    const existing = r.textContent.trim();
+    const ratLine  = evt.rationale ? evt.rationale : '';
+    r.innerHTML = (existing ? `<div>${{escHtml(existing)}}</div>` : '')
+                + (ratLine  ? `<div style="margin-top:4px">${{escHtml(ratLine)}}</div>` : '');
+    document.getElementById('council-phase').innerHTML = `<span class="dot"></span>${{_councilState.personas.length}} advisors thinking…`;
+    return;
+  }}
+  if (evt.phase === 'phase1') {{
+    document.getElementById('council-phase').innerHTML = '<span class="dot"></span>Personas thinking…';
+    return;
+  }}
+  if (evt.phase === 'crossread') {{
+    document.getElementById('council-phase').innerHTML = '<span class="dot"></span>Cross-reading each other…';
+    // Reset statuses for the new phase
+    (_councilState.personas || []).forEach(p => _setPersonaStatus(p.key, 'waiting', ''));
+    return;
+  }}
+  if (evt.phase === 'synthesizing') {{
+    document.getElementById('council-phase').innerHTML = '<span class="dot"></span>Synthesizing…';
+    (_councilState.personas || []).forEach(p => _setPersonaStatus(p.key, 'done', 'done'));
+    return;
+  }}
+  if (evt.persona_started) {{
+    _setPersonaStatus(evt.persona_started, evt.phase === 'crossread' ? 'cross-reading' : 'thinking', 'thinking');
+    return;
+  }}
+  if (evt.persona_done) {{
+    _setPersonaStatus(evt.persona_done, evt.phase === 'crossread' ? 'revised' : 'first take done', 'done');
+    return;
+  }}
+  if (evt.council_done) {{
+    const t = evt.council_done;
+    _councilState.transcript    = t;
+    _councilState.drafts.phase1  = t.phase1  || {{}};
+    _councilState.drafts.revised = t.revised || {{}};
+    _renderCouncilDrafts(_councilState);
+    _postCouncilConclusion(t);
+    // Brief delay so the user sees the "Done" state before the drawer closes
+    setTimeout(closeCouncilDrawer, 800);
+    return;
+  }}
+}}
+
+// Build the assistant bubble for the conclusion + (optionally) decision chips
+// + collapsible council notes. Lives in the main chat thread like any other
+// answer.
+function _postCouncilConclusion(t) {{
+  document.getElementById('empty-state')?.remove();
+  const wrap = document.createElement('div');
+  wrap.className = 'message assistant council';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+
+  // Header: 🧠 Council badge + persona icons row
+  const iconsStr = (t.personas || []).map(p => `<span title="${{escHtml(p.label)}}">${{p.icon}}</span>`).join(' ');
+  const badge = `<div class="council-badge">🧠 Council · ${{iconsStr}}</div>`;
+
+  // Main conclusion (markdown → html)
+  const concHtml = _mdToHtml(t.conclusion || '', {{plain: true}});
+
+  // "Why this conclusion" italic block
+  const whyBlock = (t.why_this_conclusion || '').trim()
+    ? `<div class="council-why"><span class="council-why-label">Why this conclusion</span>${{escHtml(t.why_this_conclusion)}}</div>` : '';
+
+  // Decision options — only when synthesiser said the council split
+  let optsBlock = '';
+  if (t.decision_required && Array.isArray(t.options) && t.options.length) {{
+    optsBlock = '<div class="council-options">' + t.options.map((o, i) => `
+      <button class="council-option" data-opt-idx="${{i}}">
+        <div class="council-option-label">${{escHtml(o.label || ('Option ' + (i+1)))}}</div>
+        <div class="council-option-summary">${{escHtml(o.summary || '')}}</div>
+      </button>`).join('') + '</div>';
+  }}
+
+  // Residual disagreement note (when present even if no decision needed)
+  const disagreeBlock = (t.disagreement_notes || '').trim()
+    ? `<div class="council-disagreement">${{escHtml(t.disagreement_notes)}}</div>` : '';
+
+  // Collapsible "Council notes" — each persona's revised stance
+  const notesHtml = (t.personas || []).map(p => {{
+    const stance = ((t.revised || {{}})[p.key] || (t.phase1 || {{}})[p.key] || '').trim();
+    if (!stance) return '';
+    return `<h5>${{p.icon}} ${{escHtml(p.label)}}</h5>${{_mdToHtml(stance, {{plain: true}})}}`;
+  }}).join('');
+  const notesBlock = notesHtml
+    ? `<span class="council-notes-toggle" onclick="this.nextElementSibling.classList.toggle('open'); this.textContent = this.nextElementSibling.classList.contains('open') ? '▾ Hide council notes' : '▸ Council notes (' + ${{t.personas.length}} + ' voices)';">▸ Council notes (${{t.personas.length}} voices)</span><div class="council-notes">${{notesHtml}}</div>`
+    : '';
+
+  bubble.innerHTML = badge + concHtml + whyBlock + optsBlock + disagreeBlock + notesBlock;
+  wrap.appendChild(bubble);
+  document.getElementById('messages').appendChild(wrap);
+
+  // Option chips → re-send the chosen stance as a normal chat message so the
+  // model can take it forward (the council's job is done).
+  wrap.querySelectorAll('.council-option').forEach(btn => {{
+    btn.addEventListener('click', () => {{
+      const idx = +btn.dataset.optIdx;
+      const opt = (t.options || [])[idx];
+      if (!opt) return;
+      const followup = `I'll go with: ${{opt.label}}. ${{opt.summary || ''}}`.trim();
+      input.value = followup;
+      input.style.height = 'auto';
+      input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+      input.focus();
+    }});
+  }});
+
+  // Pin button — same affordance as a normal assistant bubble, but the pin
+  // payload also carries the full council transcript so restoring the pin
+  // can rehydrate the personas + drafts.
+  messages.push({{role: 'assistant', content: t.conclusion || ''}});
+  const myTurn = TURN_INDEX++;
+  addPinButton(wrap, myTurn, t);
+  addExportBar(wrap, t.conclusion || '');
+  scrollToBottom();
+}}
+
+
 function appendBubble(role, text) {{
   const wrap = document.createElement('div');
   wrap.className = 'message ' + role;
@@ -4321,7 +4906,7 @@ const EXPORT_FMTS = [
 ];
 
 // ── Pin / unpin chat answers ─────────────────────────────────────────────
-function addPinButton(msgEl, turnIndex) {{
+function addPinButton(msgEl, turnIndex, councilTranscript) {{
   const btn = document.createElement('button');
   btn.className   = 'pin-btn';
   btn.title       = 'Pin this answer to your Top of Mind';
@@ -4330,35 +4915,57 @@ function addPinButton(msgEl, turnIndex) {{
   btn.onclick = async () => {{
     if (btn.disabled) return;
     btn.disabled = true;
+    const flashFail = (label) => {{
+      btn.textContent = label;
+      btn.classList.add('pin-failed');
+      setTimeout(() => {{
+        if (btn.dataset.pinned !== '1') {{
+          btn.textContent = '📌 Pin';
+          btn.classList.remove('pin-failed');
+        }}
+      }}, 2500);
+    }};
     if (btn.dataset.pinned === '1') {{
-      // Unpin
       try {{
-        await fetch('/api/pinned/remove', {{
+        const r = await fetch('/api/pinned/remove', {{
           method:  'POST',
           headers: {{'Content-Type': 'application/json'}},
           body:    JSON.stringify({{session_id: SESSION_ID, turn_index: turnIndex}}),
         }});
+        if (!r.ok) throw new Error('http ' + r.status);
         btn.dataset.pinned = '';
         btn.dataset.pinId  = '';
         btn.textContent    = '📌 Pin';
         btn.classList.remove('pinned');
-      }} catch (e) {{}}
+      }} catch (e) {{
+        flashFail('⚠ Unpin failed');
+      }}
     }} else {{
-      // Pin
       try {{
+        // Council bubbles pass the full transcript so the server can store
+        // it alongside the pin record (personas, takes, decision options).
+        const body = {{session_id: SESSION_ID, turn_index: turnIndex}};
+        if (councilTranscript) body.council_transcript = councilTranscript;
         const r = await fetch('/api/pinned/add', {{
           method:  'POST',
           headers: {{'Content-Type': 'application/json'}},
-          body:    JSON.stringify({{session_id: SESSION_ID, turn_index: turnIndex}}),
+          body:    JSON.stringify(body),
         }});
-        const j = await r.json();
-        if (j.pin_id) {{
+        const j = await r.json().catch(() => ({{}}));
+        if (r.ok && j.pin_id) {{
           btn.dataset.pinned = '1';
           btn.dataset.pinId  = j.pin_id;
-          btn.textContent    = '📍 Pinned';
+          btn.textContent    = councilTranscript ? '📍 Pinned (council)' : '📍 Pinned';
           btn.classList.add('pinned');
+        }} else {{
+          const why = (j && j.error) ? (' — ' + j.error) : '';
+          flashFail('⚠ Pin failed' + why);
+          console.warn('[pin] add failed', {{status: r.status, body: j}});
         }}
-      }} catch (e) {{}}
+      }} catch (e) {{
+        flashFail('⚠ Pin failed');
+        console.warn('[pin] add error', e);
+      }}
     }}
     btn.disabled = false;
   }};
@@ -4460,6 +5067,11 @@ async function restorePinnedConversation(pinId) {{
   if (msgsEl) msgsEl.innerHTML = '';
   document.getElementById('empty-state')?.remove();
 
+  // If the pin captured a council transcript, the answer at j.turn_index is a
+  // 🧠 Council answer — rehydrate the rich bubble (badge, why, notes, options)
+  // instead of a plain assistant bubble for that one turn.
+  const councilTranscript = j.pin && j.pin.council_transcript;
+
   // Rehydrate bubbles. j.messages is alternating user/assistant.
   for (let i = 0; i < j.messages.length; i += 2) {{
     const u = j.messages[i];
@@ -4470,17 +5082,36 @@ async function restorePinnedConversation(pinId) {{
     }}
     if (a) {{
       messages.push(a);
-      const aEl = appendBubble('assistant', a.content || '');
-      if ((a.content || '').trim()) {{
-        addExportBar(aEl, a.content);
-        const ti = TURN_INDEX++;
-        const pinBtn = addPinButton(aEl, ti);
-        // Pre-mark the originally-pinned turn
-        if (ti === j.turn_index) {{
+      const ti = TURN_INDEX++;
+      const isCouncilTurn = councilTranscript && ti === j.turn_index;
+      if (isCouncilTurn) {{
+        // Re-use the live council renderer so the restored bubble looks the
+        // same as a fresh one — same chip handlers, same collapsible notes.
+        _postCouncilConclusion(councilTranscript);
+        // _postCouncilConclusion already pushes the assistant message,
+        // bumps TURN_INDEX, and adds its own pin button — undo our advance
+        // so we don't double-count.
+        TURN_INDEX--; messages.pop();
+        // Mark its pin button as already pinned (restored from this pin).
+        const lastWrap = document.getElementById('messages').lastElementChild;
+        const pinBtn   = lastWrap && lastWrap.querySelector('.pin-btn');
+        if (pinBtn) {{
           pinBtn.dataset.pinned = '1';
           pinBtn.dataset.pinId  = j.pin && j.pin.pin_id;
-          pinBtn.textContent    = '📍 Pinned';
+          pinBtn.textContent    = '📍 Pinned (council)';
           pinBtn.classList.add('pinned');
+        }}
+      }} else {{
+        const aEl = appendBubble('assistant', a.content || '');
+        if ((a.content || '').trim()) {{
+          addExportBar(aEl, a.content);
+          const pinBtn = addPinButton(aEl, ti);
+          if (ti === j.turn_index) {{
+            pinBtn.dataset.pinned = '1';
+            pinBtn.dataset.pinId  = j.pin && j.pin.pin_id;
+            pinBtn.textContent    = '📍 Pinned';
+            pinBtn.classList.add('pinned');
+          }}
         }}
       }}
     }}
@@ -5323,10 +5954,16 @@ function renderTopOfMind(data) {{
   }} else {{
     pnHtml = '<div class="tom-list">' + pinned.map(p => {{
       const ageStr = _agoStr(p.pinned_at);
+      // 🧠 marker on council pins — title prefixed with the council badge so
+      // it's immediately distinguishable from a plain pinned answer. The
+      // persona icons (cached on the pin record) hint at who deliberated.
+      const councilHead = p.is_council
+        ? `<span style="background:#f3eeff;color:#8b5cf6;padding:1px 7px;border-radius:8px;font-size:9.5px;font-weight:700;letter-spacing:.5px;margin-right:5px">🧠 COUNCIL</span><span style="color:#8b5cf6;font-size:11px;margin-right:4px">${{(p.council_personas || []).join(' ')}}</span>`
+        : '';
       return `
         <div class="tom-item" onclick="restorePinnedConversation('${{escHtml(p.pin_id)}}')" style="cursor:pointer">
           <div class="tom-item-main">
-            <div style="font-weight:600;font-size:12.5px;margin-bottom:3px">${{escHtml(p.title)}}</div>
+            <div style="font-weight:600;font-size:12.5px;margin-bottom:3px">${{councilHead}}${{escHtml(p.title)}}</div>
             ${{p.assistant_snippet ? `<div class="tom-item-aux" style="font-style:italic;color:#666;line-height:1.45">${{escHtml(p.assistant_snippet.slice(0, 200))}}${{p.assistant_snippet.length > 200 ? '…' : ''}}</div>` : ''}}
             <div class="tom-item-aux" style="margin-top:5px;color:#aaa">📌 ${{ageStr}} · click to resume →</div>
           </div>

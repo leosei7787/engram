@@ -237,6 +237,12 @@ class DeepWorkConfig:
     specialist_model: str  = "claude-haiku-4-5"
     routing_model:    str  = "claude-haiku-4-5"
     synthesis_model:  str  = "claude-sonnet-4-5"
+    # Council runtime knobs (used by the deep-think endpoint, separate from
+    # the legacy deep_work team.py runner which always uses the SDK).
+    mode:             str  = "cli"   # "cli" → subprocess claude, "sdk" → Anthropic SDK
+    cross_read:       bool = True    # after phase-1, give each persona the others'
+                                      # takes and ask for a revised stance
+    max_per_day:      int  = 20      # soft cap; the endpoint refuses past this
     specialists:      dict = field(default_factory=lambda: {
         "contrarian": {"enabled": True, "label": "Contrarian", "icon": "😈", "color": "#ef4444"},
         "cfo":        {"enabled": True, "label": "CFO",         "icon": "💰", "color": "#10b981"},
@@ -510,6 +516,9 @@ def _build_config(raw: dict) -> EngramConfig:
         specialist_model = str(dw_raw.get("specialist_model",  cfg.models.haiku)),
         routing_model    = str(dw_raw.get("routing_model",     cfg.models.haiku)),
         synthesis_model  = str(dw_raw.get("synthesis_model",   cfg.models.primary)),
+        mode             = str(dw_raw.get("mode",        cfg.deep_work.mode)).lower(),
+        cross_read       = bool(dw_raw.get("cross_read", cfg.deep_work.cross_read)),
+        max_per_day      = int(dw_raw.get("max_per_day", cfg.deep_work.max_per_day)),
         specialists      = specialists,
     )
 

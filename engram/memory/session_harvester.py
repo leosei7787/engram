@@ -49,8 +49,19 @@ def _safe_id(session_id: str) -> str:
 
 
 def _session_file(memory_path: Path, session_id: str) -> Path:
-    month_dir = memory_path / "sessions" / datetime.now().strftime("%Y-%m")
-    return month_dir / f"chat_{_safe_id(session_id)}.md"
+    # If this session already has a file in an older month dir (started before
+    # midnight at a month boundary, or being looked up days later), keep using
+    # it. Otherwise default to the current month. Without this, pin/restore on
+    # a previous-month session looks up an empty file and silently fails with
+    # "turn_index out of range".
+    safe_id = _safe_id(session_id)
+    sessions_root = memory_path / "sessions"
+    if sessions_root.exists():
+        existing = list(sessions_root.glob(f"*/chat_{safe_id}.md"))
+        if existing:
+            return max(existing, key=lambda p: p.stat().st_mtime)
+    month_dir = sessions_root / datetime.now().strftime("%Y-%m")
+    return month_dir / f"chat_{safe_id}.md"
 
 
 def log_turn(
