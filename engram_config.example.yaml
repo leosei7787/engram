@@ -356,6 +356,16 @@ deep_work:
   routing_model:    "claude-haiku-4-5"    # model for routing decision
   synthesis_model:  "claude-sonnet-4-5"   # model for final synthesis
 
+  # Council mode (the /think deep-think runner — separate from the legacy
+  # team.py path, which always uses the Anthropic SDK).
+  mode:        "cli"   # "cli" → subprocess claude (uses your logged-in account,
+                       #          no API key needed), "sdk" → Anthropic SDK
+  cross_read:  true    # after personas form their first take, give each one
+                       # the others' takes and ask for a revised stance.
+                       # Set false to skip the second pass (cheaper + faster,
+                       # less interaction quality).
+  max_per_day: 20      # soft cap on /think calls per day; endpoint refuses past this
+
   specialists:
     contrarian:
       enabled: true
