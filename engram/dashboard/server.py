@@ -180,8 +180,15 @@ def _start_watcher(cfg: EngramConfig):
         original_size  = len(content)
 
         ext = path.suffix.lower()
-        if ext == ".pdf":
-            copy_original = False   # source is binary; content is pypdf-extracted text
+        # Binary-extracted formats: source is binary, ``content`` is already
+        # the extracted text from the watcher's _read_file. Don't copy the
+        # binary — write the extracted text as a .md.
+        _BINARY_EXTRACTED = {
+            ".pdf", ".docx", ".pptx", ".xlsx",
+            ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".gif", ".bmp", ".webp",
+        }
+        if ext in _BINARY_EXTRACTED:
+            copy_original = False
 
         # Apply cleaner for email-shaped formats
         if ext in (".eml", ".html", ".htm", ".md") and "<html" in content.lower()[:8000] \
@@ -225,7 +232,8 @@ def _start_watcher(cfg: EngramConfig):
             except Exception:
                 src_mtime = None
             if shape == "email":
-                stem = _email_fn(cleaned_md, source_name=path.name, mtime=src_mtime)
+                stem = _email_fn(cleaned_md, source_name=path.name, mtime=src_mtime,
+                                 user_name=cfg.identity.user_name or "")
             elif shape == "slack":
                 stem = _slack_fn(cleaned_md, source_name=path.name, mtime=src_mtime)
             else:
@@ -239,7 +247,12 @@ def _start_watcher(cfg: EngramConfig):
         else:
             safe_name = re.sub(r"[^\w.\-]", "_", path.name)[:120]
             if not copy_original:
-                safe_name = re.sub(r"\.(eml|html?|txt|pdf)$", ".md", safe_name, flags=re.IGNORECASE)
+                # Strip the source binary extension so we don't get foo.docx.md;
+                # all binary-extracted formats become .md after extraction.
+                safe_name = re.sub(
+                    r"\.(eml|html?|txt|pdf|docx|pptx|xlsx|png|jpe?g|tiff?|gif|bmp|webp)$",
+                    ".md", safe_name, flags=re.IGNORECASE,
+                )
                 if not safe_name.endswith(".md"):
                     safe_name += ".md"
         dest = dest_dir / safe_name
@@ -308,13 +321,23 @@ def _start_watcher(cfg: EngramConfig):
             print(f"[watcher] copy error: {e}", flush=True)
             return False
 
+    # Office docs + images are extracted via engram.ingest.extractors
+    # (python-docx, python-pptx, openpyxl, Anthropic vision SDK). Audio/video
+    # extensions are deliberately omitted — no transcription available.
     _watcher = InboxWatcher(
         inbox_path       = inbox_path,
         memory_path      = cfg.memory_path,
         claude_bin       = str(cfg.paths.claude_bin) if cfg.paths.claude_bin else None,
         model            = cfg.models.haiku,
         interval_seconds = 60,
-        extensions       = {".md", ".txt", ".eml", ".vtt", ".html", ".pdf"},
+        extensions       = {
+            # text-shaped
+            ".md", ".txt", ".eml", ".vtt", ".html", ".htm",
+            # binary text containers
+            ".pdf", ".docx", ".pptx", ".xlsx",
+            # images (vision-extracted when ANTHROPIC_API_KEY is set)
+            ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".gif", ".bmp", ".webp",
+        },
         on_new_file      = _ingest,
     )
 
