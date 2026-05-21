@@ -180,8 +180,15 @@ def _start_watcher(cfg: EngramConfig):
         original_size  = len(content)
 
         ext = path.suffix.lower()
-        if ext == ".pdf":
-            copy_original = False   # source is binary; content is pypdf-extracted text
+        # Binary-extracted formats: source is binary, ``content`` is already
+        # the extracted text from the watcher's _read_file. Don't copy the
+        # binary — write the extracted text as a .md.
+        _BINARY_EXTRACTED = {
+            ".pdf", ".docx", ".pptx", ".xlsx",
+            ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".gif", ".bmp", ".webp",
+        }
+        if ext in _BINARY_EXTRACTED:
+            copy_original = False
 
         # Apply cleaner for email-shaped formats
         if ext in (".eml", ".html", ".htm", ".md") and "<html" in content.lower()[:8000] \
@@ -205,6 +212,46 @@ def _start_watcher(cfg: EngramConfig):
                 cleaned_md = res.to_markdown()
                 copy_original = False
 
+        # ── Cross-batch dedupe ───────────────────────────────────────────────
+        # PA's 30-min overlapping window means most emails arrive twice (once
+        # per consecutive run). We fingerprint each email's *content* — inner
+        # From + Subject + body slice, ignoring run-time timestamps — and skip
+        # writes when the same fingerprint was seen in a previous run.
+        # State lives at MEMORY/.ingested_email_fingerprints.json.
+        if not copy_original:
+            try:
+                from engram.ingest.dedup import filter_new_content, compact_state
+                deduped, dinfo = filter_new_content(
+                    content     = cleaned_md,
+                    source_name = path.name,
+                    memory_path = cfg.memory_path,
+                )
+                if dinfo.get("all_duplicate"):
+                    _watcher_status.setdefault("duped", 0)
+                    _watcher_status["duped"] += 1
+                    print(
+                        f"[watcher] dedupe: skipping {path.name} — "
+                        f"{dinfo['blocks_dupe']} block(s) all duplicate "
+                        f"(seen in previous PA run)",
+                        flush=True,
+                    )
+                    return True   # mark seen, archive — content already in MEMORY
+                if dinfo.get("blocks_dupe"):
+                    print(
+                        f"[watcher] dedupe: {path.name} — keeping "
+                        f"{dinfo['blocks_new']} new block(s), dropping "
+                        f"{dinfo['blocks_dupe']} duplicate(s)",
+                        flush=True,
+                    )
+                    cleaned_md = deduped
+                # Keep the fingerprint state file from growing unbounded.
+                # 5000 entries ≈ a few months of emails on this workload.
+                compact_state(cfg.memory_path, max_entries=5000)
+            except Exception:
+                # Dedup failure must NOT block ingestion — log and proceed.
+                print("[watcher] dedupe error (proceeding without):\n"
+                      + traceback.format_exc(), flush=True)
+
         dest_dir = cfg.memory_path / "daily" / "emails"
         dest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -225,7 +272,8 @@ def _start_watcher(cfg: EngramConfig):
             except Exception:
                 src_mtime = None
             if shape == "email":
-                stem = _email_fn(cleaned_md, source_name=path.name, mtime=src_mtime)
+                stem = _email_fn(cleaned_md, source_name=path.name, mtime=src_mtime,
+                                 user_name=cfg.identity.user_name or "")
             elif shape == "slack":
                 stem = _slack_fn(cleaned_md, source_name=path.name, mtime=src_mtime)
             else:
@@ -239,7 +287,12 @@ def _start_watcher(cfg: EngramConfig):
         else:
             safe_name = re.sub(r"[^\w.\-]", "_", path.name)[:120]
             if not copy_original:
-                safe_name = re.sub(r"\.(eml|html?|txt|pdf)$", ".md", safe_name, flags=re.IGNORECASE)
+                # Strip the source binary extension so we don't get foo.docx.md;
+                # all binary-extracted formats become .md after extraction.
+                safe_name = re.sub(
+                    r"\.(eml|html?|txt|pdf|docx|pptx|xlsx|png|jpe?g|tiff?|gif|bmp|webp)$",
+                    ".md", safe_name, flags=re.IGNORECASE,
+                )
                 if not safe_name.endswith(".md"):
                     safe_name += ".md"
         dest = dest_dir / safe_name
@@ -308,13 +361,23 @@ def _start_watcher(cfg: EngramConfig):
             print(f"[watcher] copy error: {e}", flush=True)
             return False
 
+    # Office docs + images are extracted via engram.ingest.extractors
+    # (python-docx, python-pptx, openpyxl, Anthropic vision SDK). Audio/video
+    # extensions are deliberately omitted — no transcription available.
     _watcher = InboxWatcher(
         inbox_path       = inbox_path,
         memory_path      = cfg.memory_path,
         claude_bin       = str(cfg.paths.claude_bin) if cfg.paths.claude_bin else None,
         model            = cfg.models.haiku,
         interval_seconds = 60,
-        extensions       = {".md", ".txt", ".eml", ".vtt", ".html", ".pdf"},
+        extensions       = {
+            # text-shaped
+            ".md", ".txt", ".eml", ".vtt", ".html", ".htm",
+            # binary text containers
+            ".pdf", ".docx", ".pptx", ".xlsx",
+            # images (vision-extracted when ANTHROPIC_API_KEY is set)
+            ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".gif", ".bmp", ".webp",
+        },
         on_new_file      = _ingest,
     )
 

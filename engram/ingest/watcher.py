@@ -180,19 +180,47 @@ class InboxWatcher:
     # ── File reading ──────────────────────────────────────────────────────────
 
     def _read_file(self, path: Path) -> str:
-        """Return the text content of a file. PDFs are extracted via pypdf."""
-        if path.suffix.lower() != ".pdf":
-            return path.read_text(errors="ignore")
+        """Return the text content of a file. Dispatches by extension:
+
+          - text-shaped (.md, .txt, .eml, .vtt, .html, .htm) → raw read
+          - .pdf  → pypdf
+          - .docx, .pptx, .xlsx → engram.ingest.extractors
+          - images (.png, .jpg, .jpeg, .tiff, .gif, .bmp, .webp) → Anthropic
+            vision via the SDK (requires ANTHROPIC_API_KEY; otherwise returns
+            "" and the watcher silently treats the file as a placeholder).
+
+        Returns "" for unrecognised extensions or extractor failures — the
+        caller's <200 char check skips placeholders on the writeback side.
+        """
+        ext = path.suffix.lower()
+        # Plain text — original fast path
+        if ext in (".md", ".txt", ".eml", ".vtt", ".html", ".htm", ""):
+            try:
+                return path.read_text(errors="ignore")
+            except Exception as e:
+                self._log(f"  ⚠ read error for {path.name}: {e}")
+                return ""
+        if ext == ".pdf":
+            try:
+                import pypdf
+                reader = pypdf.PdfReader(str(path))
+                pages = [page.extract_text() or "" for page in reader.pages]
+                text = "\n\n".join(pages).strip()
+                if not text:
+                    self._log(f"  ⚠ no text extracted from PDF (scanned image?): {path.name}")
+                return text
+            except Exception as e:
+                self._log(f"  ⚠ PDF read error for {path.name}: {e}")
+                return ""
+        # Office docs + images — single dispatch through the extractors module.
         try:
-            import pypdf  # lazy import — only needed for PDFs
-            reader = pypdf.PdfReader(str(path))
-            pages = [page.extract_text() or "" for page in reader.pages]
-            text = "\n\n".join(pages).strip()
+            from engram.ingest.extractors import extract as _extract
+            text = _extract(path)
             if not text:
-                self._log(f"  ⚠ no text extracted from PDF (scanned image?): {path.name}")
+                self._log(f"  ⚠ no text extracted from {ext} file: {path.name}")
             return text
         except Exception as e:
-            self._log(f"  ⚠ PDF read error for {path.name}: {e}")
+            self._log(f"  ⚠ extractor error for {path.name}: {e}")
             return ""
 
     # ── Scan ─────────────────────────────────────────────────────────────────

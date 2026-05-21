@@ -53,7 +53,8 @@ def _resolve_memory_path() -> Path:
     return Path(cfg.memory_path)
 
 
-def backfill_emails_and_slack(*, memory_path: Path, days: int, dry_run: bool) -> dict:
+def backfill_emails_and_slack(*, memory_path: Path, days: int, dry_run: bool,
+                              user_name: str = "") -> dict:
     emails_dir = memory_path / "daily" / "emails"
     if not emails_dir.exists():
         print(f"  ! emails dir not found: {emails_dir}", file=sys.stderr)
@@ -72,14 +73,17 @@ def backfill_emails_and_slack(*, memory_path: Path, days: int, dry_run: bool) ->
                 continue
         except Exception:
             continue
-        # Already descriptive — skip
-        if fp.name.startswith("email_") or fp.name.startswith("slack_"):
+        # Re-process older descriptive filenames that don't yet include the
+        # __topics_ segment (introduced after the first backfill). New files
+        # already containing __topics_ are skipped — idempotent on re-runs.
+        if fp.name.startswith(("email_", "slack_")) and "__topics_" in fp.name:
             continue
 
         text = fp.read_text(errors="ignore")[:30000]
         shape = detect_shape(fp.name, text[:3000])
         if shape == "email":
-            stem = email_filename(text, source_name=fp.name, mtime=fp.stat().st_mtime)
+            stem = email_filename(text, source_name=fp.name, mtime=fp.stat().st_mtime,
+                                  user_name=user_name)
             kind = "email"
         elif shape == "slack":
             stem = slack_filename(text, source_name=fp.name, mtime=fp.stat().st_mtime)
@@ -160,7 +164,12 @@ def main() -> int:
     print(f"window     : last {args.days} days")
     print()
 
-    s = backfill_emails_and_slack(memory_path=memory_path, days=args.days, dry_run=args.dry_run)
+    # Pull the user_name from config so topic extraction can filter self-mentions
+    from engram.retrieval.config import load_config  # noqa: E402
+    cfg = load_config()
+    user_name = cfg.identity.user_name or ""
+    s = backfill_emails_and_slack(memory_path=memory_path, days=args.days,
+                                  dry_run=args.dry_run, user_name=user_name)
     print(f"emails renamed     : {s['emails_renamed']}")
     print(f"slack renamed      : {s['slack_renamed']}")
     print(f"skipped (exists)   : {s['skipped_existing']}")

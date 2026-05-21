@@ -58,8 +58,111 @@ _EMAIL_HASH_SUBJ  = re.compile(r"^-+##\s*(.+?)$",                  re.MULTILINE)
 _EMAIL_FROM_RX    = re.compile(r"^\*\*From:\*\*\s*(.+?)$",         re.MULTILINE)
 
 
-def parse_email_metadata(text: str) -> dict:
-    """Return {subject, from_email, from_name}. Best-effort; never raises."""
+# Topic extraction — pulls high-signal tokens out of the email body so they
+# end up in the filename stem (where the keyword scanner weights them 3×).
+# Catches the case where the OUTER subject is dull ("X wants to access Y") but
+# the email body contains relevant program / account / project names.
+#
+# Sources of topic tokens, in order:
+#   1. **Bold headings** at the start of bulleted sections — Markdown bullet
+#      list items often look like `**TopicName**: ...` after the cleaner runs.
+#   2. Comma-separated capitalized lists inside parentheses, e.g.
+#      `Customer Programs (R2, Foxtron, JLR)` — common in exec summary emails.
+#   3. Capitalised proper-noun-shaped tokens that are frequent and not
+#      already present in subject/from.
+
+_BOLD_HEAD_RX    = re.compile(r"\*\*([A-Z][A-Za-z0-9 &/'\-]{2,40})\*\*\s*[:.]")
+_PAREN_LIST_RX   = re.compile(r"\(([A-Z][\w\s,&/'\-]{4,80})\)")
+_PROPER_NOUN_RX  = re.compile(r"\b([A-Z][a-zA-Z0-9]{2,20}(?:\s+[A-Z][a-zA-Z0-9]{2,20}){0,2})\b")
+
+# Words to drop from topics — common English words that fit the proper-noun
+# regex but carry no retrieval signal, plus generic email-template terms.
+_TOPIC_STOPWORDS = {
+    "Hi", "Hello", "Thanks", "Thank", "Dear", "Regards", "Best", "Kind",
+    "Re", "Fwd", "Fw", "Subject", "From", "To", "Cc", "Bcc",
+    "May", "June", "July", "August", "September", "October", "November", "December",
+    "January", "February", "March", "April",
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    "AM", "PM", "CEST", "CET", "PST", "EST", "UTC",
+    "Status", "Update", "Updates", "Review", "Meeting", "Call", "Recording",
+    "Microsoft", "Teams", "Outlook", "Office", "SharePoint", "OneDrive",
+    "Link", "Document", "Pptx", "Docx", "Pdf",
+    "Privacy", "Statement", "Notification", "Confidential",
+}
+
+
+def parse_email_topics(text: str, *, exclude: tuple[str, ...] = (), max_topics: int = 5,
+                       user_name_parts: tuple[str, ...] = ()) -> list[str]:
+    """Return up to ``max_topics`` high-signal topic tokens from the body.
+
+    ``exclude`` is a list of already-known tokens (e.g. words from the
+    subject + sender) to suppress duplication in the final filename.
+    ``user_name_parts`` filters out the dashboard user's own name from
+    topic extraction (their name appears in nearly every email — zero signal).
+    """
+    exclude_lower = {e.lower() for e in exclude}
+    user_lower    = {p.lower() for p in user_name_parts if p}
+
+    candidates: list[str] = []
+    # Pass 1: bold section headings — highest signal (the cleaner preserves
+    # the **TopicName** pattern from forwarded messages).
+    for m in _BOLD_HEAD_RX.finditer(text):
+        candidates.append(m.group(1).strip())
+
+    # Pass 2: parenthetical comma-separated lists like "(R2, Foxtron, JLR)"
+    for m in _PAREN_LIST_RX.finditer(text):
+        for piece in m.group(1).split(","):
+            piece = piece.strip()
+            if piece and piece[0].isupper():
+                candidates.append(piece)
+
+    # Pass 3: proper-noun tokens by frequency (last-resort, lower confidence)
+    proper_counts = Counter()
+    for m in _PROPER_NOUN_RX.finditer(text[:12000]):
+        tok = m.group(1).strip()
+        first_word = tok.split()[0]
+        if first_word in _TOPIC_STOPWORDS:
+            continue
+        if first_word.lower() in exclude_lower:
+            continue
+        proper_counts[tok] += 1
+    # Only include proper nouns that appear at least twice — single-mention
+    # noise (e.g. footer copyright lines) is too noisy.
+    candidates.extend(tok for tok, n in proper_counts.most_common(20) if n >= 2)
+
+    # Dedupe (case-insensitive) and filter
+    seen_lower: set = set()
+    out: list[str] = []
+    for c in candidates:
+        c_clean = re.sub(r"\s+", " ", c).strip()
+        if not c_clean or c_clean.lower() in seen_lower:
+            continue
+        if c_clean.lower() in exclude_lower:
+            continue
+        if c_clean.split()[0] in _TOPIC_STOPWORDS:
+            continue
+        # Filter the user's own name (every email mentions them — zero signal)
+        if any(p in c_clean.lower().split() for p in user_lower):
+            continue
+        # Filter very long compound phrases — they bloat the filename
+        if len(c_clean) > 40:
+            continue
+        seen_lower.add(c_clean.lower())
+        out.append(c_clean)
+        if len(out) >= max_topics:
+            break
+    return out
+
+
+def parse_email_metadata(text: str, *, user_name: str = "") -> dict:
+    """Return {subject, from_email, from_name, topics}. Best-effort; never raises.
+
+    ``topics`` is a list of body-extracted high-signal tokens — included in
+    the filename so retrieval can find emails that mention an entity only in
+    the body (not in subject or sender). ``user_name`` (e.g. the user's
+    full name from config) is used to suppress self-mentions from topic
+    extraction so the user's own name doesn't pollute every email's topics.
+    """
     subject = ""
     m = _EMAIL_SUBJECT_RX.search(text)
     if m:
@@ -76,16 +179,32 @@ def parse_email_metadata(text: str) -> dict:
         from_email = m.group(1).strip()
         from_name  = _person_name_from_email(from_email)
 
-    return {"subject": subject, "from_email": from_email, "from_name": from_name}
+    # Suppress topics already present in subject / sender so we don't waste
+    # filename budget repeating tokens that already get matched.
+    exclude = []
+    if subject:
+        exclude.extend(re.findall(r"[A-Za-z]+", subject))
+    if from_name:
+        exclude.extend(from_name.split("_"))
+    user_parts = tuple(p for p in (user_name or "").split() if p)
+    topics = parse_email_topics(text, exclude=tuple(exclude), user_name_parts=user_parts)
+
+    return {"subject": subject, "from_email": from_email, "from_name": from_name,
+            "topics": topics}
 
 
-def email_filename(text: str, *, source_name: str = "", mtime: Optional[float] = None) -> str:
+def email_filename(text: str, *, source_name: str = "", mtime: Optional[float] = None,
+                   user_name: str = "") -> str:
     """Descriptive stem for an email file (no extension).
 
-    Pattern: ``email_<YYYY-MM-DD>__<subject>__from_<sender>``
-    Falls back to date-only if the body has no usable metadata.
+    Pattern: ``email_<YYYY-MM-DD>__<subject>__topics_<X>_<Y>__from_<sender>``
+    The ``topics`` segment is omitted when no body-extracted tokens are found.
+    Falls back to date-only if the body has no usable metadata at all.
+
+    ``user_name`` is passed through to topic extraction so the dashboard
+    user's own name (which appears in nearly every email) gets filtered.
     """
-    meta = parse_email_metadata(text)
+    meta = parse_email_metadata(text, user_name=user_name)
     # Prefer date embedded in source name (matches the email's send date when
     # the source is a Recent_email_<ISO> file); fall back to mtime.
     date_part = ""
@@ -96,9 +215,16 @@ def email_filename(text: str, *, source_name: str = "", mtime: Optional[float] =
     if not date_part:
         date_part = _date_from_mtime(mtime)
 
-    subj   = slugify(meta["subject"], max_len=70) if meta["subject"] else "no_subject"
+    subj   = slugify(meta["subject"], max_len=60) if meta["subject"] else "no_subject"
     sender = meta["from_name"] or "unknown"
-    return f"email_{date_part}__{subj}__from_{sender}"
+    topics_seg = ""
+    if meta["topics"]:
+        # Keep each topic short, cap the whole segment so the filename stays
+        # under filesystem limits (~255 chars on most FS).
+        topic_slugs = [slugify(t, max_len=20) for t in meta["topics"][:5] if slugify(t, max_len=20)]
+        if topic_slugs:
+            topics_seg = "__topics_" + "_".join(topic_slugs[:5])
+    return f"email_{date_part}__{subj}{topics_seg}__from_{sender}"
 
 
 # ─── Slack ────────────────────────────────────────────────────────────────────
