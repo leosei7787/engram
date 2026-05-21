@@ -46,10 +46,16 @@ def add_proposals(
     *,
     source: str,
     harvest_filename: Optional[str] = None,
+    initial_status: str = "pending",
 ) -> int:
     """
     Add new proposals to the index. Marks any prior pending proposals
     touching the same canonical path as 'superseded'.
+
+    ``initial_status`` controls the starting status of the new rows. Default
+    is ``"pending"`` (classic review-queue flow). Callers that already wrote
+    the content into a memory file should pass ``"applied"`` — the row then
+    serves purely as an audit trail of what was auto-captured.
     """
     idx = load_index(path)
 
@@ -62,6 +68,7 @@ def add_proposals(
             prev["status"] = "superseded"
             prev["superseded_at"] = _now()
 
+    now_ts = _now()
     added = 0
     for it in items:
         uid = it.get("uid") or f"prop_{uuid.uuid4().hex[:10]}"
@@ -71,17 +78,24 @@ def add_proposals(
             continue
         # Compute a quick salience score for ranking
         sal = compute_proposal_salience(it)
-        idx.append({
+        row = {
             "uid":       uid,
-            "ts":        _now(),
+            "ts":        now_ts,
             "path":      it.get("path"),
             "operation": it.get("operation", "update"),
             "reason":    it.get("reason", "")[:300],
             "source":    source,
             "harvest_filename": harvest_filename,
             "salience":  sal,
-            "status":    "pending",
-        })
+            "status":    initial_status,
+        }
+        # Stamp the *_at field that matches the initial status, so audit
+        # queries that look for "applied_at" / "saved_at" find it.
+        if initial_status and initial_status != "pending":
+            row[f"{initial_status}_at"] = now_ts
+        if it.get("applied_path"):
+            row["applied_path"] = it["applied_path"]
+        idx.append(row)
         added += 1
     save_index(path, idx)
     return added

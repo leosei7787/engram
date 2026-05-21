@@ -228,6 +228,70 @@ def format_agenda(events: list[Event], *, days_ahead: int = 14, max_events: int 
     return "\n".join(lines)
 
 
+# ─── Explode to per-event files ──────────────────────────────────────────────
+# The retrieval keyword scan can only surface what has a real searchable stem.
+# One big calendar.ics carries zero per-event signal, so the curator can never
+# return "the meeting with Miguel next Tuesday." Exploding into individual
+# markdown files (one per non-cancelled event in a window) gives every meeting
+# its own findable entity.
+
+def explode_to_files(
+    ics_path: Path | str,
+    *,
+    memory_path: Path,
+    days_back:    int = 7,
+    days_ahead:   int = 30,
+) -> dict:
+    """Write each non-cancelled event in the window to a standalone markdown
+    file under ``memory_path/calendar/<YYYY-MM>/<stem>.md``.
+
+    Idempotent: stem includes start-date + summary + top participants, so a
+    re-run produces the same filename and overwrites with current state.
+    Cancelled events are removed if they were written previously.
+
+    Returns ``{"written": int, "skipped_cancelled": int, "skipped_out_of_window": int}``.
+    """
+    from engram.ingest.metadata import ics_event_filename, ics_event_markdown
+
+    events = parse_ics(ics_path)
+    if not events:
+        return {"written": 0, "skipped_cancelled": 0, "skipped_out_of_window": 0}
+
+    now = datetime.now(timezone.utc)
+    lo  = now - timedelta(days=days_back)
+    hi  = now + timedelta(days=days_ahead)
+
+    out_root = Path(memory_path) / "calendar"
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    skipped_cancelled = 0
+    out_of_window = 0
+    for ev in events:
+        if ev.is_cancelled:
+            skipped_cancelled += 1
+            continue
+        if ev.start < lo or ev.start > hi:
+            out_of_window += 1
+            continue
+        stem = ics_event_filename(ev)
+        if not stem:
+            continue
+        month_dir = out_root / ev.start.strftime("%Y-%m")
+        month_dir.mkdir(parents=True, exist_ok=True)
+        fp = month_dir / f"{stem}.md"
+        try:
+            fp.write_text(ics_event_markdown(ev), encoding="utf-8")
+            written += 1
+        except Exception as e:
+            print(f"[ics] write error for {fp.name}: {e}", flush=True)
+    return {
+        "written":              written,
+        "skipped_cancelled":    skipped_cancelled,
+        "skipped_out_of_window": out_of_window,
+    }
+
+
 # ─── CLI for testing ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys

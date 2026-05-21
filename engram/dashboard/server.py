@@ -207,12 +207,48 @@ def _start_watcher(cfg: EngramConfig):
 
         dest_dir = cfg.memory_path / "daily" / "emails"
         dest_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = re.sub(r"[^\w.\-]", "_", path.name)[:120]
-        if not copy_original:
-            safe_name = re.sub(r"\.(eml|html?|txt|pdf)$", ".md", safe_name, flags=re.IGNORECASE)
-            if not safe_name.endswith(".md"):
-                safe_name += ".md"
+
+        # Try to derive a SEMANTIC filename from the cleaned content via the
+        # shared metadata builder. Falls back to the sanitised source name
+        # when the file doesn't look like an email/slack (the keyword scanner
+        # needs real tokens in the filename — generic `Recent_email_<ts>.md`
+        # carries zero searchable signal).
+        try:
+            from engram.ingest.metadata import (
+                detect_shape,
+                email_filename as _email_fn,
+                slack_filename as _slack_fn,
+            )
+            shape = detect_shape(path.name, cleaned_md[:3000])
+            try:
+                src_mtime = path.stat().st_mtime
+            except Exception:
+                src_mtime = None
+            if shape == "email":
+                stem = _email_fn(cleaned_md, source_name=path.name, mtime=src_mtime)
+            elif shape == "slack":
+                stem = _slack_fn(cleaned_md, source_name=path.name, mtime=src_mtime)
+            else:
+                stem = ""
+        except Exception as e:
+            print(f"[watcher] metadata extract failed for {path.name}: {e}", flush=True)
+            stem = ""
+
+        if stem:
+            safe_name = stem[:200] + ".md"
+        else:
+            safe_name = re.sub(r"[^\w.\-]", "_", path.name)[:120]
+            if not copy_original:
+                safe_name = re.sub(r"\.(eml|html?|txt|pdf)$", ".md", safe_name, flags=re.IGNORECASE)
+                if not safe_name.endswith(".md"):
+                    safe_name += ".md"
         dest = dest_dir / safe_name
+        # If a file with this exact descriptive name already exists, append a
+        # short hash so we never silently overwrite a prior ingest.
+        if dest.exists():
+            import hashlib as _hl
+            h = _hl.md5(path.name.encode()).hexdigest()[:6]
+            dest = dest.with_name(f"{dest.stem}__{h}{dest.suffix}")
 
         try:
             if copy_original:
@@ -783,6 +819,12 @@ def chat():
         sp = cfg.system_prompt
         if sp.user_tone:
             system_parts.append(f"Tone: {sp.user_tone}")
+
+        # Output-format constraint — keeps answers tight by default; the user
+        # has explicit trigger phrases to lift it when they want a full doc /
+        # deep dive. Configured at cfg.system_prompt.output_style.
+        if sp.output_style:
+            system_parts.append(sp.output_style)
 
         # ── Interruption note ────────────────────────────────────────────────
         # When the previous response was cut off by a new user message, give
@@ -1483,7 +1525,10 @@ def deep_think():
         # retrieval — same logic as ordinary chat turns.
         if transcript_seen and session_id:
             try:
-                from engram.memory.session_harvester import log_turn as _log_turn
+                from engram.memory.session_harvester import (
+                    log_turn as _log_turn,
+                    harvest_in_background as _harvest_bg,
+                )
                 _log_turn(
                     memory_path     = cfg.memory_path,
                     session_id      = session_id,
@@ -1493,8 +1538,22 @@ def deep_think():
                     raw_docs        = [],
                     was_interruption= False,
                 )
+                # Same harvest call /api/chat does — extracts decisions /
+                # commitments / facts / open questions from this turn into
+                # MEMORY/proposals/index.json so the proposals queue picks
+                # them up. Without this, council turns only feed the curator's
+                # keyword scan (via the session .md file) and never reach the
+                # structured proposals pipeline.
+                _harvest_bg(
+                    memory_path    = cfg.memory_path,
+                    session_id     = session_id,
+                    user_msg       = "/think " + query,
+                    assistant_text = transcript_seen.get("conclusion", ""),
+                    user_name      = cfg.identity.user_name or "",
+                    cfg            = cfg,
+                )
             except Exception:
-                print("[council] log_turn failed:\n" + traceback.format_exc(), flush=True)
+                print("[council] log_turn/harvest failed:\n" + traceback.format_exc(), flush=True)
 
         yield "data: [DONE]\n\n"
 
@@ -3198,6 +3257,18 @@ def _run_calendar_refresh(cfg) -> None:
                   f"{gr.get('past_occurrences_attached', 0)} past notes linked", flush=True)
         except Exception:
             print("[calendar] graph write error:\n" + traceback.format_exc(), flush=True)
+        # Stage 3: explode each event into its own markdown file so the
+        # keyword scanner can hit on summary / organiser / attendees. Without
+        # this step the calendar exists only as a JSON signal blob and a
+        # graph, neither of which the curator's filename-stem boost can see.
+        try:
+            from engram.ingest.ics import explode_to_files as _explode_ics
+            ex = _explode_ics(ics, memory_path=cfg.memory_path, days_back=7, days_ahead=30)
+            print(f"[calendar] explode: {ex['written']} per-event files written · "
+                  f"{ex['skipped_cancelled']} cancelled · "
+                  f"{ex['skipped_out_of_window']} out of window", flush=True)
+        except Exception:
+            print("[calendar] explode error:\n" + traceback.format_exc(), flush=True)
     except Exception:
         print("[calendar] refresh error:\n" + traceback.format_exc(), flush=True)
 

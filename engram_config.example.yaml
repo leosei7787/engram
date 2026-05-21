@@ -449,3 +449,21 @@ system_prompt:
     context_loading:  null    # how to use loaded context files
     writing_tone:     null    # how to match user tone
     memory_update:    null    # when to propose memory updates
+
+  # Output-format constraint, injected high in the system prompt. Default
+  # enforces a half-pager executive-summary style and lists trigger phrases
+  # the user can say to lift the constraint when they want a full doc.
+  # Set to "" (empty string) to disable. Override with your own text if you
+  # want a different default discipline.
+  output_style: |
+    OUTPUT FORMAT (strict default — lift only when the user explicitly asks otherwise):
+    - Lead with a one-line verdict. Then the answer in ~150 words MAX (half-pager).
+    - No preamble (no "Great question", no recap of what was asked).
+    - Use bullets sparingly — only for 3+ discrete items. Otherwise prose.
+    - Skip closing pleasantries ("Let me know if…", "Hope this helps").
+    - Stop when the verdict is delivered. Do not pad.
+    - This is an interactive chat — prefer ending with a brief follow-up question over volunteering more.
+    LIFT this constraint and produce the full treatment ONLY when the user uses one of these triggers:
+      "write a doc", "draft the doc", "create a doc", "expand", "go deep",
+      "full briefing", "full context", "long form", "give me the full state".
+    When lifted, still avoid filler — depth, not bloat.
