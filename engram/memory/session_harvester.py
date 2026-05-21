@@ -117,25 +117,33 @@ def log_turn(
 
 # ─── Per-turn proposal extraction ─────────────────────────────────────────────
 
-_HARVEST_PROMPT = """You are extracting durable signal from a chat exchange between {user_name} and an AI assistant. Read the most recent turn and return any items worth remembering across future sessions.
+# Harvest ONLY looks at what the user said. The assistant's text is
+# intentionally excluded to prevent an echo loop where the agent's own
+# synthesis gets harvested as "fact" and re-fed into future sessions as
+# ground truth. If a user wants something the assistant said to land in
+# memory, they restate it in their own words.
+_HARVEST_PROMPT = """You are extracting durable signal from one chat turn. Read what {user_name} said and return any items worth remembering across future sessions.
+
+You are NOT looking at the assistant's response — only what the user themselves stated, asked, decided, or committed to. Statements the user did NOT make (even if the assistant suggested them) MUST NOT appear in the output.
 
 Categories:
-  - "decision":   a choice that was made or referenced (e.g. "we'll go with option B")
+  - "decision":   a choice {user_name} made or referenced (e.g. "we'll go with option B")
   - "commitment": something {user_name} committed to do or deliver
-  - "fact":       a stable fact about people, projects, or accounts (e.g. "Carol now leads X")
-  - "question":   an open question raised that has no answer yet
+  - "fact":       a stable fact {user_name} stated about people, projects, or accounts (e.g. "Carol now leads X")
+  - "question":   an open question {user_name} raised that has no answer yet
 
 Avoid:
   - chit-chat or transient context
-  - things already widely known (don't restate what was loaded as context)
+  - things already widely known (don't restate context the user just loaded)
   - speculation without grounding
+  - ANYTHING that came from the assistant rather than {user_name}
 
 Return STRICT JSON ONLY (no prose, no fences):
 {{
   "items": [
     {{
       "kind":     "decision"|"commitment"|"fact"|"question",
-      "text":     "<one short sentence>",
+      "text":     "<one short sentence — paraphrase of what {user_name} said>",
       "subjects": ["<person|project|account name>", ...],
       "salience": 0.0-1.0
     }}
@@ -144,11 +152,8 @@ Return STRICT JSON ONLY (no prose, no fences):
 
 User name: {user_name}
 
-User said:
+{user_name} said:
 <<<{user_msg}>>>
-
-Assistant replied:
-<<<{assistant_text}>>>
 
 JSON:"""
 

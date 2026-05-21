@@ -274,6 +274,23 @@ class SystemPromptConfig:
     # The most-recently-modified match is auto-loaded every turn.
     calendar_globs:   list = field(default_factory=lambda: ["calendar*.md", "**/calendar*.md"])
     instructions:     dict = field(default_factory=dict)
+    # Output-format enforcement — injected high in the system prompt to keep
+    # responses tight by default. The model self-regulates: when the user
+    # explicitly asks for a doc / deep dive / full briefing, the rule lifts.
+    # Set to "" to disable.
+    output_style:     str  = (
+        "OUTPUT FORMAT (strict default — lift only when the user explicitly asks otherwise):\n"
+        "- Lead with a one-line verdict. Then the answer in ~150 words MAX (half-pager).\n"
+        "- No preamble (no 'Great question', no recap of what was asked).\n"
+        "- Use bullets sparingly — only for 3+ discrete items. Otherwise prose.\n"
+        "- Skip closing pleasantries ('Let me know if…', 'Hope this helps').\n"
+        "- Stop when the verdict is delivered. Do not pad.\n"
+        "- This is an interactive chat — prefer ending with a brief follow-up question over volunteering more.\n"
+        "LIFT this constraint and produce the full treatment ONLY when the user uses one of these triggers:\n"
+        '  "write a doc", "draft the doc", "create a doc", "expand", "go deep", '
+        '"full briefing", "full context", "long form", "give me the full state".\n'
+        "When lifted, still avoid filler — depth, not bloat."
+    )
 
 
 @dataclass
@@ -532,12 +549,20 @@ def _build_config(raw: dict) -> EngramConfig:
 
     # ── system_prompt ──
     sp = raw.get("system_prompt", {})
+    # Fall back to the dataclass default if output_style isn't set or is the
+    # literal null/None — that way we never silently drop the brevity rule.
+    output_style_raw = sp.get("output_style", None)
+    if output_style_raw is None:
+        output_style = cfg.system_prompt.output_style
+    else:
+        output_style = str(output_style_raw)
     cfg.system_prompt = SystemPromptConfig(
         user_description = str(sp.get("user_description", "")),
         user_tone        = str(sp.get("user_tone", "Direct, execution-focused.")),
         always_load      = list(sp.get("always_load", ["CLAUDE.md", "preferences.md"])),
         calendar_globs   = list(sp.get("calendar_globs", ["calendar*.md", "**/calendar*.md"])),
         instructions     = dict(sp.get("instructions", {})),
+        output_style     = output_style,
     )
 
     # ── chat ──
