@@ -212,6 +212,46 @@ def _start_watcher(cfg: EngramConfig):
                 cleaned_md = res.to_markdown()
                 copy_original = False
 
+        # ── Cross-batch dedupe ───────────────────────────────────────────────
+        # PA's 30-min overlapping window means most emails arrive twice (once
+        # per consecutive run). We fingerprint each email's *content* — inner
+        # From + Subject + body slice, ignoring run-time timestamps — and skip
+        # writes when the same fingerprint was seen in a previous run.
+        # State lives at MEMORY/.ingested_email_fingerprints.json.
+        if not copy_original:
+            try:
+                from engram.ingest.dedup import filter_new_content, compact_state
+                deduped, dinfo = filter_new_content(
+                    content     = cleaned_md,
+                    source_name = path.name,
+                    memory_path = cfg.memory_path,
+                )
+                if dinfo.get("all_duplicate"):
+                    _watcher_status.setdefault("duped", 0)
+                    _watcher_status["duped"] += 1
+                    print(
+                        f"[watcher] dedupe: skipping {path.name} — "
+                        f"{dinfo['blocks_dupe']} block(s) all duplicate "
+                        f"(seen in previous PA run)",
+                        flush=True,
+                    )
+                    return True   # mark seen, archive — content already in MEMORY
+                if dinfo.get("blocks_dupe"):
+                    print(
+                        f"[watcher] dedupe: {path.name} — keeping "
+                        f"{dinfo['blocks_new']} new block(s), dropping "
+                        f"{dinfo['blocks_dupe']} duplicate(s)",
+                        flush=True,
+                    )
+                    cleaned_md = deduped
+                # Keep the fingerprint state file from growing unbounded.
+                # 5000 entries ≈ a few months of emails on this workload.
+                compact_state(cfg.memory_path, max_entries=5000)
+            except Exception:
+                # Dedup failure must NOT block ingestion — log and proceed.
+                print("[watcher] dedupe error (proceeding without):\n"
+                      + traceback.format_exc(), flush=True)
+
         dest_dir = cfg.memory_path / "daily" / "emails"
         dest_dir.mkdir(parents=True, exist_ok=True)
 
