@@ -199,15 +199,72 @@ def _call(user: str, *, system: str = "", mode: str, model: str,
     return _cli_call(user, system=system, model=model, cli_bin=cli_bin, timeout=timeout)
 
 
+def _escape_unescaped_newlines_in_strings(text: str) -> str:
+    """Escape CR/LF/Tab characters that sit INSIDE JSON string values.
+
+    LLMs ignore the "no raw control chars inside string literals" rule
+    constantly — they're asked for strict JSON but write multi-paragraph
+    ``conclusion`` fields with literal newlines, which makes ``json.loads``
+    reject the whole blob. A small state machine walks the text, tracks
+    whether we're inside a double-quoted string, and escapes any control
+    char that would otherwise break parsing. Leaves structural whitespace
+    outside strings untouched, respects existing ``\\\\`` escapes.
+    """
+    out: list[str] = []
+    in_string = False
+    escape    = False
+    for c in text:
+        if escape:
+            out.append(c)
+            escape = False
+            continue
+        if c == "\\":
+            out.append(c)
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            out.append(c)
+            continue
+        if in_string:
+            if c == "\n":
+                out.append("\\n");  continue
+            if c == "\r":
+                out.append("\\r");  continue
+            if c == "\t":
+                out.append("\\t");  continue
+        out.append(c)
+    return "".join(out)
+
+
 def _extract_json(raw: str) -> Optional[dict]:
+    """Pull a JSON object out of LLM output.
+
+    Three-stage parse:
+      1. Strip markdown code fences (``` / ```json) and trailing backticks.
+      2. Grab the outermost ``{...}`` block via a DOTALL regex.
+      3. Try ``json.loads`` strictly. If that fails (usually because the
+         LLM wrote literal newlines inside string values), pre-process to
+         escape those chars and retry. Returns ``None`` only if both
+         attempts fail — the council then falls through to the raw-text
+         path, which was being rendered as a JSON dump in the chat bubble.
+    """
     if not raw:
         return None
     cleaned = re.sub(r"```(?:json)?", "", raw).strip().strip("`").strip()
     m = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if not m:
         return None
+    payload = m.group(0)
     try:
-        return json.loads(m.group(0))
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        # Most common LLM mistake: real newlines inside string values.
+        # Escape them and retry — the structural JSON around them is fine.
+        try:
+            return json.loads(_escape_unescaped_newlines_in_strings(payload))
+        except Exception:
+            return None
     except Exception:
         return None
 
