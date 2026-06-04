@@ -10,6 +10,8 @@ account name fragments used for the partner-doc boost is configurable —
 the caller passes a list (typically from cfg.retrieval.priority_accounts)
 or accepts the empty default and gets no boost.
 """
+from __future__ import annotations
+
 import os
 from .schemas import SOURCE_CREDIBILITY
 
