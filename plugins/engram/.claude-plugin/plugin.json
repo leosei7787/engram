@@ -1,0 +1,8 @@
+{
+  "name": "engram",
+  "description": "Tiered search over an engram-data knowledge folder (curated wiki, weighted entity graph, contradictions/open-questions log, raw memory files). Use when a question is answerable from the user's personal/work knowledge base.",
+  "author": {
+    "name": "Leo",
+    "email": "sei7787@gmail.com"
+  }
+}
