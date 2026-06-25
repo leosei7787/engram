@@ -43,3 +43,10 @@ knowledge-base/**
 # is working on, and GitHub's code-search index surfaces every historical
 # blob. Easier rule: don't sync them.
 tests/
+
+# Claude Code internal scratch
+.claude/worktrees/
+
+# Skill eval workspaces — regenerable benchmark runs, can be large.
+# Source skills (SKILL.md, evals/) are tracked; *-workspace/ trees are not.
+.claude/skills/*-workspace/
