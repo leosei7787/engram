@@ -37,6 +37,7 @@ Configuration via engram_config.yaml:
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -179,7 +180,7 @@ class InboxWatcher:
 
     # ── File reading ──────────────────────────────────────────────────────────
 
-    def _read_file(self, path: Path) -> str:
+    def _read_file(self, path: Path) -> Optional[str]:
         """Return the text content of a file. Dispatches by extension:
 
           - text-shaped (.md, .txt, .eml, .vtt, .html, .htm) → raw read
@@ -189,14 +190,26 @@ class InboxWatcher:
             vision via the SDK (requires ANTHROPIC_API_KEY; otherwise returns
             "" and the watcher silently treats the file as a placeholder).
 
-        Returns "" for unrecognised extensions or extractor failures — the
-        caller's <200 char check skips placeholders on the writeback side.
+        Return contract:
+          - str (possibly empty) — the file's extracted content, or an
+            empty string when extraction failed permanently. The caller
+            will treat empty-str the same as a placeholder and archive.
+          - None — the read failed with a *retryable* OSError (e.g.
+            EDEADLK / Errno 11 from OneDrive Files-On-Demand still
+            materialising the file). The caller MUST NOT archive; the
+            file stays in the inbox for the next cycle.
         """
         ext = path.suffix.lower()
         # Plain text — original fast path
         if ext in (".md", ".txt", ".eml", ".vtt", ".html", ".htm", ""):
             try:
                 return path.read_text(errors="ignore")
+            except OSError as e:
+                if e.errno == errno.EDEADLK:
+                    self._log(f"  ⏸ read locked (retry next cycle): {path.name}")
+                    return None
+                self._log(f"  ⚠ read error for {path.name}: {e}")
+                return ""
             except Exception as e:
                 self._log(f"  ⚠ read error for {path.name}: {e}")
                 return ""
@@ -209,6 +222,12 @@ class InboxWatcher:
                 if not text:
                     self._log(f"  ⚠ no text extracted from PDF (scanned image?): {path.name}")
                 return text
+            except OSError as e:
+                if e.errno == errno.EDEADLK:
+                    self._log(f"  ⏸ PDF read locked (retry next cycle): {path.name}")
+                    return None
+                self._log(f"  ⚠ PDF read error for {path.name}: {e}")
+                return ""
             except Exception as e:
                 self._log(f"  ⚠ PDF read error for {path.name}: {e}")
                 return ""
@@ -219,6 +238,12 @@ class InboxWatcher:
             if not text:
                 self._log(f"  ⚠ no text extracted from {ext} file: {path.name}")
             return text
+        except OSError as e:
+            if e.errno == errno.EDEADLK:
+                self._log(f"  ⏸ extractor read locked (retry next cycle): {path.name}")
+                return None
+            self._log(f"  ⚠ extractor error for {path.name}: {e}")
+            return ""
         except Exception as e:
             self._log(f"  ⚠ extractor error for {path.name}: {e}")
             return ""
@@ -250,9 +275,28 @@ class InboxWatcher:
             except ValueError:
                 pass
 
+            # Skip files that are still being written. Two producers race
+            # with our polling: Power Automate drops an empty placeholder
+            # then rewrites with the real content ~seconds later; OneDrive
+            # Files-On-Demand materialises the local copy in stages. Either
+            # way, reading during the write returns empty/partial content.
+            # If mtime is fresh (< 60s), let it settle — the next cycle will
+            # pick it up when it's stable.
+            try:
+                if (time.time() - p.stat().st_mtime) < 60:
+                    continue
+            except OSError:
+                continue
+
             try:
                 content = self._read_file(p)
             except Exception:
+                continue
+
+            # Retryable read failure (e.g. OneDrive still materialising the
+            # file → EDEADLK): leave the file in the inbox, don't archive,
+            # don't touch the seen-registry. Next cycle will retry.
+            if content is None:
                 continue
 
             if not self._registry.is_new(p, content):
