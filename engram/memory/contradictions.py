@@ -15,6 +15,8 @@ Rejected-claims registry:
   let the system reject any future triple that contradicts an established fact
   for a single-valued relation.
 """
+from __future__ import annotations
+
 import json
 import re
 import uuid
