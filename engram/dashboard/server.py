@@ -186,6 +186,10 @@ def _start_watcher(cfg: EngramConfig):
         _BINARY_EXTRACTED = {
             ".pdf", ".docx", ".pptx", ".xlsx",
             ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".gif", ".bmp", ".webp",
+            # Structured text — extractor produces a cleaner markdown view
+            # (typed table for csv, per-event agenda for ics) than the raw
+            # source. Prefer the extracted markdown for retrieval.
+            ".csv", ".ics",
         }
         if ext in _BINARY_EXTRACTED:
             copy_original = False
