@@ -490,7 +490,13 @@ def write_meetings_to_graph(*, memory_path: Path, signals: dict) -> dict:
     """
     events = [e for e in (signals.get("events") or []) if e.get("is_high_stakes") and not e.get("is_cancelled")]
     if not events:
-        return {"meetings_added": 0, "edges_added": 0, "skipped_unresolved": 0}
+        return {
+            "meetings_added":       0,
+            "edges_added":          0,
+            "skipped_unresolved":   0,
+            "old_meetings_purged":  0,
+            "past_occurrences_attached": 0,
+        }
 
     with _graph_lock:
         g = _load_graph(memory_path)
