@@ -375,6 +375,8 @@ def _start_watcher(cfg: EngramConfig):
             ".md", ".txt", ".eml", ".vtt", ".html", ".htm",
             # binary text containers
             ".pdf", ".docx", ".pptx", ".xlsx",
+            # structured text (converted to markdown via extractors)
+            ".csv", ".ics",
             # images (vision-extracted when ANTHROPIC_API_KEY is set)
             ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".gif", ".bmp", ".webp",
         },
