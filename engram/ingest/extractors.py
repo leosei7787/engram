@@ -241,6 +241,107 @@ def extract_image(path: Path, *, model: str = "claude-haiku-4-5",
     return out.strip()
 
 
+# ─── .csv ─────────────────────────────────────────────────────────────────────
+
+def extract_csv(path: Path, *, max_rows: int = 500) -> str:
+    """Extract a .csv file as a markdown table.
+
+    Mirrors extract_xlsx's contract: caps rows to keep chat-context budgets
+    sane (most opportunity/pipeline exports are <500 rows; bigger ones tend
+    to be raw dumps where row 500+ rarely adds signal). Auto-detects the
+    dialect (delimiter, quoting) via csv.Sniffer.
+    """
+    import csv as _csv
+    try:
+        # Read as text with best-effort encoding fallback — Salesforce exports
+        # sometimes come as UTF-8-BOM or Windows-1252.
+        raw = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        print(f"[extractors] csv open failed for {path.name}:\n" + traceback.format_exc(), flush=True)
+        return ""
+    if not raw.strip():
+        return ""
+    # Sniff dialect from a sizable header sample; fall back to comma.
+    sample = raw[:8192]
+    try:
+        dialect = _csv.Sniffer().sniff(sample, delimiters=",;\t|")
+    except _csv.Error:
+        dialect = _csv.excel
+    reader = _csv.reader(raw.splitlines(), dialect)
+    rows_out: list[str] = []
+    header: Optional[list[str]] = None
+    for i, row in enumerate(reader):
+        if i >= max_rows:
+            rows_out.append(f"_(truncated at {max_rows} rows)_")
+            break
+        cells = ["" if c is None else str(c).strip() for c in row]
+        line = " | ".join(cells)
+        if not line.replace("|", "").strip():
+            continue
+        rows_out.append(line)
+        if i == 0 and header is None:
+            header = cells
+            rows_out.append(" | ".join(["---"] * len(cells)))
+    if not rows_out:
+        return ""
+    return f"# {path.stem}\n\n" + "\n".join(rows_out)
+
+
+# ─── .ics ─────────────────────────────────────────────────────────────────────
+
+def extract_ics(path: Path) -> str:
+    """Extract a .ics file (VCALENDAR) as a markdown block.
+
+    Used for one-off calendar files dropped into the inbox (flight
+    itineraries, hotel bookings, meeting invites). The live sync file
+    ``calendar.ics`` at inbox root is skipped by the watcher and consumed
+    by the dedicated calendar refresh pipeline instead — this extractor
+    only sees the one-off drops.
+
+    Every VEVENT is included regardless of when it occurs (past flights and
+    stays are still worth having in memory for audit / travel history), so
+    we don't reuse ``format_agenda`` — that filters to upcoming only.
+    """
+    try:
+        from engram.ingest.ics import parse_ics
+    except Exception:
+        print(f"[extractors] ics import failed for {path.name}:\n" + traceback.format_exc(), flush=True)
+        return ""
+    try:
+        events = parse_ics(path)
+    except Exception:
+        print(f"[extractors] ics parse failed for {path.name}:\n" + traceback.format_exc(), flush=True)
+        return ""
+    if not events:
+        return ""
+    sections = [f"# {path.stem}", ""]
+    for e in events:
+        title = e.summary or "(untitled event)"
+        sections.append(f"## {title}")
+        if e.all_day:
+            sections.append(f"- **When:** {e.start.date()} (all-day)")
+        else:
+            sections.append(f"- **Start:** {e.start.isoformat()}")
+            sections.append(f"- **End:**   {e.end.isoformat()}")
+        if e.location:
+            sections.append(f"- **Location:** {e.location}")
+        if e.organizer:
+            sections.append(f"- **Organizer:** {e.organizer}")
+        if e.attendees:
+            sections.append(f"- **Attendees:** {', '.join(str(a) for a in e.attendees)}")
+        if e.status and e.status != "CONFIRMED":
+            sections.append(f"- **Status:** {e.status}")
+        if e.rrule:
+            sections.append(f"- **Recurrence:** {e.rrule}")
+        if e.description:
+            desc = e.description.strip()
+            if desc:
+                sections.append("")
+                sections.append(desc)
+        sections.append("")
+    return "\n".join(sections).strip()
+
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 
 def extract(path: Path) -> str:
@@ -253,9 +354,11 @@ def extract(path: Path) -> str:
     if ext == ".docx": return extract_docx(path)
     if ext == ".pptx": return extract_pptx(path)
     if ext == ".xlsx": return extract_xlsx(path)
+    if ext == ".csv":  return extract_csv(path)
+    if ext == ".ics":  return extract_ics(path)
     if ext in _IMAGE_EXTENSIONS: return extract_image(path)
     return ""
 
 
 # Public list — used by the watcher to set its extensions allowlist
-SUPPORTED_EXTENSIONS = {".docx", ".pptx", ".xlsx", *_IMAGE_EXTENSIONS}
+SUPPORTED_EXTENSIONS = {".docx", ".pptx", ".xlsx", ".csv", ".ics", *_IMAGE_EXTENSIONS}

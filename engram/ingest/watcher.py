@@ -5,7 +5,8 @@ engram.ingest.watcher — Continuous folder watcher
 Polls an inbox directory for new documents and triggers per-file ingestion
 via the Claude CLI. Runs as a long-lived daemon or single shot.
 
-Supported file types: .md, .txt, .eml, .vtt, .pdf (read as text)
+Supported file types: .md, .txt, .eml, .vtt, .pdf (read as text),
+                      .csv, .ics (converted to markdown via extractors)
 
 The watcher is the open-source replacement for the AcmeCorp-specific
 sync_and_ingest.sh launchd script. It works on any OS with Python 3.11+,
@@ -26,7 +27,7 @@ Configuration via engram_config.yaml:
       enabled:          true
       inbox_path:       /path/to/inbox        # overrides paths.inbox_src
       interval_seconds: 60
-      extensions:       [.md, .txt, .eml, .vtt, .pdf]
+      extensions:       [.md, .txt, .eml, .vtt, .pdf, .csv, .ics]
       model:            claude-haiku-4-5
       on_new_file:      compile               # compile | wiki | both
       redaction:
@@ -103,7 +104,7 @@ class InboxWatcher:
     on the same inbox directory.
     """
 
-    SUPPORTED_EXTENSIONS = {".md", ".txt", ".eml", ".vtt", ".pdf"}
+    SUPPORTED_EXTENSIONS = {".md", ".txt", ".eml", ".vtt", ".pdf", ".csv", ".ics"}
 
     def __init__(
         self,
@@ -268,6 +269,12 @@ class InboxWatcher:
                 continue
             if p.name.startswith("."):
                 continue
+            # The live calendar sync file lives at inbox root and is
+            # continuously overwritten by OneDrive from Outlook. It's
+            # consumed by the dedicated calendar refresh pipeline, NOT
+            # the watcher — archiving it would break that pipeline.
+            if p.name == "calendar.ics" and p.parent == self.inbox_path:
+                continue
             # Don't re-process archived files
             try:
                 if "_processed" in p.relative_to(self.inbox_path).parts:
@@ -418,7 +425,7 @@ def watcher_from_config(cfg) -> Optional[InboxWatcher]:
         claude_bin       = getattr(cfg.paths if hasattr(cfg, "paths") else cfg, "claude_bin", None),
         model            = getattr(ingest_cfg, "model", "claude-haiku-4-5"),
         interval_seconds = getattr(ingest_cfg, "interval_seconds", 60),
-        extensions       = set(getattr(ingest_cfg, "extensions", [".md", ".txt", ".eml", ".vtt", ".pdf"])),
+        extensions       = set(getattr(ingest_cfg, "extensions", [".md", ".txt", ".eml", ".vtt", ".pdf", ".csv", ".ics"])),
         redactor         = redactor,
         log_path         = cfg.memory_path / "logs" / "watcher.log" if hasattr(cfg, "memory_path") else None,
     )
