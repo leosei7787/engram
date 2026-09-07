@@ -6,7 +6,7 @@ Polls an inbox directory for new documents and triggers per-file ingestion
 via the Claude CLI. Runs as a long-lived daemon or single shot.
 
 Supported file types: .md, .txt, .eml, .vtt, .pdf (read as text),
-                      .csv, .ics (converted to markdown via extractors)
+                      .csv, .ics, .odt, .html, .htm (converted to markdown via extractors)
 
 The watcher is the open-source replacement for the AcmeCorp-specific
 sync_and_ingest.sh launchd script. It works on any OS with Python 3.11+,
@@ -27,7 +27,7 @@ Configuration via engram_config.yaml:
       enabled:          true
       inbox_path:       /path/to/inbox        # overrides paths.inbox_src
       interval_seconds: 60
-      extensions:       [.md, .txt, .eml, .vtt, .pdf, .csv, .ics]
+      extensions:       [.md, .txt, .eml, .vtt, .pdf, .csv, .ics, .odt, .html, .htm]
       model:            claude-haiku-4-5
       on_new_file:      compile               # compile | wiki | both
       redaction:
@@ -104,7 +104,7 @@ class InboxWatcher:
     on the same inbox directory.
     """
 
-    SUPPORTED_EXTENSIONS = {".md", ".txt", ".eml", ".vtt", ".pdf", ".csv", ".ics"}
+    SUPPORTED_EXTENSIONS = {".md", ".txt", ".eml", ".vtt", ".pdf", ".csv", ".ics", ".odt", ".html", ".htm"}
 
     def __init__(
         self,
@@ -184,9 +184,10 @@ class InboxWatcher:
     def _read_file(self, path: Path) -> Optional[str]:
         """Return the text content of a file. Dispatches by extension:
 
-          - text-shaped (.md, .txt, .eml, .vtt, .html, .htm) → raw read
+          - text-shaped (.md, .txt, .eml, .vtt) → raw read
           - .pdf  → pypdf
-          - .docx, .pptx, .xlsx → engram.ingest.extractors
+          - .html, .htm → html2text via engram.ingest.extractors
+          - .docx, .pptx, .xlsx, .odt, .csv, .ics → engram.ingest.extractors
           - images (.png, .jpg, .jpeg, .tiff, .gif, .bmp, .webp) → Anthropic
             vision via the SDK (requires ANTHROPIC_API_KEY; otherwise returns
             "" and the watcher silently treats the file as a placeholder).
@@ -201,8 +202,13 @@ class InboxWatcher:
             file stays in the inbox for the next cycle.
         """
         ext = path.suffix.lower()
-        # Plain text — original fast path
-        if ext in (".md", ".txt", ".eml", ".vtt", ".html", ".htm", ""):
+        # Plain text — original fast path. Note .html/.htm are NOT here
+        # anymore: they route through the extractor (html2text) so standalone
+        # HTML reports land as clean markdown. The EmailCleaner in the
+        # dashboard's _ingest still handles HTML fragments embedded in
+        # .eml or Recent_email_*.md — those files aren't .html so they
+        # stay on this raw-read path and hit the cleaner later.
+        if ext in (".md", ".txt", ".eml", ".vtt", ""):
             try:
                 return path.read_text(errors="ignore")
             except OSError as e:
@@ -425,7 +431,7 @@ def watcher_from_config(cfg) -> Optional[InboxWatcher]:
         claude_bin       = getattr(cfg.paths if hasattr(cfg, "paths") else cfg, "claude_bin", None),
         model            = getattr(ingest_cfg, "model", "claude-haiku-4-5"),
         interval_seconds = getattr(ingest_cfg, "interval_seconds", 60),
-        extensions       = set(getattr(ingest_cfg, "extensions", [".md", ".txt", ".eml", ".vtt", ".pdf", ".csv", ".ics"])),
+        extensions       = set(getattr(ingest_cfg, "extensions", [".md", ".txt", ".eml", ".vtt", ".pdf", ".csv", ".ics", ".odt", ".html", ".htm"])),
         redactor         = redactor,
         log_path         = cfg.memory_path / "logs" / "watcher.log" if hasattr(cfg, "memory_path") else None,
     )

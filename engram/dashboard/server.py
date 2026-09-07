@@ -184,8 +184,11 @@ def _start_watcher(cfg: EngramConfig):
         # the extracted text from the watcher's _read_file. Don't copy the
         # binary — write the extracted text as a .md.
         _BINARY_EXTRACTED = {
-            ".pdf", ".docx", ".pptx", ".xlsx",
+            ".pdf", ".docx", ".pptx", ".xlsx", ".odt",
             ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".gif", ".bmp", ".webp",
+            # Structured text — extractor produces a cleaner markdown view
+            # (html2text markdown for html/htm) than the raw source.
+            ".html", ".htm",
         }
         if ext in _BINARY_EXTRACTED:
             copy_original = False
@@ -372,11 +375,11 @@ def _start_watcher(cfg: EngramConfig):
         interval_seconds = 60,
         extensions       = {
             # text-shaped
-            ".md", ".txt", ".eml", ".vtt", ".html", ".htm",
+            ".md", ".txt", ".eml", ".vtt",
             # binary text containers
-            ".pdf", ".docx", ".pptx", ".xlsx",
+            ".pdf", ".docx", ".pptx", ".xlsx", ".odt",
             # structured text (converted to markdown via extractors)
-            ".csv", ".ics",
+            ".csv", ".ics", ".html", ".htm",
             # images (vision-extracted when ANTHROPIC_API_KEY is set)
             ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".gif", ".bmp", ".webp",
         },
