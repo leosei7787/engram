@@ -342,6 +342,138 @@ def extract_ics(path: Path) -> str:
     return "\n".join(sections).strip()
 
 
+# ─── .html / .htm ─────────────────────────────────────────────────────────────
+
+def extract_html(path: Path) -> str:
+    """Extract a .html/.htm file as clean markdown.
+
+    Used for standalone HTML reports (KPI dashboards, exported reports)
+    dropped into the inbox. NOT used for the HTML fragments embedded in
+    .eml / Recent_email_*.md — those go through the EmailCleaner in the
+    dashboard's _ingest, which knows how to peel HTML off email
+    boilerplate and detect marketing.
+    """
+    try:
+        import html2text as _h2t
+    except ImportError:
+        return ""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        print(f"[extractors] html open failed for {path.name}:\n" + traceback.format_exc(), flush=True)
+        return ""
+    if not raw.strip():
+        return ""
+    h = _h2t.HTML2Text()
+    h.body_width = 0            # no wrapping — preserves table cells and long headings
+    h.ignore_images = False     # keep alt text — useful for chart labels
+    h.ignore_links = False
+    h.protect_links = True      # don't rewrite URLs
+    try:
+        md = h.handle(raw).strip()
+    except Exception:
+        print(f"[extractors] html2text failed for {path.name}:\n" + traceback.format_exc(), flush=True)
+        return ""
+    if not md:
+        return ""
+    return f"# {path.stem}\n\n{md}"
+
+
+# ─── .odt ─────────────────────────────────────────────────────────────────────
+
+# ODF (OpenDocument Format) uses XML with these namespaces
+_ODT_NS = {
+    "office": "urn:oasis:names:tc:opendocument:xmlns:office:1.0",
+    "text":   "urn:oasis:names:tc:opendocument:xmlns:text:1.0",
+    "table":  "urn:oasis:names:tc:opendocument:xmlns:table:1.0",
+}
+
+def extract_odt(path: Path) -> str:
+    """Extract text from an .odt (OpenDocument Text) file.
+
+    ODT files are ZIPs containing content.xml — no third-party lib needed
+    (we use stdlib zipfile + xml.etree.ElementTree). Walks the document
+    body and emits:
+      - <text:h> headings → markdown # / ## / ... based on outline-level
+      - <text:p> paragraphs → plain lines
+      - <table:table> → pipe-delimited rows (best-effort, no merged-cell logic)
+    Lists, footnotes, images and change-tracking are ignored — enough for
+    memos and reports which is what actually lands in the inbox.
+    """
+    import zipfile as _zf
+    import xml.etree.ElementTree as _et
+    try:
+        with _zf.ZipFile(str(path)) as z:
+            with z.open("content.xml") as f:
+                tree = _et.parse(f)
+    except (_zf.BadZipFile, KeyError) as e:
+        print(f"[extractors] odt not a valid ODF zip for {path.name}: {e}", flush=True)
+        return ""
+    except Exception:
+        print(f"[extractors] odt open failed for {path.name}:\n" + traceback.format_exc(), flush=True)
+        return ""
+
+    body = tree.getroot().find("office:body/office:text", _ODT_NS)
+    if body is None:
+        return ""
+
+    def _plain(el) -> str:
+        # Concatenate all descendant text; ignore tags but preserve their content.
+        # ODF represents tabs as <text:tab/> and line breaks as <text:line-break/>
+        # — the default ''.join(el.itertext()) handles their text just fine
+        # (empty), and we don't need special-cased spacing for our use case.
+        return "".join(el.itertext())
+
+    heading_tag = f"{{{_ODT_NS['text']}}}h"
+    para_tag    = f"{{{_ODT_NS['text']}}}p"
+    table_tag   = f"{{{_ODT_NS['table']}}}table"
+    row_tag     = f"{{{_ODT_NS['table']}}}table-row"
+    cell_tag    = f"{{{_ODT_NS['table']}}}table-cell"
+
+    out: list[str] = []
+    for el in body.iter():
+        if el.tag == heading_tag:
+            lvl = el.get(f"{{{_ODT_NS['text']}}}outline-level") or "1"
+            try:
+                depth = max(1, min(6, int(lvl)))
+            except ValueError:
+                depth = 1
+            text = _plain(el).strip()
+            if text:
+                out.append(f"\n{'#' * depth} {text}\n")
+        elif el.tag == para_tag:
+            # Skip paragraphs that live inside a heading (already counted)
+            # or inside a table cell (rendered by the table branch below).
+            text = _plain(el).strip()
+            if text:
+                out.append(text)
+        elif el.tag == table_tag:
+            rows: list[str] = []
+            for r in el.iter(row_tag):
+                cells = [_plain(c).strip().replace("|", "\\|") for c in r.findall(cell_tag)]
+                if any(cells):
+                    rows.append(" | ".join(cells))
+            if rows:
+                out.append("")
+                out.extend(rows)
+                out.append("")
+    # Deduplicate paragraphs that we already emitted via a table cell or
+    # heading: iter() visits every descendant, so text nested inside a
+    # table's <text:p> gets counted twice. Simple pass to drop consecutive
+    # duplicates keeps output honest without a full ancestor check.
+    dedup: list[str] = []
+    prev = None
+    for line in out:
+        if line == prev:
+            continue
+        dedup.append(line)
+        prev = line
+    body_md = "\n".join(dedup).strip()
+    if not body_md:
+        return ""
+    return f"# {path.stem}\n\n{body_md}"
+
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 
 def extract(path: Path) -> str:
@@ -356,9 +488,14 @@ def extract(path: Path) -> str:
     if ext == ".xlsx": return extract_xlsx(path)
     if ext == ".csv":  return extract_csv(path)
     if ext == ".ics":  return extract_ics(path)
+    if ext == ".odt":  return extract_odt(path)
+    if ext in (".html", ".htm"): return extract_html(path)
     if ext in _IMAGE_EXTENSIONS: return extract_image(path)
     return ""
 
 
 # Public list — used by the watcher to set its extensions allowlist
-SUPPORTED_EXTENSIONS = {".docx", ".pptx", ".xlsx", ".csv", ".ics", *_IMAGE_EXTENSIONS}
+SUPPORTED_EXTENSIONS = {
+    ".docx", ".pptx", ".xlsx", ".csv", ".ics", ".odt", ".html", ".htm",
+    *_IMAGE_EXTENSIONS,
+}
