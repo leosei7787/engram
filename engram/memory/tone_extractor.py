@@ -169,21 +169,29 @@ def _haiku_call(prompt: str, cfg, *, max_tokens: int = 800, timeout: int = 30) -
 
 def _gather_user_emails(memory_path: Path, *, user_name: str, user_email: str,
                        max_emails: int = 25, days_back: int = 30) -> list[str]:
-    """Walk MEMORY/daily/emails/ for recent emails sent by the user."""
-    emails_dir = memory_path / "daily" / "emails"
-    if not emails_dir.exists():
+    """Walk MEMORY/daily/{emails,conversations}/ for recent user-authored text.
+
+    Historically only outgoing emails were sampled; now we also sample
+    Claude-Cowork conversations, which are literally the user's words +
+    prompts. is_from_user() still gates individual files, so noise from
+    third-party quoted content stays filtered.
+    """
+    from engram.ingest.router import ingest_scan_dirs
+    scan_dirs = ingest_scan_dirs(memory_path)
+    if not scan_dirs:
         return []
     cutoff = time.time() - days_back * 86400
     candidates: list[tuple[float, str]] = []
-    for f in emails_dir.glob("*.md"):
-        try:
-            if f.stat().st_mtime < cutoff:
+    for d in scan_dirs:
+        for f in d.glob("*.md"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    continue
+                text = f.read_text(errors="ignore")[:8000]
+            except Exception:
                 continue
-            text = f.read_text(errors="ignore")[:8000]
-        except Exception:
-            continue
-        if is_from_user(text, user_name=user_name, user_email=user_email):
-            candidates.append((f.stat().st_mtime, text))
+            if is_from_user(text, user_name=user_name, user_email=user_email):
+                candidates.append((f.stat().st_mtime, text))
     candidates.sort(key=lambda x: x[0], reverse=True)
     return [t for _, t in candidates[:max_emails]]
 

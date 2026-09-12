@@ -218,8 +218,12 @@ def extract_recent_email_signals(
     to keep the pass under a few minutes on large inboxes.
     """
     today_iso = today_iso or datetime.now().strftime("%Y-%m-%d")
-    emails_dir = memory_path / "daily" / "emails"
-    if not emails_dir.exists():
+    # Scan every first-class ingest folder — historically just daily/emails/,
+    # now also daily/conversations/ (Claude-Cowork sessions). Both contain
+    # user-facing text that can carry deadlines directed at Leo.
+    from engram.ingest.router import ingest_scan_dirs
+    scan_dirs = ingest_scan_dirs(memory_path)
+    if not scan_dirs:
         return {
             "extracted_at": datetime.now().isoformat(timespec="seconds"),
             "today":        today_iso,
@@ -231,12 +235,13 @@ def extract_recent_email_signals(
 
     cutoff = time.time() - days_back * 86400
     files: list[Path] = []
-    for f in emails_dir.glob("*.md"):
-        try:
-            if f.stat().st_mtime >= cutoff:
-                files.append(f)
-        except Exception:
-            continue
+    for d in scan_dirs:
+        for f in d.glob("*.md"):
+            try:
+                if f.stat().st_mtime >= cutoff:
+                    files.append(f)
+            except Exception:
+                continue
     files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
     files = files[:limit]
 

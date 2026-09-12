@@ -57,6 +57,8 @@ def classify_source(
         return "internal_deck", SOURCE_CREDIBILITY["internal_deck"]
 
     # Daily file types
+    if "/daily/conversations/" in s:
+        return "internal_conversation", SOURCE_CREDIBILITY["internal_conversation"]
     if "/daily/emails/" in s:
         return "internal_email", SOURCE_CREDIBILITY["internal_email"]
     if "/daily/transcripts/" in s:
