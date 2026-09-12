@@ -63,6 +63,12 @@ SOURCE_CREDIBILITY = {
     "user_upload":           0.95,
     # Tier 2: Direct — internal documents
     "internal_deck":         0.85,
+    # Distilled Claude-Cowork conversations: user's own reasoning laid out
+    # for a Claude session, with Claude's synthesis on top. Deck-tier
+    # signal because it's the user's voice curated through a working
+    # session, but not user_statement because the output text is
+    # Claude-authored from the user's inputs.
+    "internal_conversation": 0.85,
     "internal_email":        0.80,
     "internal_meeting":      0.78,
     "internal_doc":          0.75,

@@ -124,7 +124,9 @@ def fast_file_score(
                                      "/_archive/", ".bak_", ".bak/"]
     _path_boosts = path_boosts or {
         "/accounts/": 2.5, "/decisions/": 1.8, "/weekly/": 1.6,
+        "/daily/conversations/": 1.4,  # distilled Claude-Cowork sessions
         "/context/": 1.4, "/saved/": 1.4, "/research/": 1.3,
+        "/daily/documents/": 1.2,  # extracted from source docs surfaced in a session
         "/daily/emails/": 1.0, "/daily/": 0.9, "/episodic/": 1.1, "/archive/": 0.6,
     }
     _fn  = filename_match  or {"stem_hit_multiplier": 3.0, "path_hit_multiplier": 1.5}

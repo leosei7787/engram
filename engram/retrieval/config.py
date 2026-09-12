@@ -119,16 +119,26 @@ class KeywordConfig:
     max_files:        int   = 8
     body_read_chars:  int   = 8000
     path_boosts:      dict  = field(default_factory=lambda: {
-        "/accounts/":      2.5,
-        "/decisions/":     1.8,
-        "/weekly/":        1.6,
-        "/context/":       1.4,
-        "/saved/":         1.4,
-        "/research/":      1.3,
-        "/daily/emails/":  1.0,
-        "/daily/":         0.9,
-        "/episodic/":      1.1,
-        "/archive/":       0.6,
+        "/accounts/":              2.5,
+        "/decisions/":             1.8,
+        "/weekly/":                1.6,
+        # Distilled Claude-Cowork conversations — user's own reasoning
+        # laid out in a working session. Same tier as /context/ because
+        # the content shape is the same (curated user thinking), higher
+        # than raw emails because signal density is significantly
+        # better after distillation.
+        "/daily/conversations/":   1.4,
+        "/context/":               1.4,
+        "/saved/":                 1.4,
+        "/research/":              1.3,
+        # Text extracted from source docs (memos, briefs, decks) that were
+        # attached to a Claude-Cowork conversation. Between research and
+        # raw emails: reference material worth surfacing, but not curated.
+        "/daily/documents/":       1.2,
+        "/daily/emails/":          1.0,
+        "/daily/":                 0.9,
+        "/episodic/":              1.1,
+        "/archive/":               0.6,
     })
     filename_match:   dict  = field(default_factory=lambda: {
         "stem_hit_multiplier": 3.0,

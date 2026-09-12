@@ -168,7 +168,9 @@ def _start_watcher(cfg: EngramConfig):
           1. Skip placeholder files (<200 chars).
           2. For .eml/.html/.md files: strip HTML/CSS noise, detect marketing.
              Marketing emails are silently dropped (no copy, mark as done).
-          3. Write the cleaned markdown into memory/daily/emails/.
+          3. Route the file to the right subfolder under memory/daily/ via
+             engram.ingest.router (conversations/documents/transcripts/emails),
+             then write the cleaned markdown there.
         """
         if len(content.strip()) < 200:
             return True  # placeholder
@@ -252,7 +254,13 @@ def _start_watcher(cfg: EngramConfig):
                 print("[watcher] dedupe error (proceeding without):\n"
                       + traceback.format_exc(), flush=True)
 
-        dest_dir = cfg.memory_path / "daily" / "emails"
+        # Route the file to the right daily/ subfolder by content type.
+        # Frontmatter `type:` wins; falls back to filename prefix; falls back
+        # to daily/emails/ (the historical default) so anything that doesn't
+        # match a known signature keeps landing where it always did.
+        from engram.ingest.router import resolve_dest_subfolder
+        dest_sub = resolve_dest_subfolder(path.name, cleaned_md)
+        dest_dir = cfg.memory_path / "daily" / dest_sub
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         # Try to derive a SEMANTIC filename from the cleaned content via the
@@ -329,9 +337,9 @@ def _start_watcher(cfg: EngramConfig):
             })
             _watcher_status["recent_files"] = _watcher_status["recent_files"][:20]
 
-            # New email landed in MEMORY/daily/emails/ — schedule a debounced
+            # New content landed under MEMORY/daily/ — schedule a debounced
             # deadline-extraction pass so the Top of Mind tile stays current
-            # without manual refresh. Multiple emails arriving in a burst
+            # without manual refresh. Multiple files arriving in a burst
             # collapse into a single LLM run.
             try:
                 _schedule_signals_refresh(cfg, delay_s=30)
@@ -2954,13 +2962,15 @@ def watcher_status():
 @app.route("/api/clean-emails", methods=["POST"])
 def clean_emails():
     """
-    Sweep MEMORY/daily/emails/ — strip HTML noise from each file, drop marketing.
-    Backs up the original folder before any destructive change.
+    Sweep the first-class ingest folders (daily/emails/, daily/conversations/) —
+    strip HTML noise from each file, drop marketing. Backs up the original
+    folder before any destructive change.
     """
     cfg = get_cfg()
-    emails_dir = cfg.memory_path / "daily" / "emails"
-    if not emails_dir.exists():
-        return jsonify({"error": "no daily/emails dir"}), 404
+    from engram.ingest.router import ingest_scan_dirs
+    scan_dirs = ingest_scan_dirs(cfg.memory_path)
+    if not scan_dirs:
+        return jsonify({"error": "no daily/emails or daily/conversations dir"}), 404
 
     cleaner = EmailCleaner(skip_marketing=True)
     cleaned   = 0
@@ -2969,38 +2979,39 @@ def clean_emails():
     bytes_before = 0
     bytes_after  = 0
 
-    for f in emails_dir.iterdir():
-        if not f.is_file() or f.name.startswith("."):
-            continue
-        try:
-            raw = f.read_text(errors="ignore")
-        except Exception:
-            continue
-        if len(raw) < 200:
-            continue
-        bytes_before += len(raw)
-
-        res = cleaner.clean(raw, filename=f.name)
-
-        if res.is_marketing:
-            f.unlink()  # drop marketing
-            dropped += 1
-            continue
-
-        if res.cleaned_chars < res.original_chars * 0.95 and res.cleaned_chars > 100:
-            # Meaningful reduction — write cleaned markdown back, preserve mtime
-            orig_mtime = f.stat().st_mtime
-            md = res.to_markdown()
-            f.write_text(md, encoding="utf-8")
+    for d in scan_dirs:
+        for f in d.iterdir():
+            if not f.is_file() or f.name.startswith("."):
+                continue
             try:
-                os.utime(f, (orig_mtime, orig_mtime))
+                raw = f.read_text(errors="ignore")
             except Exception:
-                pass
-            cleaned += 1
-            bytes_after += len(md)
-        else:
-            untouched += 1
-            bytes_after += res.original_chars
+                continue
+            if len(raw) < 200:
+                continue
+            bytes_before += len(raw)
+
+            res = cleaner.clean(raw, filename=f.name)
+
+            if res.is_marketing:
+                f.unlink()  # drop marketing
+                dropped += 1
+                continue
+
+            if res.cleaned_chars < res.original_chars * 0.95 and res.cleaned_chars > 100:
+                # Meaningful reduction — write cleaned markdown back, preserve mtime
+                orig_mtime = f.stat().st_mtime
+                md = res.to_markdown()
+                f.write_text(md, encoding="utf-8")
+                try:
+                    os.utime(f, (orig_mtime, orig_mtime))
+                except Exception:
+                    pass
+                cleaned += 1
+                bytes_after += len(md)
+            else:
+                untouched += 1
+                bytes_after += res.original_chars
 
     saved_pct = int(100 * (1 - bytes_after / max(bytes_before, 1)))
     return jsonify({
